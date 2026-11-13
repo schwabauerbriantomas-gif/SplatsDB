@@ -23,7 +23,9 @@ ensure_hub() { # puerto, data-dir, etiqueta
         echo "$(date -u +%FT%TZ) skip $LABEL: sin $HUB/data/vectors/default.bin todavía (correr ingest+merge)" >> "$LOG"
         return 1
     fi
-    nohup "$BIN" --dim 768 serve --port "$PORT" --host 127.0.0.1 --data-dir "$HUB" --gpu >> "$LOG" 2>&1 &
+    # v2.8.0: trainer e-means para el fit jerárquico HRM2 (medido: −13.3%
+    # startup serve, −0.56% loss, /search idéntico — aprobado Brian 13-nov).
+    nohup "$BIN" --dim 768 serve --port "$PORT" --host 127.0.0.1 --data-dir "$HUB" --gpu --trainer emeans >> "$LOG" 2>&1 &
     echo $! > "$HUB/hub.pid"
     echo "$(date -u +%FT%TZ) hub $LABEL lanzado pid $(cat "$HUB/hub.pid") (puerto $PORT)" >> "$LOG"
 }
