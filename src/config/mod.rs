@@ -100,10 +100,13 @@ pub struct SplatsDBConfig {
     pub grpc_port: u16,
 
     // --- Search Configuration ---
-    pub search_backend: SearchBackend,
     pub hrm2_n_coarse: usize,
     pub hrm2_n_fine: usize,
     pub hrm2_n_probe: usize,
+    /// Trainer del clustering jerárquico HRM2 (lloyd = histórico, emeans =
+    /// faiss contrib port). Default lloyd: reversibilidad total.
+    #[serde(default)]
+    pub cluster_trainer: crate::clustering::TrainerKind,
 
     // --- HNSW Configuration ---
     pub enable_hnsw: bool,
@@ -262,10 +265,10 @@ impl Default for SplatsDBConfig {
             grpc_port: 9090,
 
             // Search
-            search_backend: SearchBackend::Hrm2,
             hrm2_n_coarse: 16,
             hrm2_n_fine: 64,
             hrm2_n_probe: 4,
+            cluster_trainer: crate::clustering::TrainerKind::Lloyd,
 
             // HNSW
             enable_hnsw: false,

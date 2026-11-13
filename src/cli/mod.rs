@@ -465,7 +465,14 @@ pub enum Commands {
 }
 
 pub fn dispatch(cli: Cli) {
-    let config = helpers::make_config(cli.dim, cli.max_splats);
+    let mut config = helpers::make_config(cli.dim, cli.max_splats);
+    config.cluster_trainer = match splatsdb::clustering::TrainerKind::parse(&cli.trainer) {
+        Some(t) => t,
+        None => {
+            eprintln!("trainer inválido: '{}' (usar lloyd|emeans)", cli.trainer);
+            std::process::exit(2);
+        }
+    };
 
     match cli.command {
         Commands::Index { input, shard } => {

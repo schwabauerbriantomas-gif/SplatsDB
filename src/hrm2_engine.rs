@@ -54,6 +54,8 @@ pub struct HRM2Engine {
     encoder: FullEmbeddingBuilder,
     is_indexed: bool,
     stats: HRM2Stats,
+    /// Trainer del clustering coarse/fine (lloyd = histórico, emeans = port).
+    trainer: crate::clustering::TrainerKind,
 }
 
 impl HRM2Engine {
@@ -64,12 +66,14 @@ impl HRM2Engine {
         embedding_dim: usize,
         n_probe: usize,
         metric: &str,
+        trainer: crate::clustering::TrainerKind,
     ) -> Self {
         Self {
             n_coarse,
             n_fine,
             embedding_dim,
             n_probe,
+            trainer,
             batch_size: 10000,
             metric: metric.to_string(),
             splats: Vec::new(),
@@ -153,7 +157,7 @@ impl HRM2Engine {
         // Level 1: Coarse clustering
         let n_coarse = self.n_coarse.min(n_samples / 10).max(1);
         let mut coarse = KMeans::new(n_coarse, 100, 42);
-        coarse.fit(embeddings);
+        coarse.fit_with(self.trainer, embeddings);
         let coarse_labels = coarse
             .labels
             .clone()
@@ -197,7 +201,7 @@ impl HRM2Engine {
 
             let n_fine = self.n_fine.min(indices.len() / 5).max(1);
             let mut fine = KMeans::new(n_fine, 50, 42 + c as u64);
-            fine.fit(&cluster_embs);
+            fine.fit_with(self.trainer, &cluster_embs);
             self.fine_models.insert(c, fine.clone());
             self.fine_assignments.insert(
                 c,

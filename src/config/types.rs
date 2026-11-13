@@ -14,16 +14,6 @@ pub enum QuantAlgorithm {
     None,
 }
 
-/// Search backend selector.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
-pub enum SearchBackend {
-    #[default]
-    Hrm2,
-    Hnsw,
-    Lsh,
-    Quantized,
-}
-
 /// Semantic search fusion method.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub enum FusionMethod {

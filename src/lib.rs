@@ -4,6 +4,7 @@ pub mod clustering;
 pub mod config;
 pub mod dataset_transformer;
 pub mod embedding_config;
+pub mod emeans;
 pub mod encoding;
 pub mod geometry;
 pub mod graph_splat;

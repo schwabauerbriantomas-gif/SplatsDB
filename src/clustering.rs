@@ -1,11 +1,44 @@
 //! KMeans clustering — native Rust implementation (no sklearn).
 //! Optimized with KMeans++ init and Lloyd's algorithm.
+//!
+//! `TrainerKind` permite elegir el trainer del fit: Lloyd (default, sin
+//! cambios de comportamiento) o e-means (port de faiss contrib, ver
+//! `crate::emeans`).
 
 use ndarray::{Array1, Array2, ArrayView2};
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
+
+/// Trainer del fit de KMeans: Lloyd clásico o e-means (faiss contrib).
+/// serde en lowercase para que `cluster_trainer = "emeans"` en config TOML/JSON.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TrainerKind {
+    /// Lloyd full-batch con k-means++ (comportamiento histórico).
+    #[default]
+    Lloyd,
+    /// e-means mini-batch EMA (pases 5.0; port validado de arXiv:2611.09501).
+    Emeans,
+}
+
+impl TrainerKind {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "lloyd" => Some(Self::Lloyd),
+            "emeans" => Some(Self::Emeans),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Lloyd => "lloyd",
+            Self::Emeans => "emeans",
+        }
+    }
+}
 
 /// KMeans clustering result.
 #[derive(Clone, Debug)]
@@ -207,6 +240,28 @@ impl KMeans {
         self.centroids = Some(centroids);
         self.labels = Some(labels);
         self
+    }
+
+    /// Fit con el trainer configurado. `fit()` equivale a
+    /// `fit_with(TrainerKind::Lloyd, data)` (comportamiento histórico).
+    pub fn fit_with(&mut self, trainer: TrainerKind, data: &Array2<f32>) -> &Self {
+        match trainer {
+            TrainerKind::Lloyd => self.fit(data),
+            TrainerKind::Emeans => {
+                let (n, dim) = (data.nrows(), data.ncols());
+                let k = self.n_clusters.min(n).max(1);
+                let flat: Vec<f32> = data.rows().into_iter().flat_map(|r| r.to_vec()).collect();
+                let fit = crate::emeans::fit_emeans(&flat, n, dim, k, 5.0, self.seed);
+                self.centroids = Some(
+                    Array2::from_shape_vec((k, dim), fit.centroids)
+                        .expect("emeans centroids shape"),
+                );
+                self.labels = Some(Array1::from(fit.labels));
+                self.inertia = fit.inertia as f32;
+                self.n_iter = fit.n_steps;
+                self
+            }
+        }
     }
 
     /// Predict cluster assignments for new data.

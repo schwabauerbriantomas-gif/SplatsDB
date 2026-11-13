@@ -82,7 +82,14 @@ impl SplatStore {
         let dim = config.latent_dim;
         let n_coarse = (((max_splats as f64).sqrt() / 10.0) as usize).max(10);
         let n_fine = (max_splats / n_coarse).max(100);
-        let engine = HRM2Engine::new(n_coarse, n_fine, dim, n_coarse.min(5), "cosine");
+        let engine = HRM2Engine::new(
+            n_coarse,
+            n_fine,
+            dim,
+            n_coarse.min(5),
+            "cosine",
+            config.cluster_trainer,
+        );
 
         // Initialize subsystems based on preset config
         let quant_store = if config.enable_quantization {

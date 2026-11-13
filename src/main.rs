@@ -29,6 +29,11 @@ struct Cli {
     #[arg(long, global = true, default_value = "sqlite")]
     backend: String,
 
+    /// Trainer del clustering jerárquico HRM2: lloyd (histórico) o emeans
+    /// (faiss contrib port, arXiv:2611.09501; −32% t_fit medido)
+    #[arg(long, global = true, default_value = "lloyd")]
+    trainer: String,
+
     #[command(subcommand)]
     command: Commands,
 }

@@ -1,5 +1,17 @@
 # Changelog
 
+## [v2.8.0] - 2026-11-13
+
+### Added
+- **clustering**: trainer e-means (port del faiss contrib `e_means`, Meta FAIR arXiv:2611.09501) como alternativa a Lloyd para el fit jerárquico HRM2. Módulo nuevo `src/emeans.rs` (~390 LOC CPU): init por filas aleatorias, batch law Ec.7 por dimensión (quality d≤16 / throughput d>16), step law Ec.6 con clamp [1e-4,1], annealing coseno a 0.1·α₀, EMA por masa, reactivación de clusters muertos cada 5 updates (split ∝ masa, Apéndice J) y finalize con medias no ponderadas. Unit tests con los valores de referencia verificados 1:1 contra `base.py` de FAISS real (batch=32, α₀=0.270245 para n=248, k=31, T=5, d=768). KMeans::fit_with(TrainerKind) despacha lloyd (histórico, default) o emeans; `--trainer lloyd|emeans` global en el CLI; campo `cluster_trainer` en config con serde default (configs viejas siguen parseando). HRM2 coarse y fine respetan el flag. Determinista por seed.
+
+### Measured
+- Standalone (port, CPU single-thread, hub real 5.871×768, coarse k=16, fine k≤64, 5 réplicas): Lloyd-100/50 1.269s / loss 0.1713 vs e-means-5/5 0.864s (−31.9% t, gate ≤0.75×) / loss 0.1703 (−0.56%, mejor en mediana y mínimo). Contra-caso conocido: blobs/GMM bien separados pierde hasta +51.7% de inercia (documentado en tests).
+- E2E in-repo (serve --gpu sobre copia del hub, 5 arranques fresh por trainer, tiempo a /health): Lloyd mediana 1.083s vs e-means 0.939s (−13.3% startup). Gate /search: top-10 idéntico con ambos trainers (HNSW+GPU exact intocables). El fit corre en CADA arranque de serve (splats.rs build_index_if_needed lo ejecuta aunque HNSW esté cacheada); default `lloyd` mantiene el comportamiento de producción hasta que se flipa el flag.
+
+### Removed
+- `SearchBackend` (config/types.rs) + campo `search_backend` + default `SearchBackend::Hrm2`: config muerta sin un solo consumidor fuera de la definición (verificado por alcanzabilidad grep — enum con variantes Hrm2/Hnsw/Lsh/Quantized que nadie leía; el backend real lo deciden los comandos, no la config)
+
 ## [v2.7.2] - 2026-11-06
 
 ### Added
