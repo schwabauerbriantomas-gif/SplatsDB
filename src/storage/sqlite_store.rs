@@ -174,8 +174,9 @@ impl MetadataStore for SqliteMetadataStore {
         } else {
             "SELECT COUNT(*) FROM documents WHERE deleted=0"
         };
-        let count: usize = conn.query_row(sql, [], |row| row.get(0))?;
-        Ok(count)
+        // rusqlite ≥0.41 ya no implementa FromSql para usize (SQLite es i64)
+        let count: i64 = conn.query_row(sql, [], |row| row.get(0))?;
+        Ok(count as usize)
     }
 
     fn flush(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

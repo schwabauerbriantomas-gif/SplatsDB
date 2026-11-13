@@ -9,6 +9,9 @@
 - Standalone (port, CPU single-thread, hub real 5.871×768, coarse k=16, fine k≤64, 5 réplicas): Lloyd-100/50 1.269s / loss 0.1713 vs e-means-5/5 0.864s (−31.9% t, gate ≤0.75×) / loss 0.1703 (−0.56%, mejor en mediana y mínimo). Contra-caso conocido: blobs/GMM bien separados pierde hasta +51.7% de inercia (documentado en tests).
 - E2E in-repo (serve --gpu sobre copia del hub, 5 arranques fresh por trainer, tiempo a /health): Lloyd mediana 1.083s vs e-means 0.939s (−13.3% startup). Gate /search: top-10 idéntico con ambos trainers (HNSW+GPU exact intocables). El fit corre en CADA arranque de serve (splats.rs build_index_if_needed lo ejecuta aunque HNSW esté cacheada); default `lloyd` mantiene el comportamiento de producción hasta que se flipa el flag.
 
+### Security
+- **deps**: rusqlite 0.31 → 0.41.1 / libsqlite3-sys 0.28 → 0.39.1 (SQLite bundled 3.54.1) — RUSTSEC-2026-0459 / CVE-2026-119375: SQLite < 3.54.0 puede devolver memoria no inicializada del page-cache al abrir una DB con un WAL hermano de page size distinto (vector local, CVSS:4.0 AV:L/VC:H). La advisory entró al RUSTSEC DB el 13-nov-2026 13:33 UTC; fue la primera CI que la vio. Único cambio de API: rusqlite ≥0.41 quitó FromSql para usize (SQLite es i64) — un cast en sqlite_store.rs.
+
 ### Removed
 - `SearchBackend` (config/types.rs) + campo `search_backend` + default `SearchBackend::Hrm2`: config muerta sin un solo consumidor fuera de la definición (verificado por alcanzabilidad grep — enum con variantes Hrm2/Hnsw/Lsh/Quantized que nadie leía; el backend real lo deciden los comandos, no la config)
 
@@ -19,6 +22,9 @@
 
 ### Fixed
 - **cli**: `--query` de `quant/field/fused/hnsw/lsh-search` y `--embedding` de `graph-add-{doc,entity}` abortaban en clap (`unexpected argument '-0'`) cuando el primer float era negativo — única salida la forma `--query="..."`; `allow_hyphen_values` en los 7 args (el `search` base ya la tenía)
+
+### Security
+- **deps**: rusqlite 0.31 → 0.41.1 / libsqlite3-sys 0.28 → 0.39.1 (SQLite bundled 3.54.1) — RUSTSEC-2026-0459 / CVE-2026-119375: SQLite < 3.54.0 puede devolver memoria no inicializada del page-cache al abrir una DB con un WAL hermano de page size distinto (vector local, CVSS:4.0 AV:L/VC:H). La advisory entró al RUSTSEC DB el 13-nov-2026 13:33 UTC; fue la primera CI que la vio. Único cambio de API: rusqlite ≥0.41 quitó FromSql para usize (SQLite es i64) — un cast en sqlite_store.rs.
 
 ### Removed
 - Poda v2.7.2 (commits `bf47b88`, `662d9bb`, `2696042`): 9.338 LOC (27%, src/ 34.007 → 24.800), cadenas muertas verificadas por alcanzabilidad. Wave 1 (5.011 LOC, cero camino de ejecución desde cualquier entry point): `semantic_memory.rs`, `bm25_index.rs`, `embedding_model.rs` (SemanticMemory nunca se construía; el léxico vivo es el FTS5 del hook), `query_optimizer.rs`, `optimized_api.rs`, `query_router.rs`, `search_supervisor.rs`, `quality_reflector.rs`, `mapreduce_indexer.rs`, `gpu_vector_index.rs`, `gpu_hierarchical_search.rs`, `cuda_search.rs`, `gpu_auto_tune.rs` (el GPU vivo es el dir `gpu/` con kernels PTX), flags `enable_semantic_memory`/`gpu_auto_tune`. Wave 2 (superficie CLI sin uso, stack single-machine): `src/cluster/` (sharding distribuido: 5 módulos + 7 comandos `cluster-*`), `src/ebm/` (`soc-check`/`soc-avalanche`/`soc-relax` — el ranking por energía ya estaba condenado por bench-gaussian, agreement vs L2 ≈ 4.6%), `entity_extractor.rs`, `evaluate_embeddings.rs`, `ml_cmds.rs`, preset `distributed`. `git show bf47b88~1:<ruta>` recupera cualquier archivo cortado. README honest-assets pass: architecture diagram, feature tables, presets table, benchmark provenance notes. Kept deliberately: `hrm2_engine` (el store lo envuelve — ES el store), `quantization`, `verbatim` + `text_compression` (MCP), `lsh_index`, `candidate_backend`, `gpu/`, `loaders/ quant/ storage/`
@@ -41,6 +47,9 @@
 - **text_compression**: `semantic_compress` panicked or silently corrupted output on Unicode whose lowercase changes byte length (`İ` U+0130 → 3 bytes); single-string char-wise matching now, with regression tests
 - **hnsw**: `HNSWIndex::new` enforces the same `m` range as `load` ([2, 4096]) — an index saved by `new` can always be reloaded
 - **cli**: `.bin` loaders cap header-driven allocations (1e9 elements) and validate real file size before allocating — a hostile header can no longer OOM the ingest/search/bench paths
+
+### Security
+- **deps**: rusqlite 0.31 → 0.41.1 / libsqlite3-sys 0.28 → 0.39.1 (SQLite bundled 3.54.1) — RUSTSEC-2026-0459 / CVE-2026-119375: SQLite < 3.54.0 puede devolver memoria no inicializada del page-cache al abrir una DB con un WAL hermano de page size distinto (vector local, CVSS:4.0 AV:L/VC:H). La advisory entró al RUSTSEC DB el 13-nov-2026 13:33 UTC; fue la primera CI que la vio. Único cambio de API: rusqlite ≥0.41 quitó FromSql para usize (SQLite es i64) — un cast en sqlite_store.rs.
 
 ### Removed
 - Dead code (zero callers verified by search): `src/energy.rs` (239 LOC), `src/ebm/exploration.rs` (447 LOC)
@@ -66,6 +75,9 @@
 - MCP stdio dispatcher runs behind `catch_unwind`: a panic in a tool handler returns JSON-RPC `-32603` instead of killing the server process; GPU clamp test asserts exact result length and sentinel/NaN-free outputs under CUDA
 - docs: badge/tests count measured (393), GPU microbenchmark re-measured with persisted artifact (`bench-data/gpu_kernel_microbench_2026-10-25.json`: 6 runs, median 30.6×, GPU 20ms @ 10K×640D×100q), longmemeval NumPy-vs-native results separated (native: 0.304 recall / 671.63 QPS), unsourced HRM2/TurboQuant claims marked NOT VALIDATED, 15 missing CLI commands documented, verbatim/compression status corrected, inert config keys (`semantic_fusion`, `semantic_vector_weight`, `semantic_bm25_*`, `semantic_decay_halflife`, `autoscale_*`) documented as unused in code (doc-comments in `src/config/mod.rs`), `build_single` input preconditions documented in code (doc-comment in `src/encoding.rs`), LOC badge recount (34,461)
 
+### Security
+- **deps**: rusqlite 0.31 → 0.41.1 / libsqlite3-sys 0.28 → 0.39.1 (SQLite bundled 3.54.1) — RUSTSEC-2026-0459 / CVE-2026-119375: SQLite < 3.54.0 puede devolver memoria no inicializada del page-cache al abrir una DB con un WAL hermano de page size distinto (vector local, CVSS:4.0 AV:L/VC:H). La advisory entró al RUSTSEC DB el 13-nov-2026 13:33 UTC; fue la primera CI que la vio. Único cambio de API: rusqlite ≥0.41 quitó FromSql para usize (SQLite es i64) — un cast en sqlite_store.rs.
+
 ### Removed
 - Dead code, wave-4 audit (zero callers verified by search before each deletion): `error::SplatsDBError`, `engine::SplatsDBEngine` + `compute_expert_distances*`, geometry helpers (`normalize_sphere_1d`, `geodesic_distance_batch`, `exp_map`, `log_map`, `project_to_tangent`, `knn_geodesic`), `BM25Index::search_ids`, `SplatStore::decay_frequencies`, cluster `protocol`/`edge_node`/`sync` modules + `HealthChecker` (`EdgeNodeInfo`/`LoadMetrics`/`GeoLocation` kept — router/sharding use them), `backend_comm`, `auto_scaling`, `api::coordinator_api` + `api::edge_api` — ~2.8K lines
 
@@ -82,6 +94,9 @@
 ### Fixed
 - `serve --gpu`: the `/search` GPU index now searches the full chunk corpus (`field.raw`) instead of the cluster centroids μ, so `topic`/`confidence` always refer to real chunks (`2ed5e6c`)
 - CI: `gpu_info()` no longer panics when `cudarc` finds no driver (`7afb768`); cudarc-without-driver panic guarded in the rest of the GPU path and clippy 1.99 lints fixed (`867b9da`)
+
+### Security
+- **deps**: rusqlite 0.31 → 0.41.1 / libsqlite3-sys 0.28 → 0.39.1 (SQLite bundled 3.54.1) — RUSTSEC-2026-0459 / CVE-2026-119375: SQLite < 3.54.0 puede devolver memoria no inicializada del page-cache al abrir una DB con un WAL hermano de page size distinto (vector local, CVSS:4.0 AV:L/VC:H). La advisory entró al RUSTSEC DB el 13-nov-2026 13:33 UTC; fue la primera CI que la vio. Único cambio de API: rusqlite ≥0.41 quitó FromSql para usize (SQLite es i64) — un cast en sqlite_store.rs.
 
 ### Removed
 - `training` preset and its subsystems (data lake, `train_embeddings`, training config fields) as unvalidated dead weight — ~1,250 lines deleted (`4d144be`)
