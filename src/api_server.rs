@@ -1013,6 +1013,10 @@ fn cpu_fused_batch(
     Ok(per_query)
 }
 
+/// Outputs of the two GPU kernel wrappers: gaussian score top-k per query
+/// and (indices, squared-L2 distances) rows per plain query.
+type GpuKernelOutputs = (Vec<Vec<(usize, f32)>>, Vec<(Vec<usize>, Vec<f32>)>);
+
 /// Refresh the CPU-side dataset snapshot when the store's `data_version`
 /// moved (add/load/compact) or there is no snapshot yet; drops it when the
 /// store is empty. `data_version` drives both the staleness check and the
@@ -1079,7 +1083,7 @@ fn split_and_run_gpu_kernels(
     queries: &[Vec<f32>],
     ks: &[usize],
     rescore: &[bool],
-) -> Result<(Vec<Vec<(usize, f32)>>, Vec<(Vec<usize>, Vec<f32>)>), String> {
+) -> Result<GpuKernelOutputs, String> {
     let gauss_flat: Vec<f32> = queries
         .iter()
         .zip(rescore.iter())
