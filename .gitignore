@@ -89,3 +89,4 @@ semantic-hub/data/metadata/*.db-wal
 # generados por repowise update (editor-specific, regenerables)
 .vscode/
 .github/copilot-instructions.md
+.claude/
