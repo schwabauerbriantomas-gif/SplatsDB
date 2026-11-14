@@ -66,6 +66,37 @@ pub struct SplatStore {
     lsh: Option<crate::lsh_index::CrossPolytopeLSH>,
 }
 
+/// Build the optional quantized-search store from the preset config.
+///
+/// Extracted from `SplatStore::new` (repowise plan `refac4_a17cdc3c78d5767a388f`).
+/// Behavior identical: TurboQuant/PolarQuant pass through, `None` defaults to
+/// TurboQuant, construction failures degrade to `None`.
+fn build_quant_store(
+    config: &SplatsDBConfig,
+    dim: usize,
+) -> Option<crate::quantization::QuantizedStore> {
+    if !config.enable_quantization {
+        return None;
+    }
+    let qcfg = crate::quantization::QuantConfig {
+        bits: config.quant_bits,
+        projections: config.quant_projections,
+        seed: 42,
+        algorithm: match config.quant_algorithm {
+            crate::config::QuantAlgorithm::TurboQuant => {
+                crate::quantization::QuantAlgorithm::TurboQuant
+            }
+            crate::config::QuantAlgorithm::PolarQuant => {
+                crate::quantization::QuantAlgorithm::PolarQuant
+            }
+            crate::config::QuantAlgorithm::None => {
+                crate::quantization::QuantAlgorithm::TurboQuant
+            }
+        },
+    };
+    crate::quantization::QuantizedStore::new(dim, qcfg).ok()
+}
+
 impl SplatStore {
     /// Gaussian score of a splat for a query at squared distance `d2`.
     ///
@@ -92,27 +123,7 @@ impl SplatStore {
         );
 
         // Initialize subsystems based on preset config
-        let quant_store = if config.enable_quantization {
-            let qcfg = crate::quantization::QuantConfig {
-                bits: config.quant_bits,
-                projections: config.quant_projections,
-                seed: 42,
-                algorithm: match config.quant_algorithm {
-                    crate::config::QuantAlgorithm::TurboQuant => {
-                        crate::quantization::QuantAlgorithm::TurboQuant
-                    }
-                    crate::config::QuantAlgorithm::PolarQuant => {
-                        crate::quantization::QuantAlgorithm::PolarQuant
-                    }
-                    crate::config::QuantAlgorithm::None => {
-                        crate::quantization::QuantAlgorithm::TurboQuant
-                    }
-                },
-            };
-            crate::quantization::QuantizedStore::new(dim, qcfg).ok()
-        } else {
-            None
-        };
+        let quant_store = build_quant_store(&config, dim);
 
         // Factory: candidate backend (HNSW today, chosen by config; CAGRA and
         // other backends will be dispatched here without touching the store).
@@ -626,28 +637,7 @@ impl SplatStore {
         }
 
         // Strategy 2: Collect candidates from approximate backends
-        let mut candidate_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
-
-        // Quantized search
-        if let Some(ref qs) = self.quant_store {
-            let qresults = qs.search(query, k * 5);
-            for (id, _) in qresults {
-                let idx = id as usize;
-                if idx < n {
-                    candidate_set.insert(idx);
-                }
-            }
-        }
-
-        // LSH search
-        if let Some(ref lsh) = self.lsh {
-            let (indices, _) = lsh.query(query, k * 5);
-            for &idx in &indices {
-                if idx < n {
-                    candidate_set.insert(idx);
-                }
-            }
-        }
+        let candidate_set = self.collect_candidate_indices(query, k, n);
 
         // If we have candidates from approximate backends, re-rank them
         if !candidate_set.is_empty() {
@@ -674,6 +664,42 @@ impl SplatStore {
 
         // Strategy 3: Fallback — linear scan (always correct, O(N))
         self.find_neighbors(query, k)
+    }
+
+    /// Strategy 2 candidate collection: query the quantized store and the LSH
+    /// index, unioning their candidate indices (bounded by `n`).
+    ///
+    /// Extracted from `find_neighbors_fused` (repowise plan
+    /// `refac4_6651a3444f9deba6fbb9`); behavior identical.
+    fn collect_candidate_indices(
+        &self,
+        query: &ArrayView1<f32>,
+        k: usize,
+        n: usize,
+    ) -> std::collections::HashSet<usize> {
+        let mut candidate_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        // Quantized search
+        if let Some(ref qs) = self.quant_store {
+            let qresults = qs.search(query, k * 5);
+            for (id, _) in qresults {
+                let idx = id as usize;
+                if idx < n {
+                    candidate_set.insert(idx);
+                }
+            }
+        }
+
+        // LSH search
+        if let Some(ref lsh) = self.lsh {
+            let (indices, _) = lsh.query(query, k * 5);
+            for &idx in &indices {
+                if idx < n {
+                    candidate_set.insert(idx);
+                }
+            }
+        }
+        candidate_set
     }
 
     /// Find the k best splats under the EXACT Gaussian score.
