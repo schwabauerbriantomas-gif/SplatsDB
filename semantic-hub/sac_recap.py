@@ -19,10 +19,8 @@ Salida: recap a stdout (y a --out si se pasa). --json agrega stats.
 """
 import argparse
 import json
-import shutil
 import sqlite3
 import sys
-import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -34,10 +32,8 @@ MAX_NOTE_CHARS = 600
 
 
 def load_session(db_path: Path, session_id: str | None, last: bool):
-    """Copia el state.db a /tmp y devuelve (session_key, messages)."""
-    tmp = Path(tempfile.mkdtemp(prefix="sacrecap")) / "state_copy.db"
-    shutil.copy2(db_path, tmp)
-    con = sqlite3.connect(tmp)
+    """Abre el state.db en modo RO (URI, sin copia: 0ms vs 16s de copy)."""
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     cur = con.cursor()
     if session_id:
         row = cur.execute(
