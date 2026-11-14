@@ -178,6 +178,7 @@ def build_digest(entries, title_lookup):
     by_sid = defaultdict(list)
     for (sid, _qh), e in turns.items():
         by_sid[sid].append(e)
+    dead_sess = 0
     for sid, evs in sorted(by_sid.items(), key=lambda kv: min(e["ts"] for e in kv[1])):
         seq = session_windows(sid)
         title = title_lookup.get(sid, "")
@@ -205,6 +206,8 @@ def build_digest(entries, title_lookup):
                          f"{len(e.get('hits', []))} · dist med {med} · "
                          f"tipos {dict(kinds)}")
         used_inj += u_sess
+        if u_sess == 0:
+            dead_sess += 1
     lines.append("")
     if cuts:
         cds = [c.get("cut_dist") for c in cuts if c.get("cut_dist") is not None]
@@ -213,19 +216,14 @@ def build_digest(entries, title_lookup):
     lines.append(f"TOTAL: {total_inj} turnos con inyección "
                  f"(de {fires} fires del hook) · {total_hits} hits · "
                  f"{used_inj} con uso detectado ({used_inj/max(1,total_inj):.0%})")
-    n_sess = len({k[0] for k in turns})
-    dead = 0
-    for sid2, evs in [(k[0], [v]) for k, v in turns.items()]:
-        seq2 = session_windows(sid2)
-        if not any(usage_for(e, seq2, get_api_content(sid2, e["ts"]))[0]
-                   for e in evs):
-            dead += 1
-    lines.append(f"sesiones con recalls: {n_sess} · sin uso detectado: {dead}")
+    n_sess = len(by_sid)
+    lines.append(f"sesiones con recalls: {n_sess} · sin uso detectado: "
+                 f"{dead_sess} (sesión sin NINGÚN turno con uso)")
     lines.append("(detector: tokens del snippet en ventana de 4 asistentes; "
                  "levemente más liberal que el análisis histórico por usar "
                  "top-3 snippets — acuerdo 87% validado 14-nov)")
     return "\n".join(lines), {"injections": total_inj, "used": used_inj,
-                              "sessions": n_sess, "dead_sessions": dead,
+                              "sessions": n_sess, "dead_sessions": dead_sess,
                               "fires": fires, "cuts": len(cuts)}
 
 
