@@ -1374,35 +1374,7 @@ fn handle_spatial_info(state: &Mutex<McpState>) -> Result<Value, String> {
     let mut wings: std::collections::HashMap<String, std::collections::HashSet<String>> =
         std::collections::HashMap::new();
     let mut halls: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut total_with_spatial = 0usize;
-
-    for id in &all_ids {
-        if let Ok(Some(rec)) = s.doc_store.get(id) {
-            if let Some(ref meta) = rec.metadata {
-                let has_wing = meta.get("wing").and_then(|v| v.as_str()).is_some();
-                let has_room = meta.get("room").and_then(|v| v.as_str()).is_some();
-                let has_hall = meta.get("hall").and_then(|v| v.as_str());
-
-                if has_wing || has_room || has_hall.is_some() {
-                    total_with_spatial += 1;
-                }
-
-                if let (Some(w), Some(r)) = (
-                    meta.get("wing").and_then(|v| v.as_str()),
-                    meta.get("room").and_then(|v| v.as_str()),
-                ) {
-                    wings
-                        .entry(w.to_string())
-                        .or_default()
-                        .insert(r.to_string());
-                }
-
-                if let Some(h) = has_hall {
-                    halls.insert(h.to_string());
-                }
-            }
-        }
-    }
+    let total_with_spatial = scan_spatial_metadata(&all_ids, &s, &mut wings, &mut halls);
 
     // Detect tunnels: rooms shared across wings
     let mut room_wings: std::collections::HashMap<String, Vec<String>> =
@@ -1442,6 +1414,52 @@ fn handle_spatial_info(state: &Mutex<McpState>) -> Result<Value, String> {
         "tunnels": tunnels,
         "tunnel_count": tunnels.len(),
     }))
+}
+
+/// Scan SQLite document metadata and build the spatial structure: every doc
+/// carrying wing/room/hall keys counts toward `total_with_spatial`, wing+room
+/// pairs fill the wings→rooms map and halls collect their keys.
+///
+/// Extracted from `handle_spatial_info` (repowise plan
+/// `refac4_6f2457a170b6b105922b`) — deviation from the plan signature: wings
+/// and halls are filled here, so they pass by `&mut` (the plan's `&` would
+/// not compile). Behavior identical; the guard stays held by the caller.
+fn scan_spatial_metadata(
+    all_ids: &[String],
+    s: &McpState,
+    wings: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+    halls: &mut std::collections::HashSet<String>,
+) -> usize {
+    let mut total_with_spatial = 0usize;
+
+    for id in all_ids {
+        if let Ok(Some(rec)) = s.doc_store.get(id) {
+            if let Some(ref meta) = rec.metadata {
+                let has_wing = meta.get("wing").and_then(|v| v.as_str()).is_some();
+                let has_room = meta.get("room").and_then(|v| v.as_str()).is_some();
+                let has_hall = meta.get("hall").and_then(|v| v.as_str());
+
+                if has_wing || has_room || has_hall.is_some() {
+                    total_with_spatial += 1;
+                }
+
+                if let (Some(w), Some(r)) = (
+                    meta.get("wing").and_then(|v| v.as_str()),
+                    meta.get("room").and_then(|v| v.as_str()),
+                ) {
+                    wings
+                        .entry(w.to_string())
+                        .or_default()
+                        .insert(r.to_string());
+                }
+
+                if let Some(h) = has_hall {
+                    halls.insert(h.to_string());
+                }
+            }
+        }
+    }
+    total_with_spatial
 }
 
 // ============================================================================

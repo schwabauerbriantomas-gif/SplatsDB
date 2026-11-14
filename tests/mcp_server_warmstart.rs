@@ -185,6 +185,73 @@ impl Server {
     }
 }
 
+/// Characterization for `splatsdb_spatial_info`: the tool scans SQLite
+/// metadata (not the in-memory spatial index) to build the wings/rooms/halls
+/// structure. Pins the response shape before the metadata-scan loop is
+/// extracted into a helper.
+#[test]
+fn spatial_info_metadata_scan_characterization() {
+    let tmp = std::env::temp_dir().join(format!(
+        "splatsdb_spatial_info_char_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let doc_db = tmp.join("docs.db");
+
+    {
+        let mut srv = spawn_server(&doc_db, false);
+        let res = srv.call_tool(
+            1,
+            "splatsdb_doc_add",
+            serde_json::json!({
+                "id": "mem_info_1",
+                "text": "characterization doc for spatial_info metadata scan",
+                "metadata": "{\"wing\":\"info_wing\",\"room\":\"info_room\",\"hall\":\"info_hall\"}"
+            }),
+        );
+        assert_eq!(res["ok"], serde_json::json!(true), "doc_add failed: {res}");
+
+        let info = srv.call_tool(2, "splatsdb_spatial_info", serde_json::json!({}));
+        assert_eq!(
+            info["total_documents"],
+            serde_json::json!(1),
+            "spatial_info total_documents wrong: {info}"
+        );
+        assert_eq!(
+            info["documents_with_spatial_metadata"],
+            serde_json::json!(1),
+            "spatial_info documents_with_spatial_metadata wrong: {info}"
+        );
+        assert_eq!(
+            info["wings"],
+            serde_json::json!({"info_wing": ["info_room"]}),
+            "spatial_info wings structure wrong: {info}"
+        );
+        assert_eq!(
+            info["halls"],
+            serde_json::json!(["info_hall"]),
+            "spatial_info halls wrong: {info}"
+        );
+        assert_eq!(
+            info["tunnels"],
+            serde_json::json!([]),
+            "spatial_info tunnels wrong: {info}"
+        );
+        assert_eq!(
+            info["tunnel_count"],
+            serde_json::json!(0),
+            "spatial_info tunnel_count wrong: {info}"
+        );
+        srv.shutdown();
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 #[test]
 fn warm_start_spatial_registration_characterization() {
     let tmp = std::env::temp_dir().join(format!(
