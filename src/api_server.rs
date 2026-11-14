@@ -1689,7 +1689,8 @@ mod tests {
         assert!(score < 1e-4, "exact match distance must be ~0, got {score}");
         assert!(results[0]["metadata"].is_null());
 
-        // Text-only query (hash embedding path) still returns k results.
+        // (fa1e528) Text-only query → 400: el fallback text-hash producía
+        // ranking de ruido con 200 OK; el contrato exige embedding.
         let (status, body) = send(
             app,
             "POST",
@@ -1697,8 +1698,11 @@ mod tests {
             Some(json!({ "query": "hello world", "top_k": 3 })),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["results"].as_array().unwrap().len(), 3);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.to_string().contains("missing embedding"),
+            "text-only search must be rejected with the reason, got: {body}"
+        );
     }
 
     #[tokio::test]
@@ -1748,7 +1752,7 @@ mod tests {
             app,
             "POST",
             "/search?rescore=bogus",
-            Some(json!({ "query": "a" })),
+            Some(json!({ "query": "a", "embedding": unit_vec(32, 0) })),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -1998,7 +2002,7 @@ mod tests {
                     app_i,
                     "POST",
                     "/search",
-                    Some(json!({ "query": format!("q{i}"), "top_k": 4 })),
+                    Some(json!({ "query": format!("q{i}"), "embedding": unit_vec(32, i % 3), "top_k": 4 })),
                 )
                 .await
             }));
