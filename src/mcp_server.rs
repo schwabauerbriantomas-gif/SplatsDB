@@ -1872,26 +1872,12 @@ pub fn run_mcp_server() {
         spatial_index: crate::spatial::SpatialIndex::new(),
     });
 
-    // Register spatial metadata from warm start
-    {
-        let mut s = state.lock().unwrap();
-        for (doc_id, wing, room, hall) in &warm_start_spatial {
-            s.spatial_index
-                .register_doc(doc_id, wing.as_deref(), room.as_deref(), hall.as_deref());
-        }
-        if !warm_start_spatial.is_empty() {
-            eprintln!(
-                "[splatsdb] Warm start: registered {} spatial metadata entries in {:.0} ms (SPLATDB_SPATIAL_WARMSTART={})",
-                warm_start_spatial.len(),
-                warm_start_t0.elapsed().as_secs_f64() * 1000.0,
-                if spatial_warmstart_enabled { "on" } else { "off" }
-            );
-        } else if !spatial_warmstart_enabled {
-            eprintln!(
-                "[splatsdb] Warm start: spatial registration skipped (SPLATDB_SPATIAL_WARMSTART=0)"
-            );
-        }
-    }
+    register_warm_start_spatial(
+        &state,
+        &warm_start_spatial,
+        spatial_warmstart_enabled,
+        warm_start_t0,
+    );
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -2104,6 +2090,38 @@ pub fn run_mcp_server() {
 /// (doc_id, wing, room, hall) pairs collected during warm start for spatial
 /// registration afterwards.
 type WarmStartSpatial = Vec<(String, Option<String>, Option<String>, Option<String>)>;
+
+/// Register the spatial metadata collected during warm start into the live
+/// index and report the outcome on stderr.
+///
+/// Extracted from `run_mcp_server` (repowise plan `refac4_c7b69cacc17990c0271a`).
+/// Behavior is identical to the former scoped block, including the lock scope:
+/// the state mutex is acquired and released entirely inside this helper, never
+/// held across the request loop that follows.
+fn register_warm_start_spatial(
+    state: &Mutex<McpState>,
+    warm_start_spatial: &WarmStartSpatial,
+    spatial_warmstart_enabled: bool,
+    warm_start_t0: std::time::Instant,
+) {
+    let mut s = state.lock().unwrap();
+    for (doc_id, wing, room, hall) in warm_start_spatial {
+        s.spatial_index
+            .register_doc(doc_id, wing.as_deref(), room.as_deref(), hall.as_deref());
+    }
+    if !warm_start_spatial.is_empty() {
+        eprintln!(
+            "[splatsdb] Warm start: registered {} spatial metadata entries in {:.0} ms (SPLATDB_SPATIAL_WARMSTART={})",
+            warm_start_spatial.len(),
+            warm_start_t0.elapsed().as_secs_f64() * 1000.0,
+            if spatial_warmstart_enabled { "on" } else { "off" }
+        );
+    } else if !spatial_warmstart_enabled {
+        eprintln!(
+            "[splatsdb] Warm start: spatial registration skipped (SPLATDB_SPATIAL_WARMSTART=0)"
+        );
+    }
+}
 
 /// SPLATDB_SPATIAL_WARMSTART parser: absent/anything-but-falsy → true
 /// (default ON); "0", "off", "false", "no" (case-insensitive, trimmed) →

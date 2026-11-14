@@ -134,14 +134,17 @@ impl Server {
             assert!(
                 !is_error,
                 "tools/call {name} returned isError=true: {}",
-                v.pointer("/result/content/0/text").and_then(|t| t.as_str()).unwrap_or("?")
+                v.pointer("/result/content/0/text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("?")
             );
             let text = v
                 .pointer("/result/content/0/text")
                 .and_then(|t| t.as_str())
                 .unwrap_or_else(|| panic!("missing content text in response for {name}: {v}"));
-            return serde_json::from_str(text)
-                .unwrap_or_else(|e| panic!("tool result for {name} is not valid JSON: {e}: {text}"));
+            return serde_json::from_str(text).unwrap_or_else(|e| {
+                panic!("tool result for {name} is not valid JSON: {e}: {text}")
+            });
         }
     }
 
@@ -150,7 +153,10 @@ impl Server {
     fn wait_stderr_containing(&self, needle: &str, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            match self.stderr_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            match self
+                .stderr_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
                 Ok(line) => {
                     if line.contains(needle) {
                         return true;
