@@ -1013,63 +1013,73 @@ fn cpu_fused_batch(
     Ok(per_query)
 }
 
-/// GPU path: refresh the flat snapshot only when the dataset changed, then a
-/// single `gpu::batch_search` for the whole batch (GPU top-k kernel with CPU
-/// fallback inside). The store mutex is never held during the search.
-fn gpu_batch_path(
+/// Refresh the CPU-side dataset snapshot when the store's `data_version`
+/// moved (add/load/compact) or there is no snapshot yet; drops it when the
+/// store is empty. `data_version` drives both the staleness check and the
+/// VRAM-cache key; `n_active` sizes the arrays.
+///
+/// Extracted from `gpu_batch_path` (repowise XL queue, split step); behavior
+/// identical. The store lock is taken briefly and released before any GPU
+/// work — the search itself never holds the store mutex.
+fn refresh_dataset_snapshot(
     store: &Arc<Mutex<SplatStore>>,
     snapshot: &mut Option<DatasetSnapshot>,
+) {
+    let s = store.blocking_lock();
+    let version = s.data_version();
+    let n = s.n_active();
+    let stale = match snapshot.as_ref() {
+        Some(snap) => snap.version != version,
+        None => true,
+    };
+    if n == 0 {
+        *snapshot = None;
+    } else if stale {
+        if let Some(mu) = s.get_mu() {
+            let dim = mu.ncols();
+            let data = mu.iter().copied().collect::<Vec<f32>>();
+            let alpha = s
+                .get_alpha()
+                .map(|a| a.iter().copied().collect::<Vec<f32>>())
+                .unwrap_or_else(|| vec![1.0f32; n]);
+            let kappa = s
+                .get_kappa()
+                .map(|k| k.iter().copied().collect::<Vec<f32>>())
+                .unwrap_or_else(|| vec![10.0f32; n]);
+            *snapshot = Some(DatasetSnapshot {
+                version,
+                n,
+                dim,
+                data,
+                alpha,
+                kappa,
+            });
+        }
+    }
+}
+
+/// Split the batch into gaussian-rescored and plain-L2 queries, flatten each
+/// group, and run the VRAM-resident GPU kernels once for the whole batch.
+/// Gaussian-rescored queries go through `gpu::gaussian_topk_scores` (B1
+/// wrapper: GPU kernel + exact CPU fallback, returns score-sorted top-k
+/// directly); plain L2 queries through `gpu::batch_search` (top-k kernel,
+/// squared-L2 → sqrt).
+///
+/// One VRAM-resident index serves the whole batch (and every later batch with
+/// the same dataset version): the `*_cached` wrappers key the process-level
+/// GpuIndex on (snapshot version, n, dim), so mu+alpha+kappa upload once per
+/// dataset version instead of once per batch. On a cache decline (small
+/// dataset / no CUDA / kernel failure) they fall back to the per-call
+/// wrappers — same results as before.
+///
+/// Extracted from `gpu_batch_path` (repowise XL queue, split step); behavior
+/// identical.
+fn split_and_run_gpu_kernels(
+    snap: &DatasetSnapshot,
     queries: &[Vec<f32>],
     ks: &[usize],
     rescore: &[bool],
-) -> Result<Vec<Vec<SearchResult>>, String> {
-    // ── Snapshot refresh under a brief lock ──
-    {
-        let s = store.blocking_lock();
-        // data_version (bumps on add/load/compact) drives both the staleness
-        // check and the VRAM-cache key below; n_active sizes the arrays.
-        let version = s.data_version();
-        let n = s.n_active();
-        let stale = match snapshot.as_ref() {
-            Some(snap) => snap.version != version,
-            None => true,
-        };
-        if n == 0 {
-            *snapshot = None;
-        } else if stale {
-            if let Some(mu) = s.get_mu() {
-                let dim = mu.ncols();
-                let data = mu.iter().copied().collect::<Vec<f32>>();
-                let alpha = s
-                    .get_alpha()
-                    .map(|a| a.iter().copied().collect::<Vec<f32>>())
-                    .unwrap_or_else(|| vec![1.0f32; n]);
-                let kappa = s
-                    .get_kappa()
-                    .map(|k| k.iter().copied().collect::<Vec<f32>>())
-                    .unwrap_or_else(|| vec![10.0f32; n]);
-                *snapshot = Some(DatasetSnapshot {
-                    version,
-                    n,
-                    dim,
-                    data,
-                    alpha,
-                    kappa,
-                });
-            }
-        }
-    } // lock released — the search itself never holds the store mutex
-
-    let snap = snapshot
-        .as_ref()
-        .ok_or_else(|| "store is empty".to_string())?;
-
-    let n_queries = queries.len();
-
-    // ── Split the batch: gaussian-rescored queries go through
-    // `gpu::gaussian_topk_scores` (B1 wrapper: GPU kernel + exact CPU
-    // fallback, returns score-sorted top-k directly), plain L2 queries
-    // through `gpu::batch_search` (top-k kernel, squared-L2 → sqrt).
+) -> Result<(Vec<Vec<(usize, f32)>>, Vec<(Vec<usize>, Vec<f32>)>), String> {
     let gauss_flat: Vec<f32> = queries
         .iter()
         .zip(rescore.iter())
@@ -1098,12 +1108,6 @@ fn gpu_batch_path(
         .collect();
     let n_l2 = l2_ks.len();
 
-    // ── One VRAM-resident index for the whole batch (and every later batch
-    // with the same dataset version): the `*_cached` wrappers key the
-    // process-level GpuIndex on (snapshot version, n, dim), so mu+alpha+
-    // kappa upload once per dataset version instead of once per batch. On a
-    // cache decline (small dataset / no CUDA / kernel failure) they fall
-    // back to the per-call wrappers — same results as before.
     let data_view = ndarray::ArrayView2::from_shape((snap.n, snap.dim), &snap.data)
         .map_err(|e| format!("snapshot reshape failed: {e}"))?;
 
@@ -1129,6 +1133,29 @@ fn gpu_batch_path(
     } else {
         Vec::new()
     };
+    Ok((gauss_out, l2_out))
+}
+
+/// GPU path: refresh the flat snapshot only when the dataset changed, then a
+/// single `gpu::batch_search` for the whole batch (GPU top-k kernel with CPU
+/// fallback inside). The store mutex is never held during the search.
+fn gpu_batch_path(
+    store: &Arc<Mutex<SplatStore>>,
+    snapshot: &mut Option<DatasetSnapshot>,
+    queries: &[Vec<f32>],
+    ks: &[usize],
+    rescore: &[bool],
+) -> Result<Vec<Vec<SearchResult>>, String> {
+    // ── Snapshot refresh under a brief lock ──
+    refresh_dataset_snapshot(store, snapshot);
+
+    let snap = snapshot
+        .as_ref()
+        .ok_or_else(|| "store is empty".to_string())?;
+
+    let n_queries = queries.len();
+
+    let (gauss_out, l2_out) = split_and_run_gpu_kernels(snap, queries, ks, rescore)?;
 
     // ── Reassemble rows in original request order.
     let mut per_query = Vec::with_capacity(n_queries);
@@ -1301,6 +1328,33 @@ fn is_loopback_addr(addr: &str) -> bool {
     matches!(a.as_str(), "localhost" | "::1" | "[::1]") || a.starts_with("127.")
 }
 
+/// Auto-load the on-disk inputs for `serve`: the `default` shard from
+/// `data_dir` (if present) into `store`, so `serve` boots with the vectors
+/// indexed by the CLI instead of an empty store and honours the CLI --dim
+/// flag instead of SplatsDBConfig::default() (issue #3); then the `field/`
+/// corpus for /search — si hay field/, el índice busca el corpus completo
+/// (field.raw — exacto sobre TODOS los chunks); si no, el shard cargado
+/// (splats/μ — en stores planos son los propios vectores).
+///
+/// Extracted from `run_server` (repowise plan `refac4_829dc22e97478fcffcab`);
+/// messages and behavior identical. Returns the field corpus, if any.
+fn load_serve_inputs(data_dir: &str, store: &mut SplatStore) -> Option<FieldData> {
+    match load_default_shard(store, data_dir) {
+        Ok(n) if n > 0 => eprintln!(
+            "[splatsdb] serve: loaded {n} vectors (dim {}) from {data_dir}",
+            store.get_statistics().embedding_dim
+        ),
+        Ok(_) => eprintln!("[splatsdb] serve: no existing data in {data_dir}, starting empty"),
+        Err(e) => eprintln!("[splatsdb] serve: failed to load {data_dir}: {e}"),
+    }
+
+    let field_data = load_field(data_dir);
+    if field_data.is_some() {
+        eprintln!("[splatsdb] serve: campo splat cargado (/field-search disponible)");
+    }
+    field_data
+}
+
 pub async fn run_server(
     addr: &str,
     port: u16,
@@ -1312,25 +1366,7 @@ pub async fn run_server(
     let hnsw_on = config.enable_hnsw;
     let mut store = SplatStore::new(config);
 
-    // Auto-load the `default` shard from `data_dir` (if present) so `serve`
-    // boots with the vectors indexed by the CLI instead of an empty store,
-    // and honours the CLI --dim flag instead of SplatsDBConfig::default() (issue #3).
-    match load_default_shard(&mut store, data_dir) {
-        Ok(n) if n > 0 => eprintln!(
-            "[splatsdb] serve: loaded {n} vectors (dim {}) from {data_dir}",
-            store.get_statistics().embedding_dim
-        ),
-        Ok(_) => eprintln!("[splatsdb] serve: no existing data in {data_dir}, starting empty"),
-        Err(e) => eprintln!("[splatsdb] serve: failed to load {data_dir}: {e}"),
-    }
-
-    // ── Corpus para /search: si hay field/, el índice busca el corpus
-    // completo (field.raw — exacto sobre TODOS los chunks); si no, el shard
-    // cargado (splats/μ — en stores planos son los propios vectores).
-    let field_data = load_field(data_dir);
-    if field_data.is_some() {
-        eprintln!("[splatsdb] serve: campo splat cargado (/field-search disponible)");
-    }
+    let field_data = load_serve_inputs(data_dir, &mut store);
     let corpus: Option<(Vec<f32>, usize, usize)> = if let Some(f) = &field_data {
         let (n, d) = f.raw.dim();
         let slice = f
