@@ -2,7 +2,7 @@
 """Smoke test end-to-end del hub de memoria Hermes.
 
 Valida, contra servicios reales:
-  1. embed server (:8860) y hub (:8872) sanos
+  1. embed server (:8860) y hubs (:8872/:8873) sanos
   2. sidecar y shard bin consistentes (mismo número de docs)
   3. recall semántico: queries de paráfrasis (sin compartir keywords con
      el target) encuentran la sesión esperada en top-k
@@ -13,6 +13,9 @@ corpus crece con sesiones más nuevas, el rank puede moverse: el smoke
 falla solo si la sesión correcta sale del top-k.
 
 Exit 0 = PASS. Exit 1 = FAIL (detalla cuál check falló).
+
+Refactor 14-nov (repowise marcaba main() complex_method, score 5.1):
+split mecánico por fase — lógica idéntica, funciones testables.
 """
 import json
 import os
@@ -47,13 +50,11 @@ def check(name, ok, detail=""):
     return ok
 
 
-def main():
-    failures = 0
-    print("smoke hermes-hub:")
-
-    # 1. servicios
+def check_services(failures):
+    """1. salud: embed server + hub sesiones + hub código."""
     for name, url in (("embed-server", f"{EMBED_URL_DEFAULT.split('/v1')[0]}/health"),
-                      ("hub", f"http://127.0.0.1:{HUB_PORT}/health")):
+                      ("hub", f"http://127.0.0.1:{HUB_PORT}/health"),
+                      ("hub código (:8873)", "http://127.0.0.1:8873/health")):
         try:
             resp = json.loads(urllib.request.urlopen(url, timeout=5).read())
             ok = resp.get("status") == "ok"
@@ -62,10 +63,15 @@ def main():
         except Exception as e:
             failures += 1
             check(f"health {name}", False, str(e)[:80])
+    return failures
 
-    # 2. consistencia sidecar/bin (ambos hubs) + 4. drift part/sidecar
-    # (bug real detectado: ciclo sin merge de sesiones — el check debe
-    # correr POR HUB; antes usaba variables del loop y solo auditaba código)
+
+def check_consistency(failures):
+    """2. consistencia sidecar/bin + drift part/sidecar, POR HUB.
+
+    (bug real detectado: ciclo sin merge de sesiones — el check debe
+    correr por hub; antes usaba variables del loop y solo auditaba código)
+    """
     for label, hub in (("sesiones", HERMES_HUB),
                        ("código", "/mnt/d/splatdb/hermes-hub-code")):
         ndocs = -1
@@ -99,19 +105,12 @@ def main():
         except Exception as e:
             failures += 1
             check(f"part/sidecar sin drift ({label})", False, str(e)[:80])
+    return failures
 
-    # 3. health del hub de código
-    try:
-        resp = json.loads(urllib.request.urlopen(
-            "http://127.0.0.1:8873/health", timeout=5).read())
-        ok = resp.get("status") == "ok"
-        check("health hub código (:8873)", ok, json.dumps(resp)[:80])
-        failures += 0 if ok else 1
-    except Exception as e:
-        failures += 1
-        check("health hub código (:8873)", False, str(e)[:80])
 
-    # 4. recall semántico (paráfrasis → sesión esperada en top-k)
+def check_recall_cases(failures):
+    """3. recall semántico (paráfrasis → sesión esperada en top-k) +
+    recall de código (top-3 = kind repo en el hub de código)."""
     from hermes_recall import recall
     for name, query, sid_substr, k in CASES:
         try:
@@ -141,7 +140,6 @@ def main():
             failures += 1
             check(f"recall {name}", False, str(e)[:80])
 
-    # 5. recall de código: en el hub puro de código, top-3 debe ser kind=repo
     try:
         from hermes_recall import recall_any
         t0 = time.monotonic()
@@ -155,14 +153,16 @@ def main():
     except Exception as e:
         failures += 1
         check("recall código (top-3 = kind repo)", False, str(e)[:80])
+    return failures
 
-    # 5. sanidad de la métrica: la distancia del literal DEBE ser menor que
-    #    la de basura (detecta inversiones de semántica score/distance)
+
+def check_metric_sanity(failures):
+    """4. sanidad de la métrica: la distancia del literal DEBE ser menor
+    que la de basura (detecta inversiones de semántica score/distance)."""
     try:
         from hermes_lib import embed_texts, search_hub, QUERY_PROMPT, DIMS
-        import sqlite3 as _sq
-        _con = _sq.connect(f"file:{os.path.join(HERMES_HUB, 'sidecar.db')}?mode=ro",
-                           uri=True)
+        _con = sqlite3.connect(f"file:{os.path.join(HERMES_HUB, 'sidecar.db')}?mode=ro",
+                               uri=True)
         _lit = _con.execute(
             "SELECT text FROM chunks WHERE meta LIKE '%20261026_191031%' "
             "LIMIT 1").fetchone()[0][:120]
@@ -180,7 +180,16 @@ def main():
     except Exception as e:
         failures += 1
         check("métrica: literal < basura (distancia)", False, str(e)[:80])
+    return failures
 
+
+def main():
+    failures = 0
+    print("smoke hermes-hub:")
+    failures = check_services(failures)
+    failures = check_consistency(failures)
+    failures = check_recall_cases(failures)
+    failures = check_metric_sanity(failures)
     print(f"\n{'PASS ✓' if failures == 0 else f'FAIL ✗ ({failures} checks)'}")
     return 1 if failures else 0
 
