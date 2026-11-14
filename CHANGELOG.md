@@ -1,5 +1,17 @@
 # Changelog
 
+## [v2.8.1] - 2026-11-14
+
+### Added
+- **api**: `POST /recap` — recap SAC-style de handoff, LLM-free (ver módulo `src/recap.rs`). Recibe `{objective, actions[], max_words}` inline (stateless: sin store, sin mutex) y devuelve un recap determinista por extracción: clasificación por heurística (changes/verification/dead-ends/facts) + ranking TF-IDF contra objetivo y acciones recientes + `semantic_compress`, con trim post-render que garantiza el contrato de palabras (max 397/400 sobre 30 recaps reales). 8 tests nuevos (6 unit + 2 router). Latencia: 9.1ms server mediana, p90 13.3ms sobre 30 recaps de trayectorias reales.
+- **semantic-hub**: `sac_recap.py` — cliente para compactar el estado de una sesión Hermes: lee state.db en RO (copia a /tmp), arma el action log y pide el recap al hub. Es la variante agéntica validada en sac_falsif.
+
+### Measured
+- A/B en el harness sac_falsif (10 bugs reales de `requests`, GLM-5.3-flash, 40 runs): brazo SACDB (recap por /recap en cada acción) 10/10 con wall mediana **162s** vs SAC-LLM 689s (4.45×) y FHA 323s (3.06×); contexto pico 2.7K tokens; overhead de recap 4.7s TOTAL en ~450 compactaciones. Detalles: `~/sac_falsif/STATE.md`.
+
+### Fixed
+- `emeans.rs`: 3 `needless_range_loop` en el fixture de tests (clippy nuevo); mismos valores, mismo orden de sampling del RNG.
+
 ## [v2.8.0] - 2026-11-13
 
 ### Added
