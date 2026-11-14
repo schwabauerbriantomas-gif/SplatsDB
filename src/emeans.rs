@@ -295,18 +295,18 @@ mod tests {
         let mut x = Vec::with_capacity(4 * n_per * d);
         let mut centers = vec![vec![0f32; d]; 4];
         for (c, cent) in centers.iter_mut().enumerate() {
-            for t in 0..d {
-                cent[t] = if t == c * 7 % d {
+            for (t, slot) in cent.iter_mut().enumerate() {
+                *slot = if t == c * 7 % d {
                     2.0
                 } else {
                     0.1 * (c as f32 + 1.0)
                 };
             }
         }
-        for c in 0..4usize {
+        for center in centers.iter() {
             for _ in 0..n_per {
-                for t in 0..d {
-                    x.push(centers[c][t] + normal.sample(&mut rng));
+                for v in center.iter() {
+                    x.push(*v + normal.sample(&mut rng));
                 }
             }
         }

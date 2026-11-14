@@ -5,6 +5,7 @@
 //!   POST /search  - Search memories (query text, top-k, `?rescore=gaussian`)
 //!   POST /status  - Get store stats
 //!   GET  /health  - Health check
+//!   POST /recap   - SAC-style handoff recap from an inline action log (LLM-free)
 //!
 //! Architecture (R9 audit):
 //!   - `/search` NEVER takes the global store mutex: it enqueues into an mpsc
@@ -29,6 +30,9 @@
 //!   - CORS restricted to localhost by default
 //!   - Input size limits enforced
 
+use crate::recap::{
+    build_recap, RecapRequest, RecapResponse, MAX_ACTION_TEXT_LEN, MAX_TOTAL_ACTIONS_LEN,
+};
 use axum::{
     extract::{Query, Request, State},
     http::{HeaderMap, StatusCode},
@@ -797,6 +801,39 @@ async fn field_search_handler(
     }
 }
 
+/// POST /recap — SAC-style handoff recap, LLM-free (see `recap` module docs).
+///
+/// Stateless: the action log comes inline in the request; the store is never
+/// touched (no mutex, no persistence). Deterministic output.
+async fn recap_handler(
+    Json(req): Json<RecapRequest>,
+) -> Result<Json<RecapResponse>, (StatusCode, String)> {
+    // Input size guards (mirror /store's limits, applied per action + total).
+    let mut total = 0usize;
+    for a in &req.actions {
+        if a.text.len() > MAX_ACTION_TEXT_LEN {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("Action text exceeds max length ({MAX_ACTION_TEXT_LEN})"),
+            ));
+        }
+        total += a.text.len();
+        if total > MAX_TOTAL_ACTIONS_LEN {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("Total action payload exceeds max length ({MAX_TOTAL_ACTIONS_LEN})"),
+            ));
+        }
+    }
+    if req.objective.len() > MAX_TEXT_LEN {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("Objective exceeds max length ({MAX_TEXT_LEN})"),
+        ));
+    }
+    Ok(Json(build_recap(&req)))
+}
+
 // ─── Batch worker (R9 §2) ─────────────────────────────────
 
 /// Cached flat copy of the active dataset for the GPU batch path.
@@ -1410,6 +1447,7 @@ fn build_router(state: AppState) -> Router {
         .route("/store", post(store_memory))
         .route("/search", post(search_memories))
         .route("/field-search", post(field_search_handler))
+        .route("/recap", post(recap_handler))
         // Layer order matters: `.layer()` wraps everything added BEFORE it,
         // so the LAST layer is the OUTERMOST. cors must be outermost so a
         // preflight OPTIONS is answered (with CORS headers) without going
@@ -1502,6 +1540,74 @@ mod tests {
         let mut v = vec![0.0f32; dim];
         v[axis] = 1.0;
         v
+    }
+
+    // ── recap: SAC handoff builder ─────────────────────────────
+
+    #[tokio::test]
+    async fn test_recap_endpoint() {
+        let (app, _) = test_app().await;
+        let actions: Vec<serde_json::Value> = (1..=5u64)
+            .map(|i| {
+                json!({
+                    "seq": i,
+                    "kind": if i == 2 { "error" } else { "command" },
+                    "text": if i == 2 {
+                        "Traceback: connection refused".to_string()
+                    } else {
+                        format!("pytest tests/test_{i}.py")
+                    }
+                })
+            })
+            .collect();
+        let (status, body) = send(
+            app.clone(),
+            "POST",
+            "/recap",
+            Some(json!({
+                "objective": "Fix the netrc auth guard",
+                "actions": actions,
+                "max_words": 100
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "recap failed: {body}");
+        let recap = body["recap"].as_str().expect("recap string");
+        assert!(recap.contains("OBJECTIVE:"), "recap must carry objective");
+        assert!(
+            recap.contains("DEAD ENDS"),
+            "error action must land in dead ends"
+        );
+        assert_eq!(body["actions_in"], 5);
+        assert!(body["words"].as_u64().unwrap() <= 100, "budget respected");
+        assert!(body["elapsed_ms"].as_f64().unwrap() >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_recap_endpoint_empty_and_deterministic() {
+        let (app, _) = test_app().await;
+        let (status, body) = send(
+            app.clone(),
+            "POST",
+            "/recap",
+            Some(json!({ "objective": "solo objetivo" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["actions_in"], 0);
+
+        // Same payload twice → byte-identical recap.
+        let payload = json!({
+            "objective": "Fix leak",
+            "actions": [
+                {"seq": 1, "kind": "command", "text": "pytest -x"},
+                {"seq": 2, "kind": "observation", "text": "1 passed in 0.1s"}
+            ]
+        });
+        let (s1, b1) = send(app.clone(), "POST", "/recap", Some(payload.clone())).await;
+        let (s2, b2) = send(app, "POST", "/recap", Some(payload)).await;
+        assert_eq!((s1, s2), (StatusCode::OK, StatusCode::OK));
+        assert_eq!(b1["recap"], b2["recap"]);
     }
 
     // ── health ──────────────────────────────────────────────

@@ -15,6 +15,7 @@ pub mod lsh_index;
 pub mod mcp_server;
 pub mod memory;
 pub mod quantization;
+pub mod recap;
 pub mod spatial;
 pub mod splat_types;
 pub mod splats;

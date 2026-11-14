@@ -17,7 +17,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Stop words to remove during semantic compression.
-const STOP_WORDS: &[&str] = &[
+pub(crate) const STOP_WORDS: &[&str] = &[
     "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
     "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can",
     "need", "dare", "ought", "used", "to", "of", "in", "for", "on", "with", "at", "by", "from",
