@@ -85,3 +85,7 @@ _swarm/
 # sidecars transitorios del hub vivo (dejar de trackear: churn infinito)
 semantic-hub/data/metadata/*.db-shm
 semantic-hub/data/metadata/*.db-wal
+
+# generados por repowise update (editor-specific, regenerables)
+.vscode/
+.github/copilot-instructions.md
