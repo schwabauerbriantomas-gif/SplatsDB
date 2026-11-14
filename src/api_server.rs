@@ -352,8 +352,6 @@ async fn search_memories(
     }
     let k = k_req;
 
-    #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
-    let had_embedding = req.embedding.is_some();
     // (14-nov) embedding obligatorio en /search: el fallback text-hash
     // devolvía L2 contra ruido determinista con 200 OK — un bug de cliente
     // se veía como "no hay memoria relevante" sin error. Los callers
@@ -375,7 +373,7 @@ async fn search_memories(
     // query de texto (hash embedding) siguen por el camino CPU.
     #[cfg(feature = "cuda")]
     if let Some(gpu) = &state.gpu {
-        if had_embedding && !rescore_gaussian {
+        if !rescore_gaussian {
             if let Some(mut per_query) = gpu.topk_search(&embedding, 1, k, "l2") {
                 if let Some((idxs, dists)) = per_query.pop() {
                     let mut pairs: Vec<(usize, f32)> = idxs.into_iter().zip(dists).collect();
@@ -435,10 +433,9 @@ async fn search_memories(
             eprintln!("[splatsdb] /search: batch worker error: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
         })?;
-    if had_embedding {
-        // scores L2 reales (no gaussian, no hash) → confidence espacial
-        enrich_topics(&state, &mut results, false);
-    }
+    // scores L2 reales (no gaussian, no hash) → confidence espacial
+    // (siempre: desde fa1e528 /search garantiza embedding)
+    enrich_topics(&state, &mut results, false);
 
     Ok(Json(SearchResponse {
         results,
