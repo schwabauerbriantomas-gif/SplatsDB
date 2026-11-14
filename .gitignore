@@ -79,3 +79,5 @@ hermes-hub-code/
 splatsdb_data/
 emb-test/*.png
 _swarm/
+.graphlint/
+.repowise/

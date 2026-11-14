@@ -159,7 +159,7 @@ def iter_m2m_chunks(db_path):
     con = sqlite3.connect(db_path)
     cur = con.execute("SELECT vector_idx, metadata, document, deleted, created_at "
                       "FROM documents WHERE deleted = 0 ORDER BY vector_idx")
-    for vec_idx, meta, doc, deleted, created in cur:
+    for vec_idx, meta, doc, _deleted, created in cur:
         text = (doc or "").strip() or (meta or "").strip()
         if not text:
             text = str(vec_idx)

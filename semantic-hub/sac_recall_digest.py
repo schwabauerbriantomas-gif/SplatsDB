@@ -255,6 +255,10 @@ def main():
     db.close()
 
     digest, stats = build_digest(entries, titles)
+    if "--json" in args:
+        # consumo programático (cron/agentes): sin parsear texto
+        print(json.dumps(stats, ensure_ascii=False, indent=1))
+        return
     if with_recap and sid:
         import subprocess
         r = subprocess.run([sys.executable, str(SAC_RECAP),
