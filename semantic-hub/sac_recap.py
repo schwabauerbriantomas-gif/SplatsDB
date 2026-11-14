@@ -18,6 +18,8 @@ Uso:
 Salida: recap a stdout (y a --out si se pasa). --json agrega stats.
 """
 import argparse
+import urllib.error
+import urllib.request
 import json
 import sqlite3
 import sys
@@ -116,8 +118,12 @@ def post_recap(url, objective, actions):
     req = urllib.request.Request(
         f"{url.rstrip('/')}/recap", data=payload,
         headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    except urllib.error.URLError as e:
+        sys.exit(f"hub inaccesible en {url} ({e.reason if hasattr(e, 'reason') else e}) — "
+                 f"levantá el hub o revisá --url")
 
 
 def main():
@@ -134,7 +140,8 @@ def main():
     sid, title, msgs = load_session(args.db, args.session_id, args.last)
     objective, actions = build_actions(msgs)
     if args.tail != MAX_ACTIONS:
-        actions = actions[-args.tail:]
+        # tail=0 debe truncar a nada (antes [-0:] devolvía la lista completa)
+        actions = actions[-args.tail:] if args.tail > 0 else []
     if not actions:
         sys.exit("la sesión no tiene acciones para compactar")
 

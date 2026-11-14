@@ -206,7 +206,9 @@ pub fn fit_emeans(
                         let v = row[t] - cent[t];
                         acc += v * v;
                     }
-                    if acc < bd {
+                    // guard NaN (14-nov): acc=NaN compara false y envenenaría
+                    // el cluster 0 (fila siempre en best=0) sin error
+                    if acc.is_finite() && acc < bd {
                         bd = acc;
                         best = j;
                     }

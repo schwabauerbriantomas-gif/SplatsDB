@@ -63,7 +63,9 @@ def main():
             failures += 1
             check(f"health {name}", False, str(e)[:80])
 
-    # 2. consistencia sidecar/bin (ambos hubs)
+    # 2. consistencia sidecar/bin (ambos hubs) + 4. drift part/sidecar
+    # (bug real detectado: ciclo sin merge de sesiones — el check debe
+    # correr POR HUB; antes usaba variables del loop y solo auditaba código)
     for label, hub in (("sesiones", HERMES_HUB),
                        ("código", "/mnt/d/splatdb/hermes-hub-code")):
         ndocs = -1
@@ -82,22 +84,21 @@ def main():
             failures += 1
             check(f"sidecar/bin consistentes ({label})", False, str(e)[:80])
 
-    # 4. drift part vs sidecar: si el part creció sin merge, el índice queda
-    #    viejo (bug real detectado: ciclo sin merge de sesiones)
-    try:
-        part_db = os.path.join(hub, "parts")
-        parts = [f for f in os.listdir(part_db) if f.endswith(".db")]
-        con = sqlite3.connect(f"file:{os.path.join(part_db, parts[0])}?mode=ro",
-                              uri=True)
-        npart = con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-        con.close()
-        ok = npart == ndocs
-        check(f"part/sidecar sin drift ({label})", ok,
-              f"part={npart}, sidecar={ndocs}" + ("" if ok else " — falta merge"))
-        failures += 0 if ok else 1
-    except Exception as e:
-        failures += 1
-        check(f"part/sidecar sin drift ({label})", False, str(e)[:80])
+        # drift part vs sidecar: si el part creció sin merge, el índice queda viejo
+        try:
+            part_db = os.path.join(hub, "parts")
+            parts = [f for f in os.listdir(part_db) if f.endswith(".db")]
+            con = sqlite3.connect(f"file:{os.path.join(part_db, parts[0])}?mode=ro",
+                                  uri=True)
+            npart = con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+            con.close()
+            ok = npart == ndocs
+            check(f"part/sidecar sin drift ({label})", ok,
+                  f"part={npart}, sidecar={ndocs}" + ("" if ok else " — falta merge"))
+            failures += 0 if ok else 1
+        except Exception as e:
+            failures += 1
+            check(f"part/sidecar sin drift ({label})", False, str(e)[:80])
 
     # 3. health del hub de código
     try:

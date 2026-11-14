@@ -969,9 +969,11 @@ fn cpu_fused_batch(
                 .map(|n| SearchResult {
                     index: n.index,
                     // rescore=gaussian → `score` is the Gaussian splat score
-                    // (higher is better); otherwise it is the exact L2
-                    // distance (lower is better).
-                    score: if want_rescore { n.score } else { n.distance },
+                    // (higher is better); otherwise it is the SQUARED exact
+                    // L2 distance (lower is better) — misma escala que el
+                    // path GPU (d²), para que las bandas calibradas del
+                    // cliente (0.55/0.70) sobrevivan un fallback a CPU.
+                    score: if want_rescore { n.score } else { n.distance * n.distance },
                     metadata: None,
                     confidence: None,
                     topic: None,

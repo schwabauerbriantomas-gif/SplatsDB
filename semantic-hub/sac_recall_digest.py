@@ -56,12 +56,20 @@ HDR = re.compile(
 
 
 def block_snippets(api_content):
-    """Snippets de los hits del bloque inyectado (metodología del análisis)."""
+    """Snippets de los hits del bloque inyectado (metodología del análisis).
+    Líneas tipo-header que no matchean el regex igual abren snippet nuevo:
+    evita que su texto contamine el snippet del hit anterior."""
     idx = api_content.find("[Memoria vectorial")
     if idx < 0:
         return []
     block = api_content[idx:]
     ms = list(HDR.finditer(block))
+    # posiciones de líneas header-like sin match (fallback anti-contaminación)
+    matched = {m.start() for m in ms}
+    for m2 in re.finditer(r"^\[(?:sesión|código) ", block, re.M):
+        if m2.start() not in matched:
+            ms.append(m2)
+    ms.sort(key=lambda m: m.start())
     out = []
     for i, m in enumerate(ms):
         end = ms[i+1].start() if i+1 < len(ms) else min(len(block), m.end()+400)
@@ -89,9 +97,16 @@ def load_log():
     out = []
     for line in LOG.read_text().splitlines():
         try:
-            out.append(json.loads(line))
+            e = json.loads(line)
         except Exception:
             continue
+        # schema-safe: JSON válido pero malformado se degrada, no crashea
+        if not isinstance(e, dict):
+            continue
+        ts = e.get("ts")
+        if not isinstance(ts, (int, float)):
+            continue
+        out.append(e)
     return out
 
 
@@ -135,17 +150,32 @@ def usage_for(entry, seq, api_content=None):
 
 
 def build_digest(entries, title_lookup):
-    by_sid = defaultdict(list)
+    # dedupe turn-level: el hook dispara por API-call, no por turno de
+    # usuario (medido 14-nov: 1 qhash = hasta 29 fires) — 1 inyección real
+    # = (session_id, qhash) único. Los cortes (arm=-1) nunca inyectaron:
+    # se listan aparte, no cuentan como inyecciones.
+    turns = {}
+    cuts = []
+    fires = 0
     for e in entries:
-        by_sid[e.get("session_id") or "?"].append(e)
+        fires += 1
+        if e.get("arm") == -1:
+            cuts.append(e)
+            continue
+        key = (e.get("session_id") or "?", e.get("qhash"))
+        if key not in turns:
+            turns[key] = e
+    entries = list(turns.values())
+
     lines = []
     lines.append("RECALL DIGEST — qué memoria se inyectó y qué mostró uso "
                  "(detector de tokens, post-hoc, desde 14-nov)")
     lines.append("")
-    total_inj = sum(len(v) for v in by_sid.values())
+    total_inj = len(entries)
     total_hits = sum(len(e.get("hits", [])) for e in entries)
     used_inj = 0
-    for sid, evs in sorted(by_sid.items(), key=lambda kv: kv[1][-1]["ts"]):
+    for sid, evs in sorted([(k[0], [v]) for k, v in turns.items()],
+                           key=lambda kv: kv[1][-1]["ts"]):
         seq = session_windows(sid)
         title = title_lookup.get(sid, "")
         u_this = 0
@@ -167,24 +197,31 @@ def build_digest(entries, title_lookup):
         med = f"{statistics.median(dists):.2f}" if dists else "-"
         lines.append(f"* `{sid[:24]}`{(' — ' + title[:50]) if title else ''}")
         nv = f" · sin veredicto {no_verdict}" if no_verdict else ""
-        lines.append(f"  inyecciones {len(evs)} · con uso {u_this}{nv} · "
+        lines.append(f"  turnos {len(evs)} · con uso {u_this}{nv} · "
                      f"hits {sum(len(e.get('hits', [])) for e in evs)} · "
                      f"dist med {med} · tipos {dict(kinds)}")
     lines.append("")
-    lines.append(f"TOTAL: {total_inj} inyecciones · {total_hits} hits · "
+    if cuts:
+        cds = [c.get("cut_dist") for c in cuts if c.get("cut_dist") is not None]
+        lines.append(f"CORTES banda medium (arm=-1, nunca inyectaron): "
+                     f"{len(cuts)} — cut_dist {cds}")
+    lines.append(f"TOTAL: {total_inj} turnos con inyección "
+                 f"(de {fires} fires del hook) · {total_hits} hits · "
                  f"{used_inj} con uso detectado ({used_inj/max(1,total_inj):.0%})")
-    n_sess = len(by_sid)
+    n_sess = len({k[0] for k in turns})
     dead = 0
-    for sid2, evs in by_sid.items():
+    for sid2, evs in [(k[0], [v]) for k, v in turns.items()]:
         seq2 = session_windows(sid2)
         if not any(usage_for(e, seq2, get_api_content(sid2, e["ts"]))[0]
                    for e in evs):
             dead += 1
     lines.append(f"sesiones con recalls: {n_sess} · sin uso detectado: {dead}")
     lines.append("(detector: tokens del snippet en ventana de 4 asistentes; "
-                 "conservador — subestima por paráfrasis)")
+                 "levemente más liberal que el análisis histórico por usar "
+                 "top-3 snippets — acuerdo 87% validado 14-nov)")
     return "\n".join(lines), {"injections": total_inj, "used": used_inj,
-                              "sessions": n_sess, "dead_sessions": dead}
+                              "sessions": n_sess, "dead_sessions": dead,
+                              "fires": fires, "cuts": len(cuts)}
 
 
 def main():

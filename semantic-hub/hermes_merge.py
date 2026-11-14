@@ -31,9 +31,13 @@ def run_merge(hub=HERMES_HUB, parts=("hermes",)):
     os.makedirs(bin_dir, exist_ok=True)
 
     all_blobs = []
-    if os.path.exists(master_path):
-        os.remove(master_path)
-    con = sqlite3.connect(master_path)
+    # rebuild ATÓMICO (14-nov): escribir a .tmp + os.replace — antes el
+    # os.remove() dejaba una ventana de crash sin sidecar mientras el bin
+    # conservaba las filas viejas → hook sin join vectorial hasta 24h.
+    tmp_path = master_path + ".tmp"
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+    con = sqlite3.connect(tmp_path)
     con.execute("CREATE TABLE chunks (rowid INTEGER PRIMARY KEY, repo TEXT, "
                 "path TEXT, kind TEXT, meta TEXT, text TEXT, vec BLOB)")
     con.execute("CREATE TABLE parts (part TEXT, first_rowid INTEGER, n INTEGER)")
@@ -55,10 +59,14 @@ def run_merge(hub=HERMES_HUB, parts=("hermes",)):
     con.commit()
     con.close()
 
+    # reemplazo atómico del sidecar + bin: o el par viejo completo o el nuevo
+    os.replace(tmp_path, master_path)
     bin_path = os.path.join(bin_dir, "default.bin")
     blob = pack_shard_bin(all_blobs)
-    with open(bin_path, "wb") as f:
+    bin_tmp = bin_path + ".tmp"
+    with open(bin_tmp, "wb") as f:
         f.write(blob)
+    os.replace(bin_tmp, bin_path)
     log(f"MASTER: {len(all_blobs)} chunks → {master_path} + "
         f"{bin_path} ({os.path.getsize(bin_path)/1e6:.1f} MB)")
     return len(all_blobs)
