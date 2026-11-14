@@ -81,3 +81,7 @@ emb-test/*.png
 _swarm/
 .graphlint/
 .repowise/
+
+# sidecars transitorios del hub vivo (dejar de trackear: churn infinito)
+semantic-hub/data/metadata/*.db-shm
+semantic-hub/data/metadata/*.db-wal
