@@ -105,6 +105,89 @@ inversiones de esta semántica. Lección: la hipótesis "no se puede rechazar
 basura por score" del benchmark inicial era un artefacto de interpretar el
 score como similitud — con la semántica correcta la separación es limpia.
 
+## Stack de memoria de Hermes — configuración canónica (14-nov-2026)
+
+Auditoría swarm (deleg_2f5f34ea, 27 hallazgos con probes) + replay de
+datos pasados. Commits: 7b46184, 87d5d91, fa1e528. Todo lo de esta
+sección está medido, no asumido.
+
+### Los tres consumidores del hub (:8872)
+
+| consumidor | trigger | qué hace | config clave |
+|---|---|---|---|
+| **hook de memoria** (`~/.hermes/agent-hooks/hermes-memory-recall.py`) | cada API-call (dispara varias veces por turno — bursts medidos hasta 29×) | inyecta bloque `[Memoria vectorial]` en el contexto | STRONG_SESS ≤0.55 → 3 hits + STRONG_CODE ≤0.70 → 1 (banda medium 0.55-0.62 ELIMINADA: uso 4% medido por replay, Fisher p=0.029) |
+| **sac_recap** (`semantic-hub/sac_recap.py` → POST /recap) | a pedido (handoff/recall) | recap de sesión: qué pasó, LLM-free | extrae acciones de state.db él mismo; el hub solo rankea |
+| **sac_recall_digest** (`semantic-hub/sac_recall_digest.py`) | a pedido (auditoría) | qué memoria se inyectó y qué mostró uso | turn-level (dedupe por session+qhash), cortes aparte |
+
+### Embeddings (config exacta)
+
+- `google/embeddinggemma-2` en :8860, CUDA graphs, **dims 768** (MRL),
+  query con `prompt_name=Retrieval-query` (asimetría crítica — ver arriba).
+- El hook y todos los clientes internos mandan SIEMPRE el embedding en
+  /search: desde fa1e528 el hub responde **400 sin embedding** (el
+  fallback text-hash producía ranking de ruido con 200 OK).
+
+### Contrato /search
+
+- `score` = distancia d² ascendente en AMBOS paths (GPU y CPU — unificado
+  fa1e528; antes el fallback CPU daba d y desplazaba las bandas ×√2).
+- `backend: "gpu"` presente en la respuesta. El hook hace **fail-closed**
+  si backend ≠ gpu (bandas descalibradas = corrupción silenciosa; el FTS
+  literal sigue cubriendo).
+- top_k=0 → 0 resultados (antes coerción silenciosa a 1).
+
+### Contrato /recap
+
+- Stateless por diseño: el lookup de sesión NO existe en el hub —
+  `session_id` se acepta y se devuelve (echo) solo para roundtrip check.
+- `RecapAction.seq` default 0 (decorativo; el orden es el del array).
+- `max_words` clamp **50..2000**: con <41 las secciones mínimas
+  state-critical no cabían y el recap degeneraba a OBJECTIVE-only.
+
+### Telemetría (JSONL del hook, /mnt/d/WSL/orch/hermes-recalls.jsonl)
+
+```json
+{"ts": ..., "session_id": "...", "qhash": "sha1-12", "qlen": N,
+ "n_injected": N, "arm": 0|-1, "backend": "gpu", "drops": N,
+ "cut_dist": 0.585?, "hits": [{"kind","dist","sid","repo","path"}]}
+```
+- `arm=-1` + `cut_dist`: query cortada por la banda medium (falsificable).
+- `backend` ≠ "gpu": falla de escala detectada.
+- `drops` > 0: join index↔rowid roto (invariant roto — investigar merge).
+- El log mide FIRES del hook, no turnos: el digest dedupea por
+  (session_id, qhash).
+
+### Smoke y validación
+
+- `hermes_smoke.py`: health x3 + consistencia POR HUB (el drift-check de
+  sesiones era código muerto hasta 87d5d91) + recall-cases tolerantes a
+  drift de corpus (WARN si en top-2k).
+- **`hermes_stack_check.py` — validación de configuración en un comando**:
+  embed (modelo/device/dims/prompt), hub health + backend gpu + escala,
+  contratos del hook, log schema, state.db RO, digest, recap, crons.
+  `PASS: 17/18` medido al deploy (WARN = hub viejo sin fa1e528, se
+  resuelve con build+restart).
+
+### Triage cuando la memoria parece muerta (en orden)
+
+1. `curl :8860/health` — ¿embed vivo? (el ensure */10 lo relanza)
+2. `hermes_stack_check.py` — localiza el check rojo
+3. hook log: ¿líneas con backend≠gpu o drops>0?
+4. digest: ¿los turnos recientes dan "sin veredicto" masivo? → match de
+   timestamps roto o hook sin logging
+5. `hermes-hub.log`: último ciclo — ¿smoke 8/8?
+
+### Decisiones falsificadas/canceladas (no reintentar sin protocolo nuevo)
+
+- Gate anti system-turns: REFUTADO (usan memoria MÁS que las queries:
+  16.7% vs 7.7%).
+- A/B top-1: CANCELADO (hits 2-3 con 15 usos únicos vs 6 del top con
+  filtro DF — top-1 perdería ~71% del uso detectado).
+- P2 re-recall (AUC 0.43) y P3 tool-lift (0.48): falsificados.
+- P1 eco-cosine (AUC 0.78, IC ancho): en telemetría; re-eval con n≥300
+  del log antes de usarlo como weight.
+- KEV gate como filtro: desmontado (solapamiento en los datos).
+
 ## Operación (runbook)
 
 ```bash
