@@ -422,32 +422,46 @@ mod api_smoke {
         }
         assert!(healthy, "server did not become healthy on port {port}");
 
-        // Store two memories (hash-embedding path, deterministic).
-        let (s1, b1) = http_request(
-            port,
-            "POST",
-            "/store",
-            Some(r#"{"text": "gaussian splat memory one"}"#),
-        );
+        // Store two memories with explicit embeddings (1024 = default
+        // latent_dim). Desde fa1e528 /search exige embedding: el smoke
+        // ejercita el roundtrip real con vectores, no el hash-path
+        // (removido: producía ranking de ruido con 200 OK).
+        let dim = 1024usize;
+        let unit_json = |axis: usize| {
+            let mut v = vec![0.0f64; dim];
+            v[axis] = 1.0;
+            serde_json::json!({ "text": format!("gaussian splat memory {axis}"),
+                                "embedding": v })
+            .to_string()
+        };
+        let (s1, b1) = http_request(port, "POST", "/store", Some(&unit_json(0)));
         assert_eq!(s1, 200, "POST /store #1 failed: {b1}");
         assert!(b1.contains("stored"), "unexpected body: {b1}");
 
-        let (s2, b2) = http_request(
-            port,
-            "POST",
-            "/store",
-            Some(r#"{"text": "gaussian splat memory two"}"#),
-        );
+        let (s2, b2) = http_request(port, "POST", "/store", Some(&unit_json(1)));
         assert_eq!(s2, 200, "POST /store #2 failed: {b2}");
 
         // Search must return results ranked by distance.
-        let (s3, b3) = http_request(
+        let mut qv = vec![0.0f64; dim];
+        qv[0] = 1.0;
+        let search_body = serde_json::json!({
+            "query": "gaussian splat memory 0",
+            "embedding": qv,
+            "top_k": 2
+        })
+        .to_string();
+        let (s3, b3) = http_request(port, "POST", "/search", Some(&search_body));
+        assert_eq!(s3, 200, "POST /search failed: {b3}");
+
+        // Contract (fa1e528): text-only search is rejected with 400.
+        let (s4, b4) = http_request(
             port,
             "POST",
             "/search",
             Some(r#"{"query": "gaussian splat memory one", "top_k": 2}"#),
         );
-        assert_eq!(s3, 200, "POST /search failed: {b3}");
+        assert_eq!(s4, 400, "text-only /search must be 400: {b4}");
+        assert!(b4.contains("missing embedding"), "unexpected body: {b4}");
 
         let parsed: serde_json::Value = serde_json::from_str(&b3).expect("search JSON");
         let results = parsed["results"].as_array().expect("results array");
