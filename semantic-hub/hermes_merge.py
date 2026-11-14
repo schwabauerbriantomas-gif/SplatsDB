@@ -36,6 +36,9 @@ def run_merge(hub=HERMES_HUB, parts=("hermes",)):
     # conservaba las filas viejas → hook sin join vectorial hasta 24h.
     tmp_path = master_path + ".tmp"
     if os.path.exists(tmp_path):
+        # nosemgrep: non-atomic-file-replace — borra un .tmp VIEJO de una
+        # corrida previa, no un archivo vivo del hub (esos van por
+        # os.replace abajo).
         os.remove(tmp_path)
     con = sqlite3.connect(tmp_path)
     con.execute("CREATE TABLE chunks (rowid INTEGER PRIMARY KEY, repo TEXT, "

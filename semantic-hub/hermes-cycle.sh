@@ -71,8 +71,19 @@ done
 
 # 5. smoke: si falla, queda en el log con detalle
 if python3 "$SH/hermes_smoke.py" >> "$LOG" 2>&1; then
-    say "=== ciclo OK ==="
+    say "smoke OK"
 else
     say "WARN: smoke falló — ver detalles arriba"
     exit 1
 fi
+
+# 6. validación de configuración del stack (14-nov): embed+hubs+hook+log
+#   +crons en un comando. Fallo = exit 1 (cron notifica).
+if python3 "$SH/hermes_stack_check.py" >> "$LOG" 2>&1; then
+    say "stack_check OK"
+else
+    say "WARN: stack_check FAIL — algún check del stack en rojo"
+    exit 1
+fi
+
+say "=== ciclo OK ==="

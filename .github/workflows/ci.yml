@@ -57,6 +57,16 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      # deps muertas en Cargo.toml (14-nov: encontró `regex` sin refs).
+      # Prebuilt via install-action: segundos, no compila.
+      - name: Unused dependencies (cargo-machete)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+
+      - name: Run cargo-machete
+        run: cargo machete
+
       - name: Clippy (default)
         run: cargo clippy -- -D warnings
 
@@ -97,7 +107,10 @@ jobs:
           python-version: "3.12"
 
       - name: Byte-compile tools (syntax gate)
-        run: python -m py_compile semantic-hub/hermes_lib.py semantic-hub/hermes_ingest.py semantic-hub/hermes_merge.py semantic-hub/hermes_recall.py semantic-hub/hermes_smoke.py
+        run: python -m py_compile semantic-hub/hermes_lib.py semantic-hub/hermes_ingest.py semantic-hub/hermes_merge.py semantic-hub/hermes_recall.py semantic-hub/hermes_smoke.py semantic-hub/sac_recap.py semantic-hub/sac_recall_digest.py semantic-hub/hermes_stack_check.py semantic-hub/check_dead_code.py semantic-hub/sem-search.py
+
+      - name: Dead-code gate (AST stdlib-only)
+        run: python semantic-hub/check_dead_code.py
 
       - name: Unit tests (mocked embed server)
         run: python -m unittest discover -s semantic-hub/tests -v

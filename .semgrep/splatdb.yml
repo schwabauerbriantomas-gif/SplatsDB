@@ -1,0 +1,50 @@
+# Reglas semgrep custom de splatdb — clases de bug REALES mordidas en
+# producción (cada regla traza a un incidente, no es teórica).
+#
+# Run manual:  semgrep scan --config .semgrep/splatdb.yml semantic-hub/ src/
+# (los packs públicos p/rust + p/python se corrieron el 14-nov: 0 accionable;
+#  el valor de semgrep acá es codificar NUESTRAS clases de bug, no genéricos).
+rules:
+  # ── mordida 1 (14-nov): import dentro de un bloque fail-open ──
+  # el import falla o se traga junto con el bloque → NameError silencioso
+  # (alias _tm/_hl importados dentro del try del log del hook).
+  - id: import-inside-fail-open
+    languages: [python]
+    severity: WARNING
+    message: >
+      import dentro de un try/except que traga excepciones: si el import
+      falla se traga igual que el resto y el bloque queda roto sin señal.
+      Importar al top del archivo.
+    patterns:
+      - pattern: |
+          try:
+              ...
+              import $X
+              ...
+          except $E:
+              ...
+
+  # ── mordida 2 (14-nov): archivo no atómico en el pipeline ──
+  # os.remove() seguido de escritura dejó una ventana sin sidecar → hook
+  # sin join vectorial hasta 24h. Todo reemplazo de archivo vivo es
+  # os.replace (atómico).
+  - id: non-atomic-file-replace
+    languages: [python]
+    severity: WARNING
+    message: >
+      os.remove sobre un archivo vivo del hub: ventana sin archivo si el
+      proceso muere acá. Usar os.replace(tmp_path, target) — atómico.
+    pattern: os.remove(...)
+
+  # ── mordida 3 (13-nov): coerción silenciosa de top_k ──
+  # .max(1) convertía top_k=0 en 1 resultado sin señal; el contrato honesto
+  # (fa1e528) devuelve 0 resultados. Toda coerción max(1) sobre input de
+  # cliente merece revisión.
+  - id: silent-min-coercion-on-client-input
+    languages: [rust]
+    severity: WARNING
+    message: >
+      max(1) sobre un valor derivado de input del cliente: convierte 0
+      explícito en 1 silenciosamente. Si 0 es válido, respetarlo; si no,
+      400/422 con mensaje.
+    pattern: $REQ.unwrap_or($D).max(1)
