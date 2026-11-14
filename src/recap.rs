@@ -33,6 +33,9 @@ pub const MAX_TOTAL_ACTIONS_LEN: usize = 2_000_000;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RecapAction {
     /// Monotonic sequence number (1-based from the harness).
+    /// (14-nov) default 0: build_recap NO lee seq (el orden del recap es el
+    /// orden del array) — exigirlo rompía con 422 a clientes que lo omiten.
+    #[serde(default)]
     pub seq: u64,
     /// Harness-provided kind: "command" | "observation" | "edit" | "test" |
     /// "error" | "note". Content-based classification can override.
@@ -53,6 +56,13 @@ pub struct RecapRequest {
     /// Word budget for the whole recap (default 400).
     #[serde(default)]
     pub max_words: Option<usize>,
+    /// Echo-only (14-nov): el hub es stateless y NO resuelve sessions — el
+    /// cliente (sac_recap.py) extrae acciones él mismo. Se acepta y se
+    /// devuelve en la respuesta para verificar roundtrip; antes se ignoraba
+    /// en silencio y un cliente que esperaba lookup por sid obtenía un recap
+    /// vacío plausible sin señal.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,6 +71,8 @@ pub struct RecapResponse {
     pub words: usize,
     pub actions_in: usize,
     pub actions_used: usize,
+    /// Echo del session_id recibido (roundtrip check del cliente).
+    pub session_id: Option<String>,
     pub sections: RecapSections,
     pub elapsed_ms: f64,
 }
@@ -193,7 +205,7 @@ fn truncate_words(text: &str, max_words: usize) -> String {
 /// Build the recap. Deterministic: no HashMap iteration feeds the output.
 pub fn build_recap(req: &RecapRequest) -> RecapResponse {
     let started = Instant::now();
-    let max_words = req.max_words.unwrap_or(DEFAULT_MAX_WORDS).clamp(20, 2000);
+    let max_words = req.max_words.unwrap_or(DEFAULT_MAX_WORDS).clamp(50, 2000);
     let n = req.actions.len();
 
     let objective = if req.objective.trim().is_empty() {
@@ -212,6 +224,7 @@ pub fn build_recap(req: &RecapRequest) -> RecapResponse {
             words,
             actions_in: 0,
             actions_used: 0,
+            session_id: req.session_id.clone(),
             sections: RecapSections::default(),
             elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
         };
@@ -390,6 +403,7 @@ pub fn build_recap(req: &RecapRequest) -> RecapResponse {
     RecapResponse {
         recap: out,
         words,
+        session_id: req.session_id.clone(),
         actions_in: n,
         actions_used,
         sections,
@@ -436,6 +450,7 @@ mod tests {
             objective: "Fix the netrc auth guard".into(),
             actions: vec![],
             max_words: None,
+            session_id: None,
         };
         let r = build_recap(&req);
         assert_eq!(r.actions_in, 0);
@@ -454,6 +469,7 @@ mod tests {
                 action(3, "command", "git status"),
             ],
             max_words: None,
+            session_id: None,
         };
         let r = build_recap(&req);
         // Duplicate command collapses to one; 3 in → ≤3 used, dedup happened.
@@ -475,6 +491,7 @@ mod tests {
             objective: "Benchmark the recap builder budget".into(),
             actions,
             max_words: Some(400),
+            session_id: None,
         };
         let r = build_recap(&req);
         assert!(
@@ -497,6 +514,7 @@ mod tests {
                 action(5, "command", "git diff --stat"),
             ],
             max_words: None,
+            session_id: None,
         };
         let a = build_recap(&mk());
         let b = build_recap(&mk());
@@ -516,6 +534,7 @@ mod tests {
             objective: "Speed check".into(),
             actions,
             max_words: None,
+            session_id: None,
         };
         let r = build_recap(&req);
         // Generous CI bound (debug build); release target is <50ms.

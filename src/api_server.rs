@@ -341,13 +341,32 @@ async fn search_memories(
         }));
     }
 
-    let k = req.top_k.unwrap_or(10).max(1).min(n_active).min(MAX_TOP_K);
+    let k_req = req.top_k.unwrap_or(10).min(n_active).min(MAX_TOP_K);
+    if k_req == 0 {
+        // top_k=0 explícito → cero resultados (antes la coerción .max(1)
+        // devolvía 1 resultado sin señal en la respuesta)
+        return Ok(Json(SearchResponse {
+            results: vec![],
+            backend: None,
+        }));
+    }
+    let k = k_req;
 
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
     let had_embedding = req.embedding.is_some();
-    let embedding = req
-        .embedding
-        .unwrap_or_else(|| simple_hash_embedding(&req.query, dim));
+    // (14-nov) embedding obligatorio en /search: el fallback text-hash
+    // devolvía L2 contra ruido determinista con 200 OK — un bug de cliente
+    // se veía como "no hay memoria relevante" sin error. Los callers
+    // internos (hook, sem-search, hermes_recall) siempre lo envían.
+    let embedding = match req.embedding {
+        Some(e) => e,
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "missing embedding: POST the query vector (dims 768) — the text-hash fallback produced noise ranking and was removed".into(),
+            ));
+        }
+    };
 
     let rescore_gaussian = matches!(params.rescore.as_deref(), Some("gaussian"));
 
@@ -973,7 +992,11 @@ fn cpu_fused_batch(
                     // L2 distance (lower is better) — misma escala que el
                     // path GPU (d²), para que las bandas calibradas del
                     // cliente (0.55/0.70) sobrevivan un fallback a CPU.
-                    score: if want_rescore { n.score } else { n.distance * n.distance },
+                    score: if want_rescore {
+                        n.score
+                    } else {
+                        n.distance * n.distance
+                    },
                     metadata: None,
                     confidence: None,
                     topic: None,

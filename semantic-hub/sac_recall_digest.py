@@ -174,32 +174,37 @@ def build_digest(entries, title_lookup):
     total_inj = len(entries)
     total_hits = sum(len(e.get("hits", [])) for e in entries)
     used_inj = 0
-    for sid, evs in sorted([(k[0], [v]) for k, v in turns.items()],
-                           key=lambda kv: kv[1][-1]["ts"]):
+    # agrupado por sesión: un header por sesión, filas de turno debajo
+    by_sid = defaultdict(list)
+    for (sid, _qh), e in turns.items():
+        by_sid[sid].append(e)
+    for sid, evs in sorted(by_sid.items(), key=lambda kv: min(e["ts"] for e in kv[1])):
         seq = session_windows(sid)
         title = title_lookup.get(sid, "")
-        u_this = 0
-        no_verdict = 0
-        kinds = defaultdict(int)
-        dists = []
-        for e in evs:
+        u_sess = 0
+        lines.append(f"* `{sid[:24]}`{(' — ' + title[:50]) if title else ''}")
+        for e in sorted(evs, key=lambda e: e["ts"]):
             api = get_api_content(sid, e["ts"])
             u, _ = usage_for(e, seq, api)
             if api is None:
-                no_verdict += 1
+                verdict = "sin veredicto"
+            elif u:
+                verdict = "CON USO"
+                u_sess += 1
             else:
-                u_this += 1 if u else 0
+                verdict = "sin uso"
+            kinds = defaultdict(int)
+            dists = []
             for h in e.get("hits", []):
                 kinds[h.get("kind", "?")] += 1
                 if h.get("dist") is not None:
                     dists.append(h["dist"])
-        used_inj += u_this
-        med = f"{statistics.median(dists):.2f}" if dists else "-"
-        lines.append(f"* `{sid[:24]}`{(' — ' + title[:50]) if title else ''}")
-        nv = f" · sin veredicto {no_verdict}" if no_verdict else ""
-        lines.append(f"  turnos {len(evs)} · con uso {u_this}{nv} · "
-                     f"hits {sum(len(e.get('hits', [])) for e in evs)} · "
-                     f"dist med {med} · tipos {dict(kinds)}")
+            med = f"{statistics.median(dists):.2f}" if dists else "-"
+            qh = e.get("qhash") or "?"
+            lines.append(f"  - turno `{qh}` · {verdict} · hits "
+                         f"{len(e.get('hits', []))} · dist med {med} · "
+                         f"tipos {dict(kinds)}")
+        used_inj += u_sess
     lines.append("")
     if cuts:
         cds = [c.get("cut_dist") for c in cuts if c.get("cut_dist") is not None]

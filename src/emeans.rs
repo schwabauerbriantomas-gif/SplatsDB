@@ -161,6 +161,19 @@ pub fn fit_emeans(
 ) -> EmeansFit {
     let k = k_req.min(n).max(1);
     let d = dim;
+    // guard NaN (14-nov): una fila no-finita envenena sumas/centroides sin
+    // error (acc=NaN compara false → cae siempre en best=0). La validación
+    // fina vive en /store (all_finite); esto es defensa local del trainer.
+    let mut x_san: Vec<f32> = x.to_vec();
+    for r in 0..n {
+        let s = &mut x_san[r * d..(r + 1) * d];
+        if s.iter().any(|f| !f.is_finite()) {
+            for f in s.iter_mut() {
+                *f = 0.0;
+            }
+        }
+    }
+    let x: &[f32] = &x_san;
     let batch = resolve_batch(n, k, nepochs, d);
     let alpha0 = step_law(n, k, nepochs, batch);
     let epochs = epoch_rows(n, nepochs);
