@@ -1755,28 +1755,7 @@ pub fn run_mcp_server() {
     let mut store = SplatStore::new(config);
 
     // Initialize SQLite doc store
-    let db_path = std::env::var("SPLATSDB_DOC_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            std::path::PathBuf::from(format!("{home}/.hermes/splatsdb_docs.db"))
-        });
-    let doc_store = match SqliteMetadataStore::new(db_path.clone()) {
-        Ok(ds) => {
-            eprintln!("[splatsdb] SQLite doc store: {:?}", db_path);
-            ds
-        }
-        Err(e) => {
-            eprintln!(
-                "[splatsdb] WARNING: SQLite init failed ({}), docs won't persist",
-                e
-            );
-            SqliteMetadataStore::new(std::path::PathBuf::from(":memory:")).unwrap_or_else(|e| {
-                eprintln!("[splatsdb] FATAL: in-memory SQLite failed: {}", e);
-                std::process::exit(1);
-            })
-        }
-    };
+    let doc_store = init_doc_store();
 
     // Warm start: reload documents from SQLite into vector store.
     // SPLATDB_SPATIAL_WARMSTART=0|off|false skips the spatial registration
@@ -1786,99 +1765,17 @@ pub fn run_mcp_server() {
     let mut vector_to_doc: HashMap<usize, String> = HashMap::new();
     let mut doc_texts = DocTextCache::default();
     let mut next_id: usize = 0;
-    let mut warm_start_spatial: WarmStartSpatial = Vec::new();
-    let dim = store.get_statistics().embedding_dim;
     let warm_start_t0 = std::time::Instant::now();
 
-    match doc_store.list_ids(false) {
-        Ok(ids) => {
-            let total = ids.len();
-            if total > MAX_WARM_START_DOCS {
-                eprintln!(
-                    "[splatsdb] Warm start: {} docs found, capping at {} for performance",
-                    total, MAX_WARM_START_DOCS
-                );
-            }
-            for (i, doc_id) in ids.iter().enumerate().take(MAX_WARM_START_DOCS) {
-                if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
-                    eprintln!("[splatsdb] Warm start interrupted by shutdown signal");
-                    break;
-                }
-                if let Ok(Some(record)) = doc_store.get(doc_id) {
-                    let text = record.document.clone().unwrap_or_default();
-                    if text.is_empty() {
-                        continue;
-                    }
-
-                    // Extract spatial metadata from the JSON metadata field
-                    // (skipped entirely when spatial warm-start is disabled)
-                    let (meta_wing, meta_room, meta_hall) = if spatial_warmstart_enabled {
-                        (
-                            record.metadata.as_ref().and_then(|m| {
-                                m.get("wing")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string())
-                            }),
-                            record.metadata.as_ref().and_then(|m| {
-                                m.get("room")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string())
-                            }),
-                            record.metadata.as_ref().and_then(|m| {
-                                m.get("hall")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string())
-                            }),
-                        )
-                    } else {
-                        (None, None, None)
-                    };
-
-                    // Re-compute embedding and add to vector store
-                    let embedding = get_embedding(&text, dim);
-                    if let Ok(arr) = Array2::from_shape_vec((1, dim), embedding) {
-                        let vector_idx = store.n_active();
-                        if store.add_splat(&arr) {
-                            vector_to_doc.insert(vector_idx, doc_id.clone());
-                            doc_texts.insert(doc_id.clone(), text);
-                            next_id = next_id.max(
-                                doc_id
-                                    .strip_prefix("mem_")
-                                    .and_then(|s| s.parse::<usize>().ok())
-                                    .unwrap_or(0),
-                            );
-                            // Save spatial metadata for later registration
-                            if meta_wing.is_some() || meta_room.is_some() || meta_hall.is_some() {
-                                warm_start_spatial.push((
-                                    doc_id.clone(),
-                                    meta_wing.clone(),
-                                    meta_room.clone(),
-                                    meta_hall.clone(),
-                                ));
-                            }
-                        }
-                    }
-                }
-                if i > 0 && i % 100 == 0 {
-                    eprintln!(
-                        "[splatsdb] Warm start: {}/{} docs loaded",
-                        i,
-                        total.min(MAX_WARM_START_DOCS)
-                    );
-                }
-            }
-            if !ids.is_empty() {
-                store.hnsw_sync_incremental();
-                eprintln!(
-                    "[splatsdb] Warm start: reloaded {}/{} documents from SQLite in {:.0} ms",
-                    doc_texts.len().min(MAX_WARM_START_DOCS),
-                    total,
-                    warm_start_t0.elapsed().as_secs_f64() * 1000.0
-                );
-            }
-        }
-        Err(e) => eprintln!("[splatsdb] Warm start: could not list docs: {}", e),
-    }
+    let warm_start_spatial = warm_start_reload(
+        &doc_store,
+        &mut store,
+        &mut vector_to_doc,
+        &mut doc_texts,
+        &mut next_id,
+        spatial_warmstart_enabled,
+        warm_start_t0,
+    );
 
     let state = Mutex::new(McpState {
         store,
@@ -2139,6 +2036,151 @@ fn register_warm_start_spatial(
             "[splatsdb] Warm start: spatial registration skipped (SPLATDB_SPATIAL_WARMSTART=0)"
         );
     }
+}
+
+/// Initialize the SQLite doc store from `SPLATSDB_DOC_PATH` (default
+/// `$HOME/.hermes/splatsdb_docs.db`), degrading to an in-memory database if
+/// the on-disk one cannot be opened (docs won't persist across restarts).
+///
+/// Extracted from `run_mcp_server`; messages and behavior identical,
+/// including the FATAL exit when even `:memory:` fails.
+fn init_doc_store() -> SqliteMetadataStore {
+    let db_path = std::env::var("SPLATSDB_DOC_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            std::path::PathBuf::from(format!("{home}/.hermes/splatsdb_docs.db"))
+        });
+    match SqliteMetadataStore::new(db_path.clone()) {
+        Ok(ds) => {
+            eprintln!("[splatsdb] SQLite doc store: {:?}", db_path);
+            ds
+        }
+        Err(e) => {
+            eprintln!(
+                "[splatsdb] WARNING: SQLite init failed ({}), docs won't persist",
+                e
+            );
+            SqliteMetadataStore::new(std::path::PathBuf::from(":memory:")).unwrap_or_else(|e| {
+                eprintln!("[splatsdb] FATAL: in-memory SQLite failed: {}", e);
+                std::process::exit(1);
+            })
+        }
+    }
+}
+
+/// Warm start: reload persisted documents from SQLite into the vector store.
+///
+/// Extracted from `run_mcp_server`; behavior identical: caps at
+/// `MAX_WARM_START_DOCS`, honours the shutdown flag mid-loop, skips empty
+/// texts, extracts spatial metadata only when `spatial_warmstart_enabled`,
+/// re-embeds every document, advances `next_id` past any `mem_N` id, syncs
+/// HNSW once at the end, and reports progress/final timing on stderr.
+///
+/// Returns the (doc_id, wing, room, hall) tuples collected for the later
+/// spatial registration pass.
+#[allow(clippy::too_many_arguments)]
+fn warm_start_reload(
+    doc_store: &SqliteMetadataStore,
+    store: &mut SplatStore,
+    vector_to_doc: &mut HashMap<usize, String>,
+    doc_texts: &mut DocTextCache,
+    next_id: &mut usize,
+    spatial_warmstart_enabled: bool,
+    warm_start_t0: std::time::Instant,
+) -> WarmStartSpatial {
+    let mut warm_start_spatial: WarmStartSpatial = Vec::new();
+    let dim = store.get_statistics().embedding_dim;
+    match doc_store.list_ids(false) {
+        Ok(ids) => {
+            let total = ids.len();
+            if total > MAX_WARM_START_DOCS {
+                eprintln!(
+                    "[splatsdb] Warm start: {} docs found, capping at {} for performance",
+                    total, MAX_WARM_START_DOCS
+                );
+            }
+            for (i, doc_id) in ids.iter().enumerate().take(MAX_WARM_START_DOCS) {
+                if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                    eprintln!("[splatsdb] Warm start interrupted by shutdown signal");
+                    break;
+                }
+                if let Ok(Some(record)) = doc_store.get(doc_id) {
+                    let text = record.document.clone().unwrap_or_default();
+                    if text.is_empty() {
+                        continue;
+                    }
+
+                    // Extract spatial metadata from the JSON metadata field
+                    // (skipped entirely when spatial warm-start is disabled)
+                    let (meta_wing, meta_room, meta_hall) = if spatial_warmstart_enabled {
+                        (
+                            record.metadata.as_ref().and_then(|m| {
+                                m.get("wing")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                            }),
+                            record.metadata.as_ref().and_then(|m| {
+                                m.get("room")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                            }),
+                            record.metadata.as_ref().and_then(|m| {
+                                m.get("hall")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                            }),
+                        )
+                    } else {
+                        (None, None, None)
+                    };
+
+                    // Re-compute embedding and add to vector store
+                    let embedding = get_embedding(&text, dim);
+                    if let Ok(arr) = Array2::from_shape_vec((1, dim), embedding) {
+                        let vector_idx = store.n_active();
+                        if store.add_splat(&arr) {
+                            vector_to_doc.insert(vector_idx, doc_id.clone());
+                            doc_texts.insert(doc_id.clone(), text);
+                            *next_id = (*next_id).max(
+                                doc_id
+                                    .strip_prefix("mem_")
+                                    .and_then(|s| s.parse::<usize>().ok())
+                                    .unwrap_or(0),
+                            );
+                            // Save spatial metadata for later registration
+                            if meta_wing.is_some() || meta_room.is_some() || meta_hall.is_some() {
+                                warm_start_spatial.push((
+                                    doc_id.clone(),
+                                    meta_wing.clone(),
+                                    meta_room.clone(),
+                                    meta_hall.clone(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                if i > 0 && i % 100 == 0 {
+                    eprintln!(
+                        "[splatsdb] Warm start: {}/{} docs loaded",
+                        i,
+                        total.min(MAX_WARM_START_DOCS)
+                    );
+                }
+            }
+            if !ids.is_empty() {
+                store.hnsw_sync_incremental();
+                eprintln!(
+                    "[splatsdb] Warm start: reloaded {}/{} documents from SQLite in {:.0} ms",
+                    doc_texts.len().min(MAX_WARM_START_DOCS),
+                    total,
+                    warm_start_t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        }
+        Err(e) => eprintln!("[splatsdb] Warm start: could not list docs: {}", e),
+    }
+    warm_start_spatial
 }
 
 /// SPLATDB_SPATIAL_WARMSTART parser: absent/anything-but-falsy → true
