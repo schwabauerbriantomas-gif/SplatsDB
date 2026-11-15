@@ -1748,6 +1748,10 @@ fn dispatch_request(state: &Mutex<McpState>, req: &JsonRpcRequest) -> JsonRpcRes
 // Main entry point
 // ============================================================================
 
+/// Maximum bytes for a single JSON-RPC line on stdin (10MB) — larger lines
+/// are rejected and drained (see `read_request_line`).
+const MAX_JSONRPC_LINE_LEN: usize = 10_000_000;
+
 pub fn run_mcp_server() {
     eprintln!("[splatsdb] MCP server v2.5 starting (stdio transport)...");
 
@@ -1813,8 +1817,6 @@ pub fn run_mcp_server() {
         std::env::var("SPLATSDB_DOC_PATH").unwrap_or_else(|_| "(default)".into())
     );
 
-    const MAX_JSONRPC_LINE_LEN: usize = 10_000_000; // 10MB max line length
-
     // Bounded line reader (fix: `reader.lines()` buffers the ENTIRE line in
     // memory before the 10MB check below could reject it — one huge line
     // could OOM the server). read_until under a take() cap bounds the buffer
@@ -1832,57 +1834,10 @@ pub fn run_mcp_server() {
             break;
         }
 
-        raw_line.clear();
-        let read = if pending.is_empty() {
-            let mut capped = reader.by_ref().take(MAX_JSONRPC_LINE_LEN as u64 + 1);
-            capped.read_until(b'\n', &mut raw_line)
-        } else {
-            // Seed the tail of the previous oversized line, then keep reading
-            // the current one under the same cap (identical semantics to a
-            // fresh read: newline detection and oversize check still apply).
-            raw_line.extend_from_slice(&pending);
-            pending.clear();
-            let seeded = raw_line.len();
-            let mut capped = reader.by_ref().take(MAX_JSONRPC_LINE_LEN as u64 + 1);
-            match capped.read_until(b'\n', &mut raw_line) {
-                Ok(n) => Ok(seeded + n),
-                Err(e) => Err(e),
-            }
-        };
-        let line = match read {
-            Ok(0) => break, // EOF — stdin closed
-            Ok(_) => {
-                let ends_nl = raw_line.last() == Some(&b'\n');
-                // Hit the MAX+1 cap with no newline → oversized line: reject
-                // and drain the rest in bounded chunks.
-                if !ends_nl && raw_line.len() > MAX_JSONRPC_LINE_LEN {
-                    eprintln!(
-                        "[splatsdb] rejecting oversized JSON-RPC message (>{} bytes)",
-                        MAX_JSONRPC_LINE_LEN
-                    );
-                    let mut discard = [0u8; 8192];
-                    loop {
-                        match reader.read(&mut discard) {
-                            Ok(0) => break, // EOF
-                            Ok(m) => {
-                                if let Some(pos) = discard[..m].iter().position(|&b| b == b'\n') {
-                                    // Keep whatever follows the newline: the
-                                    // next request already arrived.
-                                    pending.extend_from_slice(&discard[pos + 1..m]);
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    continue;
-                }
-                String::from_utf8_lossy(&raw_line).trim().to_string()
-            }
-            Err(e) => {
-                eprintln!("[splatsdb] stdin error: {}", e);
-                break;
-            }
+        let line = match read_request_line(&mut reader, &mut raw_line, &mut pending) {
+            LineRead::Eof => break,
+            LineRead::Skip => continue,
+            LineRead::Line(line) => line,
         };
 
         {
@@ -1897,49 +1852,9 @@ pub fn run_mcp_server() {
                 continue;
             }
 
-            let req: JsonRpcRequest = match serde_json::from_str::<JsonRpcRequest>(&line) {
-                Ok(r) => {
-                    // Validate jsonrpc version
-                    if r.jsonrpc != "2.0" {
-                        eprintln!("[splatsdb] invalid jsonrpc version: {}", r.jsonrpc);
-                        let resp = JsonRpcResponse {
-                            jsonrpc: "2.0".into(),
-                            id: r.id.clone(),
-                            result: None,
-                            error: Some(JsonRpcError {
-                                code: -32600,
-                                message: format!(
-                                    "Invalid jsonrpc version: expected '2.0', got '{}'",
-                                    r.jsonrpc
-                                ),
-                            }),
-                        };
-                        let out = serde_json::to_string(&resp)
-                                .unwrap_or_else(|_| r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}}"#.to_string());
-                        writeln!(stdout, "{}", out).ok();
-                        stdout.flush().ok();
-                        continue;
-                    }
-                    eprintln!("[splatsdb] <- method={}", r.method);
-                    r
-                }
-                Err(e) => {
-                    eprintln!("[splatsdb] parse error: {}", e);
-                    let resp = JsonRpcResponse {
-                        jsonrpc: "2.0".into(),
-                        id: None,
-                        result: None,
-                        error: Some(JsonRpcError {
-                            code: -32700,
-                            message: format!("Parse error: {}", e),
-                        }),
-                    };
-                    let out = serde_json::to_string(&resp)
-                            .unwrap_or_else(|_| r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"#.to_string());
-                    writeln!(stdout, "{}", out).ok();
-                    stdout.flush().ok();
-                    continue;
-                }
+            let req: JsonRpcRequest = match parse_jsonrpc_request(&line, &mut stdout) {
+                Ok(r) => r,
+                Err(()) => continue,
             };
 
             let is_notification = req.id.is_none() && req.method != "initialize";
@@ -1958,13 +1873,7 @@ pub fn run_mcp_server() {
             })) {
                 Ok(resp) => resp,
                 Err(payload) => {
-                    let detail = if let Some(s) = payload.downcast_ref::<&str>() {
-                        (*s).to_string()
-                    } else if let Some(s) = payload.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "non-string panic payload".to_string()
-                    };
+                    let detail = panic_payload_detail(&payload);
                     // Panic detail goes to server stderr only, never to the
                     // client (same convention as api_server.rs).
                     eprintln!(
@@ -1984,17 +1893,7 @@ pub fn run_mcp_server() {
             };
 
             if !is_notification && resp.id.is_some() {
-                let out = match serde_json::to_string(&resp) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("[splatsdb] serialization error: {}", e);
-                        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal error"}}"#.to_string()
-                    }
-                };
-                let preview: String = out.chars().take(200).collect();
-                eprintln!("[splatsdb] -> {}...", preview);
-                writeln!(stdout, "{}", out).ok();
-                stdout.flush().ok();
+                write_response(&resp, &mut stdout);
             }
         }
     }
@@ -2181,6 +2080,178 @@ fn warm_start_reload(
         Err(e) => eprintln!("[splatsdb] Warm start: could not list docs: {}", e),
     }
     warm_start_spatial
+}
+
+/// Outcome of one bounded line read from the JSON-RPC stdin stream.
+enum LineRead {
+    /// A complete (possibly empty after trimming) request line.
+    Line(String),
+    /// Oversized line rejected and drained — skip to the next read.
+    Skip,
+    /// EOF or stdin error — leave the main loop.
+    Eof,
+}
+
+/// Bounded line reader (fix: `reader.lines()` buffers the ENTIRE line in
+/// memory before the 10MB check could reject it — one huge line could OOM
+/// the server). `read_until` under a `take()` cap bounds the buffer at
+/// MAX+1 bytes; the remainder of an oversized line is drained in 8KB chunks
+/// and skipped, never buffered whole.
+///
+/// Extracted from `run_mcp_server`; behavior identical, including the
+/// `pending` seeding: bytes that followed an oversized line's '\n' inside a
+/// drained chunk are the START of the next (valid) request and must NOT be
+/// thrown away, or the JSON-RPC stream desynchronizes.
+fn read_request_line(
+    reader: &mut impl std::io::BufRead,
+    raw_line: &mut Vec<u8>,
+    pending: &mut Vec<u8>,
+) -> LineRead {
+    raw_line.clear();
+    let read = if pending.is_empty() {
+        let mut capped = reader.take(MAX_JSONRPC_LINE_LEN as u64 + 1);
+        capped.read_until(b'\n', raw_line)
+    } else {
+        // Seed the tail of the previous oversized line, then keep reading
+        // the current one under the same cap (identical semantics to a
+        // fresh read: newline detection and oversize check still apply).
+        raw_line.extend_from_slice(&pending);
+        pending.clear();
+        let seeded = raw_line.len();
+        let mut capped = reader.take(MAX_JSONRPC_LINE_LEN as u64 + 1);
+        match capped.read_until(b'\n', raw_line) {
+            Ok(n) => Ok(seeded + n),
+            Err(e) => Err(e),
+        }
+    };
+    match read {
+        Ok(0) => LineRead::Eof, // EOF — stdin closed
+        Ok(_) => {
+            let ends_nl = raw_line.last() == Some(&b'\n');
+            // Hit the MAX+1 cap with no newline → oversized line: reject
+            // and drain the rest in bounded chunks.
+            if !ends_nl && raw_line.len() > MAX_JSONRPC_LINE_LEN {
+                eprintln!(
+                    "[splatsdb] rejecting oversized JSON-RPC message (>{} bytes)",
+                    MAX_JSONRPC_LINE_LEN
+                );
+                let mut discard = [0u8; 8192];
+                loop {
+                    match reader.read(&mut discard) {
+                        Ok(0) => break, // EOF
+                        Ok(m) => {
+                            if let Some(pos) = discard[..m].iter().position(|&b| b == b'\n') {
+                                // Keep whatever follows the newline: the
+                                // next request already arrived.
+                                pending.extend_from_slice(&discard[pos + 1..m]);
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                LineRead::Skip
+            } else {
+                LineRead::Line(String::from_utf8_lossy(raw_line).trim().to_string())
+            }
+        }
+        Err(e) => {
+            eprintln!("[splatsdb] stdin error: {}", e);
+            LineRead::Eof
+        }
+    }
+}
+
+/// Parse and validate one JSON-RPC request line. On a parse error or a bad
+/// jsonrpc version, writes the corresponding error response to stdout and
+/// returns `Err(())` (the caller skips the line). On success logs the method
+/// and returns the request.
+///
+/// Extracted from `run_mcp_server`; messages, error codes and behavior
+/// identical.
+fn parse_jsonrpc_request(line: &str, stdout: &mut io::Stdout) -> Result<JsonRpcRequest, ()> {
+    let req: JsonRpcRequest = match serde_json::from_str::<JsonRpcRequest>(line) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[splatsdb] parse error: {}", e);
+            let resp = JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                id: None,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32700,
+                    message: format!("Parse error: {}", e),
+                }),
+            };
+            let out = serde_json::to_string(&resp).unwrap_or_else(|_| {
+                r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"#
+                    .to_string()
+            });
+            writeln!(stdout, "{}", out).ok();
+            stdout.flush().ok();
+            return Err(());
+        }
+    };
+
+    // Validate jsonrpc version
+    if req.jsonrpc != "2.0" {
+        eprintln!("[splatsdb] invalid jsonrpc version: {}", req.jsonrpc);
+        let resp = JsonRpcResponse {
+            jsonrpc: "2.0".into(),
+            id: req.id.clone(),
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32600,
+                message: format!(
+                    "Invalid jsonrpc version: expected '2.0', got '{}'",
+                    req.jsonrpc
+                ),
+            }),
+        };
+        let out = serde_json::to_string(&resp).unwrap_or_else(|_| {
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid request"}}"#
+                .to_string()
+        });
+        writeln!(stdout, "{}", out).ok();
+        stdout.flush().ok();
+        return Err(());
+    }
+    eprintln!("[splatsdb] <- method={}", req.method);
+    Ok(req)
+}
+
+/// Serialize a JSON-RPC response and write it as one stdout line, with a
+/// 200-char preview on stderr. On serialization failure writes the
+/// canonical internal-error response instead.
+///
+/// Extracted from `run_mcp_server`; behavior identical.
+fn write_response(resp: &JsonRpcResponse, stdout: &mut io::Stdout) {
+    let out = match serde_json::to_string(resp) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[splatsdb] serialization error: {}", e);
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal error"}}"#
+                .to_string()
+        }
+    };
+    let preview: String = out.chars().take(200).collect();
+    eprintln!("[splatsdb] -> {}...", preview);
+    writeln!(stdout, "{}", out).ok();
+    stdout.flush().ok();
+}
+
+/// Best-effort string rendering of a panic payload caught by
+/// `catch_unwind` around `dispatch_request`.
+///
+/// Extracted from `run_mcp_server`; behavior identical.
+fn panic_payload_detail(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
 
 /// SPLATDB_SPATIAL_WARMSTART parser: absent/anything-but-falsy → true
