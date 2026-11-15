@@ -2141,7 +2141,7 @@ fn read_request_line(
         // Seed the tail of the previous oversized line, then keep reading
         // the current one under the same cap (identical semantics to a
         // fresh read: newline detection and oversize check still apply).
-        raw_line.extend_from_slice(&pending);
+        raw_line.extend_from_slice(pending);
         pending.clear();
         let seeded = raw_line.len();
         let mut capped = reader.take(MAX_JSONRPC_LINE_LEN as u64 + 1);
