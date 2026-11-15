@@ -148,6 +148,55 @@ impl Server {
         }
     }
 
+    /// Like `call_tool` but tolerates isError responses: returns
+    /// (is_error, content_text) without asserting success.
+    fn call_tool_raw(&mut self, id: u64, name: &str, args: serde_json::Value) -> (bool, String) {
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": args},
+        });
+        self.stdin
+            .write_all(req.to_string().as_bytes())
+            .expect("write request");
+        self.stdin.write_all(b"\n").expect("write newline");
+        self.stdin.flush().expect("flush stdin");
+
+        let deadline = Instant::now() + RESP_TIMEOUT;
+        loop {
+            if Instant::now() > deadline {
+                panic!("timeout waiting for tools/call response id={id} ({name})");
+            }
+            let line = match self.stdout_rx.recv_timeout(RESP_TIMEOUT) {
+                Ok(l) => l,
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!("stdout idle for {RESP_TIMEOUT:?} waiting for id={id} ({name})")
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("server stdout closed before answering id={id} ({name})")
+                }
+            };
+            let v: serde_json::Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue, // non-JSON line on stdout: skip
+            };
+            if v.get("id").and_then(|i| i.as_u64()) != Some(id) {
+                continue;
+            }
+            let is_error = v
+                .pointer("/result/isError")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            let text = v
+                .pointer("/result/content/0/text")
+                .and_then(|t| t.as_str())
+                .unwrap_or_default()
+                .to_string();
+            return (is_error, text);
+        }
+    }
+
     /// Drain stderr for up to `timeout` looking for `needle`.
     /// Returns true as soon as a matching line is seen.
     fn wait_stderr_containing(&self, needle: &str, timeout: Duration) -> bool {
@@ -246,6 +295,160 @@ fn spatial_info_metadata_scan_characterization() {
             serde_json::json!(0),
             "spatial_info tunnel_count wrong: {info}"
         );
+        srv.shutdown();
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Characterization for `splatsdb_store` (`handle_store`): validation order,
+/// id/category bounds, embedding dimension handling, auto-id assignment
+/// (`mem_{next_id}`) and the wing/room/hall spatial registration branch.
+/// Pins behavior before the validation block is extracted into a helper.
+///
+/// Note: the NaN/inf embedding guard is NOT reachable through JSON-RPC —
+/// serde_json cannot serialize non-finite f64s (they become null and the
+/// `filter_map(as_f64)` drops them, so the dimension check fires first).
+#[test]
+fn store_handler_characterization() {
+    let tmp = std::env::temp_dir().join(format!(
+        "splatsdb_store_char_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let doc_db = tmp.join("docs.db");
+
+    {
+        let mut srv = spawn_server(&doc_db, false);
+
+        // Validation order: missing text fires before any other check.
+        let (err, msg) =
+            srv.call_tool_raw(1, "splatsdb_store", serde_json::json!({"category": "x"}));
+        assert!(err, "missing text must be an error");
+        assert!(
+            msg.contains("missing 'text' field"),
+            "unexpected error for missing text: {msg}"
+        );
+
+        // Oversized / empty explicit IDs are rejected before touching the store.
+        let long_id = "x".repeat(300);
+        let (err, msg) = srv.call_tool_raw(
+            2,
+            "splatsdb_store",
+            serde_json::json!({"text": "t", "id": long_id}),
+        );
+        assert!(err && msg.contains("invalid document ID"), "got: {msg}");
+
+        let (err, msg) = srv.call_tool_raw(
+            3,
+            "splatsdb_store",
+            serde_json::json!({"text": "t", "id": ""}),
+        );
+        assert!(err && msg.contains("invalid document ID"), "got: {msg}");
+
+        // Category bounds mirror id bounds.
+        let long_cat = "y".repeat(300);
+        let (err, msg) = srv.call_tool_raw(
+            4,
+            "splatsdb_store",
+            serde_json::json!({"text": "t", "category": long_cat}),
+        );
+        assert!(err && msg.contains("invalid category"), "got: {msg}");
+
+        // A wrong-dimension embedding is rejected; the message reveals the
+        // store's expected dimension, which the rest of the test reuses.
+        let (err, msg) = srv.call_tool_raw(
+            5,
+            "splatsdb_store",
+            serde_json::json!({"text": "t", "embedding": [0.5, 0.5]}),
+        );
+        assert!(err, "dim-mismatched embedding must be an error");
+        assert!(msg.contains("Embedding dimension mismatch"), "got: {msg}");
+        let dim: usize = msg
+            .split("expected ")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .and_then(|s| s.trim().parse().ok())
+            .expect("could not parse expected dim from error");
+        assert!(dim >= 8, "implausibly small embedding dim: {dim}");
+
+        // Happy path: explicit id + category + client-provided embedding.
+        let emb: Vec<f64> = vec![0.25; dim];
+        let r = srv.call_tool(
+            6,
+            "splatsdb_store",
+            serde_json::json!({
+                "text": "store characterization doc",
+                "id": "vec_char_1",
+                "category": "char",
+                "embedding": emb
+            }),
+        );
+        assert_eq!(r["id"], serde_json::json!("vec_char_1"), "store id: {r}");
+        assert_eq!(r["status"], serde_json::json!("stored"), "store: {r}");
+
+        // No id supplied → auto id from `next_id`, which increments on EVERY
+        // store — including the explicit-id one above — so this is `mem_2`.
+        let r2 = srv.call_tool(
+            7,
+            "splatsdb_store",
+            serde_json::json!({"text": "second doc", "embedding": emb}),
+        );
+        assert_eq!(r2["id"], serde_json::json!("mem_2"), "auto id: {r2}");
+        assert_eq!(r2["status"], serde_json::json!("stored"), "auto id: {r2}");
+
+        // wing/room/hall branch registers into the spatial index.
+        let r3 = srv.call_tool(
+            8,
+            "splatsdb_store",
+            serde_json::json!({
+                "text": "spatial doc",
+                "id": "vec_char_2",
+                "wing": "store_w",
+                "room": "store_r",
+                "hall": "store_h",
+                "embedding": emb
+            }),
+        );
+        assert_eq!(
+            r3["id"],
+            serde_json::json!("vec_char_2"),
+            "spatial store: {r3}"
+        );
+
+        let info = srv.call_tool(9, "splatsdb_spatial_info", serde_json::json!({}));
+        assert_eq!(
+            info["total_documents"],
+            serde_json::json!(3),
+            "spatial_info total after stores: {info}"
+        );
+        // KNOWN INCONSISTENCY (behavior, not refactor — flag, don't "fix"
+        // silently): handle_store registers wing/room/hall in the live
+        // in-memory spatial_index but persists only {text, category} to the
+        // SQLite metadata JSON, while handle_spatial_info counts by scanning
+        // SQLite. Net effect: store-registered spatial metadata is invisible
+        // to spatial_info AND lost across restarts (doc_add persists spatial
+        // keys and does not have this problem).
+        assert_eq!(
+            info["documents_with_spatial_metadata"],
+            serde_json::json!(0),
+            "current behavior: store spatial keys are not persisted, spatial_info sees 0: {info}"
+        );
+        assert_eq!(
+            info["wings"],
+            serde_json::json!({}),
+            "current behavior: no persisted wings: {info}"
+        );
+        assert_eq!(
+            info["halls"],
+            serde_json::json!([]),
+            "current behavior: no persisted halls: {info}"
+        );
+
         srv.shutdown();
     }
 
