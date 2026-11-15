@@ -567,7 +567,21 @@ fn simcos_embedding(text: &str, dim: usize) -> Vec<f32> {
 // Tool handlers
 // ============================================================================
 
-fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String> {
+/// Validated parameters for `splatsdb_store`.
+struct StoreParams<'a> {
+    text: &'a str,
+    category: Option<&'a str>,
+    embedding_opt: Option<Vec<f32>>,
+}
+
+/// Validate the `splatsdb_store` request fields BEFORE touching the store:
+/// text required (≤100k bytes), id/category optional but non-empty and
+/// ≤256 bytes, embedding parsed as f32 (dimension checked later against the
+/// store, once `dim` is known).
+///
+/// Extracted from `handle_store`; behavior identical, including the check
+/// order (text → id → category).
+fn validate_store_params(params: &Value) -> Result<StoreParams<'_>, String> {
     let text = params["text"].as_str().ok_or("missing 'text' field")?;
     const MAX_TEXT_LEN: usize = 100_000;
     if text.len() > MAX_TEXT_LEN {
@@ -592,6 +606,18 @@ fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String
             .filter_map(|v| v.as_f64().map(|f| f as f32))
             .collect::<Vec<_>>()
     });
+    Ok(StoreParams {
+        text,
+        category,
+        embedding_opt,
+    })
+}
+
+fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String> {
+    let p = validate_store_params(params)?;
+    let text = p.text;
+    let category = p.category;
+    let embedding_opt = p.embedding_opt;
 
     // Read dimension under a brief lock, then compute embedding WITHOUT holding
     // the mutex — get_embedding() may make an HTTP call (5s timeout) and would
