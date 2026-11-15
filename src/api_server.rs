@@ -492,12 +492,58 @@ pub struct FieldData {
     pub chunk_cluster: Vec<u32>,
 }
 
+/// Sanity caps for field/ headers (parsed straight from file bytes, so a
+/// corrupt header must not OOM the server on boot).
+const MAX_FIELD_N: usize = 100_000_000;
+const MAX_FIELD_K: usize = 100_000_000;
+const MAX_FIELD_RADII: usize = 100_000_000;
+
 fn load_field(data_dir: &str) -> Option<FieldData> {
-    use std::io::Read;
     let dir = std::path::Path::new(data_dir).join("field");
     if !dir.join("members.idx").exists() || !dir.join("radii.bin").exists() {
         return None;
     }
+    let (n, k, offsets, ids) = read_members_idx(&dir)?;
+
+    let radii = read_radii_bin(&dir)?;
+
+    let persist = crate::storage::persistence::SplatsDBPersistence::with_backend(
+        data_dir,
+        crate::storage::persistence::StorageBackend::Sqlite,
+        false,
+    )
+    .ok()?;
+    let raw = persist.load_vectors("raw").ok()??;
+    let splats = persist.load_vectors("default").ok()??;
+    if raw.nrows() != n || splats.nrows() != k || radii.len() != k {
+        eprintln!("[splatsdb] field/ desincronizado; /field-search deshabilitado");
+        return None;
+    }
+    let mut chunk_cluster = vec![0u32; n];
+    for c in 0..k {
+        let (lo, hi) = (offsets[c] as usize, offsets[c + 1] as usize);
+        for &id in &ids[lo..hi] {
+            chunk_cluster[id as usize] = c as u32;
+        }
+    }
+    Some(FieldData {
+        raw,
+        splats,
+        offsets,
+        radii,
+        chunk_cluster,
+        ids,
+    })
+}
+
+/// Parse `field/members.idx`: 16-byte header (n, k) + (k+1)×8 CSR offsets +
+/// n×4 member ids, with sanity caps, a size-vs-header truncation check, CSR
+/// monotonicity (bounds every later `ids[lo..hi]` slice in
+/// field_sweep/field_two_phase) and member-id range validation.
+///
+/// Extracted from `load_field`; messages and behavior identical.
+fn read_members_idx(dir: &std::path::Path) -> Option<(usize, usize, Vec<u64>, Vec<u32>)> {
+    use std::io::Read;
     let mut f = std::fs::File::open(dir.join("members.idx")).ok()?;
     let mut hdr = [0u8; 16];
     f.read_exact(&mut hdr).ok()?;
@@ -506,8 +552,6 @@ fn load_field(data_dir: &str) -> Option<FieldData> {
     // Sanity caps BEFORE any allocation: n*4 / (k+1)*8 bytes are reserved
     // straight from the file header, so a corrupt header must not OOM the
     // server on boot.
-    const MAX_FIELD_N: usize = 100_000_000;
-    const MAX_FIELD_K: usize = 100_000_000;
     if n > MAX_FIELD_N || k > MAX_FIELD_K {
         eprintln!(
             "[splatsdb] field/ header out of range (n={n}, k={k}); /field-search deshabilitado"
@@ -553,13 +597,21 @@ fn load_field(data_dir: &str) -> Option<FieldData> {
         eprintln!("[splatsdb] field/ member id fuera de rango; /field-search deshabilitado");
         return None;
     }
+    Some((n, k, offsets, ids))
+}
+
+/// Parse `field/radii.bin`: 8-byte header (kr) + kr×4 f32 radii, with the
+/// same sanity-cap and truncation checks as members.idx.
+///
+/// Extracted from `load_field`; messages and behavior identical.
+fn read_radii_bin(dir: &std::path::Path) -> Option<Vec<f32>> {
+    use std::io::Read;
     let mut f = std::fs::File::open(dir.join("radii.bin")).ok()?;
     let mut k8 = [0u8; 8];
     f.read_exact(&mut k8).ok()?;
     let kr = u64::from_le_bytes(k8) as usize;
     // Same sanity cap as n/k: kr*4 bytes are allocated straight from the
     // radii.bin header.
-    const MAX_FIELD_RADII: usize = 100_000_000;
     if kr > MAX_FIELD_RADII {
         eprintln!(
             "[splatsdb] field/ radii header out of range (kr={kr}); /field-search deshabilitado"
@@ -582,33 +634,7 @@ fn load_field(data_dir: &str) -> Option<FieldData> {
     for (i, c) in rb.as_chunks::<4>().0.iter().enumerate() {
         radii[i] = f32::from_le_bytes(*c);
     }
-    let persist = crate::storage::persistence::SplatsDBPersistence::with_backend(
-        data_dir,
-        crate::storage::persistence::StorageBackend::Sqlite,
-        false,
-    )
-    .ok()?;
-    let raw = persist.load_vectors("raw").ok()??;
-    let splats = persist.load_vectors("default").ok()??;
-    if raw.nrows() != n || splats.nrows() != k || kr != k {
-        eprintln!("[splatsdb] field/ desincronizado; /field-search deshabilitado");
-        return None;
-    }
-    let mut chunk_cluster = vec![0u32; n];
-    for c in 0..k {
-        let (lo, hi) = (offsets[c] as usize, offsets[c + 1] as usize);
-        for &id in &ids[lo..hi] {
-            chunk_cluster[id as usize] = c as u32;
-        }
-    }
-    Some(FieldData {
-        raw,
-        splats,
-        offsets,
-        radii,
-        chunk_cluster,
-        ids,
-    })
+    Some(radii)
 }
 
 fn field_sweep(field: &FieldData, q: &[f32], kq: usize) -> serde_json::Value {
