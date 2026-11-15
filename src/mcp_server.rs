@@ -1459,30 +1459,32 @@ fn scan_spatial_metadata(
     let mut total_with_spatial = 0usize;
 
     for id in all_ids {
-        if let Ok(Some(rec)) = s.doc_store.get(id) {
-            if let Some(ref meta) = rec.metadata {
-                let has_wing = meta.get("wing").and_then(|v| v.as_str()).is_some();
-                let has_room = meta.get("room").and_then(|v| v.as_str()).is_some();
-                let has_hall = meta.get("hall").and_then(|v| v.as_str());
+        let Ok(Some(rec)) = s.doc_store.get(id) else {
+            continue;
+        };
+        let Some(ref meta) = rec.metadata else {
+            continue;
+        };
+        let has_wing = meta.get("wing").and_then(|v| v.as_str()).is_some();
+        let has_room = meta.get("room").and_then(|v| v.as_str()).is_some();
+        let has_hall = meta.get("hall").and_then(|v| v.as_str());
 
-                if has_wing || has_room || has_hall.is_some() {
-                    total_with_spatial += 1;
-                }
+        if has_wing || has_room || has_hall.is_some() {
+            total_with_spatial += 1;
+        }
 
-                if let (Some(w), Some(r)) = (
-                    meta.get("wing").and_then(|v| v.as_str()),
-                    meta.get("room").and_then(|v| v.as_str()),
-                ) {
-                    wings
-                        .entry(w.to_string())
-                        .or_default()
-                        .insert(r.to_string());
-                }
+        if let (Some(w), Some(r)) = (
+            meta.get("wing").and_then(|v| v.as_str()),
+            meta.get("room").and_then(|v| v.as_str()),
+        ) {
+            wings
+                .entry(w.to_string())
+                .or_default()
+                .insert(r.to_string());
+        }
 
-                if let Some(h) = has_hall {
-                    halls.insert(h.to_string());
-                }
-            }
+        if let Some(h) = has_hall {
+            halls.insert(h.to_string());
         }
     }
     total_with_spatial

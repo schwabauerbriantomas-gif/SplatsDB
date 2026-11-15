@@ -399,22 +399,11 @@ impl SplatStore {
                              falling back to per-vector insertion",
                             e
                         );
-                        for v in &new_vecs {
-                            match backend.add_batch(std::slice::from_ref(v)) {
-                                Ok(()) => inserted += 1,
-                                Err(e) => {
-                                    eprintln!(
-                                        "[splatsdb] Warning: stopping incremental sync at {} \
-                                         inserted: {}",
-                                        inserted, e
-                                    );
-                                    // Backend indices are positional: a skipped
-                                    // middle vector would SHIFT every later one
-                                    // (silent index corruption). Stop instead.
-                                    break;
-                                }
-                            }
-                        }
+                        // Backend indices are positional: a skipped middle
+                        // vector would SHIFT every later one (silent index
+                        // corruption). The helper stops at the first failure
+                        // and returns how many made it in before that.
+                        inserted += Self::insert_fallback_one_by_one(backend.as_mut(), &new_vecs);
                     }
                 }
             } else {
@@ -427,6 +416,33 @@ impl SplatStore {
         // Advance only by what actually made it into the backend: a failure
         // leaves the counter behind so the next sync retries the remainder.
         self.hnsw_indexed_count = start + inserted;
+        inserted
+    }
+
+    /// Per-vector fallback after a failed batch insert: inserts one by one,
+    /// stopping at the first failure (a skipped middle vector would SHIFT
+    /// every later positional index — silent index corruption).
+    ///
+    /// Extracted from `hnsw_sync_incremental` (repowise XL queue, nesting
+    /// reduction); messages and behavior identical.
+    fn insert_fallback_one_by_one(
+        backend: &mut dyn CandidateBackend,
+        new_vecs: &[Vec<f32>],
+    ) -> usize {
+        let mut inserted = 0usize;
+        for v in new_vecs {
+            match backend.add_batch(std::slice::from_ref(v)) {
+                Ok(()) => inserted += 1,
+                Err(e) => {
+                    eprintln!(
+                        "[splatsdb] Warning: stopping incremental sync at {} \
+                         inserted: {}",
+                        inserted, e
+                    );
+                    break;
+                }
+            }
+        }
         inserted
     }
 
