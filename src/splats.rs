@@ -89,9 +89,7 @@ fn build_quant_store(
             crate::config::QuantAlgorithm::PolarQuant => {
                 crate::quantization::QuantAlgorithm::PolarQuant
             }
-            crate::config::QuantAlgorithm::None => {
-                crate::quantization::QuantAlgorithm::TurboQuant
-            }
+            crate::config::QuantAlgorithm::None => crate::quantization::QuantAlgorithm::TurboQuant,
         },
     };
     crate::quantization::QuantizedStore::new(dim, qcfg).ok()
