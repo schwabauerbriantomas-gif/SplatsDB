@@ -13,7 +13,6 @@ pub mod hrm2_engine;
 pub mod interfaces;
 pub mod lsh_index;
 pub mod mcp_server;
-pub mod memory;
 pub mod quantization;
 pub mod recap;
 pub mod spatial;

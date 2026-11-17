@@ -61,9 +61,6 @@ pub enum Commands {
         #[arg(short, long)]
         verbose: bool,
     },
-    /// SOC: check system criticality
-    /// SOC: trigger avalanche reorganization
-    /// SOC: relax the system toward lower energy
     /// Save current state to disk
     Save {
         #[arg(short, long, default_value = "default")]
@@ -324,8 +321,6 @@ pub enum Commands {
     /// Print graph store statistics
     GraphStats,
     // ── ML / Entity / Data Lake Commands ──────────────────────────────
-    /// Extract entities from text using structural patterns and n-grams
-    /// Evaluate embedding quality with synthetic benchmark
     /// Benchmark HNSW search with recall measurement (single-process)
     BenchHnsw {
         /// Binary file with training vectors [u64 rows][u64 cols][f32 data]
@@ -385,12 +380,6 @@ pub enum Commands {
     },
     /// Show spatial memory structure (wings, rooms, tunnels)
     SpatialInfo,
-    /// Remove a node from the cluster
-    /// Show cluster status — nodes, routing, sharding
-    /// Ingest documents to cluster with sharding
-    /// Search the cluster with routing and RRF aggregation
-    /// Benchmark cluster search performance
-    /// Reset cluster state (remove all nodes)
     // ── Verbatim Storage ─────────────────────────────────────────────
     /// Store document with verbatim text for exact recall
     VerbatimStore {
