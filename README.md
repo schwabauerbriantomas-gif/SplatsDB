@@ -288,11 +288,11 @@ Candidate retrieval (HNSW or HRM2) returns neighbors by geometric distance. Spla
 score(i) = αᵢ · exp(−κᵢ · ‖q − μᵢ‖²)
 ```
 
-where each stored item carries α (opacity / importance) and κ (concentration / specificity) alongside its mean μ. The re-scoring step is what produces the confidence signal: an item with high κ only scores high when it is very close to the query, while a low-κ item contributes a broader, weaker match. The same α/κ model defines the energy landscape `E(x) = −log(Σᵢ αᵢ·exp(−κᵢ·‖x−μᵢ‖²))` used for uncertainty estimation (`src/energy.rs`, `src/ebm/`).
+where each stored item carries α (opacity / importance) and κ (concentration / specificity) alongside its mean μ. The re-scoring step is what produces the confidence signal: an item with high κ only scores high when it is very close to the query, while a low-κ item contributes a broader, weaker match. The same α/κ model drives the Gaussian re-scoring and confidence flagging implemented in `src/splats.rs` (`gaussian_score`). The earlier energy-landscape uncertainty estimation (`src/energy.rs`, `src/ebm/`) was **removed in v2.7.x** after being falsified as a ranking signal — see the v2.6 audit below and `docs/A5_FINDINGS.md`.
 
 Probabilistic scoring of candidates is not new as a technique — probabilistic cross-media embedding methods (e.g. PCME / PCME++) and mixture-model retrieval score candidates distributionally in the academic literature. SplatsDB's contribution is at the product level: per-item κ re-scoring, uncertainty flags, and confidence-aware results exposed as first-class database features (search results, MCP tools), not as a research artifact.
 
-> **v2.6 empirical audit** (`bench-latent/`, 30 queries vs exact GT, 26k×768): energy re-scoring as a *ranking* signal collapses recall to ~0.00–0.05 in 768d — κ clamps low and α dominates, so the ranking becomes cluster popularity. Use it for uncertainty flagging and energy exploration only; rank with the embedding metric. Details in [`docs/A5_FINDINGS.md`](docs/A5_FINDINGS.md).
+> **v2.6 empirical audit** (30 queries vs exact GT, 26k×768; measurement source **not preserved** — the `bench-latent/` directory referenced by earlier revisions no longer exists in the tree or history): energy re-scoring as a *ranking* signal collapses recall to ~0.00–0.05 in 768d — κ clamps low and α dominates, so the ranking becomes cluster popularity. Rank with the embedding metric; confidence flagging stays a first-class feature. Details in [`docs/A5_FINDINGS.md`](docs/A5_FINDINGS.md).
 
 ### SimCos Embeddings
 

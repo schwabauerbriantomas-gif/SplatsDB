@@ -2,7 +2,9 @@
 
 **Date:** 2026-11-05 · **Origin:** comparison against LeJEPA/SIGReg
 (Balestriero & LeCun, arXiv:2511.08544) requested by the owner.
-**Code:** `src/ebm/fidelity.rs` · **Receipts:** `docs/eval/ep_lejepa_x/`.
+**Code:** `src/ebm/fidelity.rs` — **removed in v2.7.x**; this document
+preserves the methodology and the experiment receipts.
+**Receipts:** `docs/eval/ep_lejepa_x/`.
 
 ## What it measures
 
@@ -49,7 +51,7 @@ Experiment: 20 Newsgroups, all-MiniLM-L6-v2 384d, seed 42, CPU-only.
 
 ## Files
 
-* `src/ebm/fidelity.rs` — implementation + 6 unit tests pinned to the
+* `src/ebm/fidelity.rs` — *(removed in v2.7.x)* implementation had 6 unit tests pinned to the
   experiment receipts (EP discrimination 1365×, vMF mean-resultant exact
   A₃(10)=0.9 and continued-fraction values, sampler R within tolerance,
   gap-ratio regime pinned at d=64/6 clusters/κ≈10 reproducing ratio ≪1).
