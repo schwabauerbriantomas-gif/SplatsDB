@@ -1216,9 +1216,13 @@ fn gpu_batch_path(
                 .take(k)
                 .map(|(&ix, &d)| SearchResult {
                     index: ix,
-                    // batch_search reports squared L2; expose true L2 to
-                    // match the CPU path (find_neighbors sqrt'd distances).
-                    score: d.sqrt(),
+                    // Emit raw squared L2 (d²) — same scale as the fast GPU
+                    // path and cpu_fused_batch (87d5d91), so the client's
+                    // calibrated bands (0.55/0.70) survive a batch-worker
+                    // fallback. The old sqrt here described the pre-87d5d91
+                    // CPU path and made the scale depend on which route
+                    // served the query (17-nov EGM audit).
+                    score: d,
                     metadata: None,
                     confidence: None,
                     topic: None,
