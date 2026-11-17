@@ -234,7 +234,8 @@ struct JsonRpcRequest {
 #[derive(Serialize)]
 struct JsonRpcResponse {
     jsonrpc: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // id is ALWAYS serialized (null when undetectable): JSON-RPC 2.0 requires
+    // the id member present on error responses (17-nov EGM audit).
     id: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<Value>,
@@ -713,9 +714,16 @@ fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String
         updated_at: now,
     };
 
-    if let Err(e) = s.doc_store.upsert(&record) {
-        eprintln!("[mcp] warning: SQLite upsert failed: {}", e);
-    }
+    // Persistence failure must be visible to the client (17-nov EGM audit):
+    // a swallowed upsert error made "stored" a lie after a restart wiped the
+    // doc from warm start.
+    let persisted = match s.doc_store.upsert(&record) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[mcp] warning: SQLite upsert failed: {}", e);
+            false
+        }
+    };
 
     // Register spatial metadata if present
     let wing = params["wing"].as_str();
@@ -731,7 +739,7 @@ fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String
         vector_idx,
         text.len()
     );
-    Ok(json!({ "id": id, "status": "stored" }))
+    Ok(json!({ "id": id, "status": "stored", "persisted": persisted }))
 }
 
 fn handle_search(state: &Mutex<McpState>, params: &Value) -> Result<Value, String> {
@@ -1717,7 +1725,7 @@ fn dispatch_request(state: &Mutex<McpState>, req: &JsonRpcRequest) -> JsonRpcRes
                 },
                 "serverInfo": {
                     "name": "splatsdb",
-                    "version": "2.5.0"
+                    "version": env!("CARGO_PKG_VERSION")
                 }
             })),
             error: None,
@@ -1811,7 +1819,10 @@ fn dispatch_request(state: &Mutex<McpState>, req: &JsonRpcRequest) -> JsonRpcRes
 const MAX_JSONRPC_LINE_LEN: usize = 10_000_000;
 
 pub fn run_mcp_server() {
-    eprintln!("[splatsdb] MCP server v2.5 starting (stdio transport)...");
+    eprintln!(
+        "[splatsdb] MCP server v{} starting (stdio transport)...",
+        env!("CARGO_PKG_VERSION")
+    );
 
     let config = SplatsDBConfig::mcp(None);
     let mut store = SplatStore::new(config);
@@ -1894,7 +1905,20 @@ pub fn run_mcp_server() {
 
         let line = match read_request_line(&mut reader, &mut raw_line, &mut pending) {
             LineRead::Eof => break,
-            LineRead::Skip => continue,
+            LineRead::Skip => {
+                // The oversized line was drained inside read_request_line.
+                // Reply anyway: the client's request (undetectable → id:null)
+                // must not hang forever waiting for a response (17-nov).
+                write_rpc_error(
+                    &mut stdout,
+                    -32600,
+                    &format!(
+                        "Invalid Request: message exceeds {} bytes",
+                        MAX_JSONRPC_LINE_LEN
+                    ),
+                );
+                continue;
+            }
             LineRead::Line(line) => line,
         };
 
@@ -1906,6 +1930,14 @@ pub fn run_mcp_server() {
                 eprintln!(
                     "[splatsdb] rejecting oversized JSON-RPC message ({} bytes)",
                     line.len()
+                );
+                write_rpc_error(
+                    &mut stdout,
+                    -32600,
+                    &format!(
+                        "Invalid Request: message exceeds {} bytes",
+                        MAX_JSONRPC_LINE_LEN
+                    ),
                 );
                 continue;
             }
@@ -2237,6 +2269,26 @@ fn read_request_line(
 /// jsonrpc version, writes the corresponding error response to stdout and
 /// returns `Err(())` (the caller skips the line). On success logs the method
 /// and returns the request.
+/// Write a JSON-RPC error response with `id: null` (request undetectable).
+fn write_rpc_error(stdout: &mut io::Stdout, code: i32, message: &str) {
+    let resp = JsonRpcResponse {
+        jsonrpc: "2.0".into(),
+        id: None,
+        result: None,
+        error: Some(JsonRpcError {
+            code,
+            message: message.to_string(),
+        }),
+    };
+    let out = serde_json::to_string(&resp).unwrap_or_else(|_| {
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request"}}"#
+            .to_string()
+    });
+    writeln!(stdout, "{}", out).ok();
+    stdout.flush().ok();
+}
+
+/// Parse one JSON-RPC line.
 ///
 /// Extracted from `run_mcp_server`; messages, error codes and behavior
 /// identical.
@@ -2245,13 +2297,22 @@ fn parse_jsonrpc_request(line: &str, stdout: &mut io::Stdout) -> Result<JsonRpcR
         Ok(r) => r,
         Err(e) => {
             eprintln!("[splatsdb] parse error: {}", e);
+            let msg = e.to_string();
+            // JSON-RPC 2.0 spec: syntactically invalid JSON → -32700 Parse
+            // error; valid JSON with an invalid request schema (missing
+            // field) → -32600 Invalid Request (17-nov EGM audit).
+            let (code, prefix) = if msg.starts_with("missing field") {
+                (-32600, "Invalid Request")
+            } else {
+                (-32700, "Parse error")
+            };
             let resp = JsonRpcResponse {
                 jsonrpc: "2.0".into(),
                 id: None,
                 result: None,
                 error: Some(JsonRpcError {
-                    code: -32700,
-                    message: format!("Parse error: {}", e),
+                    code,
+                    message: format!("{prefix}: {msg}"),
                 }),
             };
             let out = serde_json::to_string(&resp).unwrap_or_else(|_| {
