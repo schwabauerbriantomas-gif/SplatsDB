@@ -47,13 +47,19 @@ extern "C" fn handle_sigint(_: i32) {
     SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
 }
 
-fn get_embedding(text: &str, dim: usize) -> Vec<f32> {
+/// Embedding from the service only: None when the service is unavailable or
+/// fails. No SimCos fallback — /search is fail-closed (fa1e528 parity: a
+/// hash-text embedding produces noise ranking reported with a success status).
+fn get_embedding_strict(text: &str, dim: usize) -> Option<Vec<f32>> {
     if EMBED_SERVICE_AVAILABLE.load(Ordering::Relaxed) {
-        if let Some(vec) = fetch_real_embedding(text, dim) {
-            return vec;
-        }
+        fetch_real_embedding(text, dim)
+    } else {
+        None
     }
-    simcos_embedding(text, dim)
+}
+
+fn get_embedding(text: &str, dim: usize) -> Vec<f32> {
+    get_embedding_strict(text, dim).unwrap_or_else(|| simcos_embedding(text, dim))
 }
 
 fn fetch_real_embedding(text: &str, target_dim: usize) -> Option<Vec<f32>> {
@@ -595,6 +601,13 @@ fn validate_store_params(params: &Value) -> Result<StoreParams<'_>, String> {
         if id.is_empty() || id.len() > MAX_ID_LEN {
             return Err("invalid document ID".into());
         }
+        // mem_<n> is the auto-id namespace: warm_start_reload derives
+        // next_id from persisted ids, so an explicit mem_18446744073709551615
+        // would wrap the counter on the next store and alias over persisted
+        // docs via INSERT OR REPLACE (17-nov EGM audit). Reject it.
+        if id.len() > 4 && id.starts_with("mem_") && id[4..].bytes().all(|b| b.is_ascii_digit()) {
+            return Err("'mem_<n>' IDs are reserved for auto-generated documents".into());
+        }
     }
     if let Some(cat) = category {
         if cat.is_empty() || cat.len() > MAX_ID_LEN {
@@ -661,7 +674,13 @@ fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String
     }
     s.store.hnsw_sync_incremental();
 
-    s.next_id += 1;
+    // Counter advance must fail cleanly instead of wrapping into persisted
+    // mem_<n> ids (17-nov EGM audit: a wrapped counter regenerates mem_1..mem_N
+    // via INSERT OR REPLACE and corrupts existing docs silently).
+    s.next_id = s
+        .next_id
+        .checked_add(1)
+        .ok_or_else(|| "document id counter exhausted".to_string())?;
     let id = params["id"]
         .as_str()
         .map(|s| s.to_string())
@@ -747,7 +766,15 @@ fn handle_search(state: &Mutex<McpState>, params: &Value) -> Result<Value, Strin
             .filter_map(|v| v.as_f64().map(|f| f as f32))
             .collect::<Vec<_>>()
     });
-    let embedding = embedding_opt.unwrap_or_else(|| get_embedding(query, dim));
+    let embedding = match embedding_opt {
+        Some(e) => e,
+        // fa1e528 parity (HTTP /search answers 400 without embedding): no
+        // text-hash fallback here either — SimCos noise with a 200-equivalent
+        // response is silent garbage ranking. Fail closed (17-nov EGM audit).
+        None => get_embedding_strict(query, dim).ok_or_else(|| {
+            "embedding unavailable: embed service unreachable — send an 'embedding' argument or start the embed server".to_string()
+        })?,
+    };
 
     if embedding.len() != dim {
         return Err(format!(
@@ -804,7 +831,10 @@ fn handle_search(state: &Mutex<McpState>, params: &Value) -> Result<Value, Strin
         query.len(),
         results.len()
     );
-    Ok(json!({ "results": results }))
+    // backend marker: scores are HRM2 engine distances (approximate path for
+    // large stores), NOT the exact d² the HTTP /search emits — clients must
+    // not reuse HTTP band calibrations against them (17-nov EGM audit).
+    Ok(json!({ "results": results, "backend": "hrm2" }))
 }
 
 fn handle_status(state: &Mutex<McpState>) -> Result<Value, String> {
@@ -2139,9 +2169,22 @@ fn read_request_line(
     let read = if pending.is_empty() {
         let mut capped = reader.take(MAX_JSONRPC_LINE_LEN as u64 + 1);
         capped.read_until(b'\n', raw_line)
+    } else if let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+        // Pending holds ≥1 COMPLETE line (pipelined requests that followed the
+        // oversized one): return the first now and keep the rest queued.
+        // Returning it without consuming fresh stdin keeps the JSON-RPC stream
+        // in sync — merging it with the next read_until would concatenate
+        // distinct requests into one unparseable line, or hang waiting for a
+        // newline the client never sends (17-nov EGM audit).
+        let line_bytes: Vec<u8> = pending[..=pos].to_vec();
+        let rest: Vec<u8> = pending[(pos + 1)..].to_vec();
+        pending.clear();
+        pending.extend_from_slice(&rest);
+        raw_line.extend_from_slice(&line_bytes);
+        return LineRead::Line(String::from_utf8_lossy(raw_line).trim().to_string());
     } else {
-        // Seed the tail of the previous oversized line, then keep reading
-        // the current one under the same cap (identical semantics to a
+        // Pending is a partial tail (no newline yet): seed it and keep reading
+        // the current line under the same cap (identical semantics to a
         // fresh read: newline detection and oversize check still apply).
         raw_line.extend_from_slice(pending);
         pending.clear();
