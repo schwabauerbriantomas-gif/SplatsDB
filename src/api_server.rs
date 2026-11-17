@@ -433,9 +433,11 @@ async fn search_memories(
             eprintln!("[splatsdb] /search: batch worker error: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
         })?;
-    // scores L2 reales (no gaussian, no hash) → confidence espacial
-    // (siempre: desde fa1e528 /search garantiza embedding)
-    enrich_topics(&state, &mut results, false);
+    // scores del batch son d² en AMBOS caminos (cpu_fused_batch desde
+    // 87d5d91, gpu_batch_path desde el fix 17-nov): squared=true para que
+    // confidence use d=√score. Con false la confidence quedaba inflada
+    // (1−d²/R en vez de 1−√d²/R) en el batch (17-nov EGM audit).
+    enrich_topics(&state, &mut results, true);
 
     Ok(Json(SearchResponse {
         results,
@@ -905,6 +907,7 @@ async fn batch_worker(
     mut rx: mpsc::Receiver<BatchRequest>,
     store: Arc<Mutex<SplatStore>>,
     batches_served: Arc<AtomicUsize>,
+    gpu_enabled: bool,
 ) {
     // Host-side dataset snapshot cache for the GPU path.
     let mut snapshot: Option<DatasetSnapshot> = None;
@@ -923,7 +926,7 @@ async fn batch_worker(
         }
 
         batches_served.fetch_add(1, Ordering::Relaxed);
-        serve_batch(batch, &store, &mut snapshot).await;
+        serve_batch(batch, &store, &mut snapshot, gpu_enabled).await;
     }
 }
 
@@ -934,11 +937,16 @@ async fn serve_batch(
     batch: Vec<BatchRequest>,
     store: &Arc<Mutex<SplatStore>>,
     snapshot: &mut Option<DatasetSnapshot>,
+    gpu_enabled: bool,
 ) {
     let queries: Vec<Vec<f32>> = batch.iter().map(|b| b.query.clone()).collect();
     let ks: Vec<usize> = batch.iter().map(|b| b.k).collect();
     let rescore: Vec<bool> = batch.iter().map(|b| b.rescore_gaussian).collect();
-    let use_gpu = crate::gpu::is_cuda_available();
+    // The operator's --gpu opt-in governs the batch path too (17-nov EGM
+    // audit): with only is_cuda_available() here, `serve` WITHOUT --gpu on a
+    // CUDA machine still uploaded the dataset to VRAM and served through the
+    // one route whose score scale differed from the fast path.
+    let use_gpu = gpu_enabled && crate::gpu::is_cuda_available();
 
     let store = store.clone();
     // The snapshot cache must survive the 'static spawn_blocking boundary:
@@ -1068,6 +1076,11 @@ fn refresh_dataset_snapshot(
         if let Some(mu) = s.get_mu() {
             let dim = mu.ncols();
             let data = mu.iter().copied().collect::<Vec<f32>>();
+            // get_alpha/get_kappa solo devuelven None con n_active==0 (caso
+            // ya descartado arriba): los defaults son inalcanzables hoy.
+            // Alineados a la init real del store (kappa: Array1::ones) para
+            // que, si el contrato cambia, el snapshot no diverja en 10× del
+            // kernel gaussiano del path CPU (17-nov EGM audit).
             let alpha = s
                 .get_alpha()
                 .map(|a| a.iter().copied().collect::<Vec<f32>>())
@@ -1075,7 +1088,7 @@ fn refresh_dataset_snapshot(
             let kappa = s
                 .get_kappa()
                 .map(|k| k.iter().copied().collect::<Vec<f32>>())
-                .unwrap_or_else(|| vec![10.0f32; n]);
+                .unwrap_or_else(|| vec![1.0f32; n]);
             *snapshot = Some(DatasetSnapshot {
                 version,
                 n,
@@ -1343,9 +1356,10 @@ fn load_default_shard(store: &mut SplatStore, data_dir: &str) -> anyhow::Result<
         Some(vectors) => {
             if !store.add_splat(&vectors) {
                 anyhow::bail!(
-                    "store capacity exceeded (max_splats={}) while loading {} vectors",
-                    store.max_splats(),
-                    vectors.nrows()
+                    "store capacity exceeded or dimension mismatch while loading {} vectors \
+                     (max_splats={}) — check --dim against the shard's dim",
+                    vectors.nrows(),
+                    store.max_splats()
                 );
             }
             Ok(vectors.nrows())
@@ -1455,8 +1469,6 @@ pub async fn run_server(
         None
     };
     #[cfg(not(feature = "cuda"))]
-    let _ = gpu_enabled;
-    #[cfg(not(feature = "cuda"))]
     drop(corpus);
 
     let store = Arc::new(Mutex::new(store));
@@ -1466,6 +1478,7 @@ pub async fn run_server(
         batch_rx,
         store.clone(),
         batches_served.clone(),
+        gpu_enabled,
     ));
 
     let state = AppState {
@@ -1582,6 +1595,7 @@ mod tests {
             batch_rx,
             store.clone(),
             batches_served.clone(),
+            false,
         ));
         let state = AppState {
             store,
@@ -2185,6 +2199,7 @@ mod tests {
             batch_rx,
             store.clone(),
             batches_served.clone(),
+            false,
         ));
         let state = AppState {
             store,

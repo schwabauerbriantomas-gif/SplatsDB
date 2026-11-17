@@ -170,10 +170,17 @@ impl SplatStore {
         }
     }
 
-    /// Add a batch of splat vectors. Returns false if capacity exceeded.
+    /// Add a batch of splat vectors. Returns false if capacity exceeded
+    /// or `x` has a different dimension than the store — without this guard
+    /// ndarray's broadcast panics on a mismatched shard (or silently fills
+    /// every row when ncols==1); `insert` documents the dim contract but
+    /// add_splat is the path serve/CLI actually use (17-nov EGM audit).
     pub fn add_splat(&mut self, x: &Array2<f32>) -> bool {
         let n_new = x.nrows();
         if self.n_active + n_new > self.max_splats {
+            return false;
+        }
+        if x.ncols() != self.config.latent_dim {
             return false;
         }
         for i in 0..n_new {
