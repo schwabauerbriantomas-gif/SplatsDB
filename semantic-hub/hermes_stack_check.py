@@ -89,18 +89,29 @@ def main():
     except Exception as e:
         check("hub sesiones :8872", False, str(e)[:100])
     backend = ""
-    try:
-        st, r = post_json("http://127.0.0.1:8872/search",
-                          {"query": "trainer emeans splatdb", "embedding": qv,
-                           "top_k": 3}, timeout=10)
-        backend = str(r.get("backend") or "")
-        best = min((x["score"] for x in r.get("results", [])), default=None)
+    if qv is None:
+        # embed caído: sin query vector los checks /search enrojecen con la
+        # causa equivocada (400 sin embedding ≠ embed down) — WARN con causa
+        # real (17-nov: el except-pass original ocultaba la falla padre)
         check("hub /search backend=gpu (bandas calibradas sobre d² gpu)",
-              backend == "gpu", f"backend={backend!r}, best={best}")
+              False, "salteado: embed :8860 caído (check 1)", warn=True)
         check("escala de score razonable (on-corpus ≤ 0.8)",
-              best is not None and best <= 0.8, f"best={best}")
-    except Exception as e:
-        check("hub /search", False, str(e)[:100])
+              False, "salteado: embed :8860 caído (check 1)", warn=True)
+    else:
+        try:
+            st, r = post_json("http://127.0.0.1:8872/search",
+                              {"query": "trainer emeans splatdb", "embedding": qv,
+                               "top_k": 3}, timeout=10)
+            if not isinstance(r, dict):
+                raise ValueError(f"respuesta no-JSON del hub (status {st})")
+            backend = str(r.get("backend") or "")
+            best = min((x["score"] for x in r.get("results", [])), default=None)
+            check("hub /search backend=gpu (bandas calibradas sobre d² gpu)",
+                  backend == "gpu", f"backend={backend!r}, best={best}")
+            check("escala de score razonable (on-corpus ≤ 0.8)",
+                  best is not None and best <= 0.8, f"best={best}")
+        except Exception as e:
+            check("hub /search", False, str(e)[:100])
     try:
         st, _ = post_json("http://127.0.0.1:8872/search",
                           {"query": "probe sin embedding", "top_k": 3}, timeout=10)
@@ -175,7 +186,9 @@ def main():
                             "--tail", "3"], capture_output=True, text=True,
                            timeout=60)
         ok = r.returncode == 0 and "OBJECTIVE" in r.stdout
-        ms = re.search(r"server=([\d.]+)ms", r.stdout)
+        # sac_recap imprime la línea de stats a stderr (17-nov: grepear stdout
+        # nunca encontraba la latencia y el detalle mostraba el fallback)
+        ms = re.search(r"server=([\d.]+)ms", r.stderr)
         check("sac_recap corre (POST /recap)", ok,
               f"server={ms.group(1)}ms" if ms else r.stdout[:60])
     except Exception as e:

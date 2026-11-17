@@ -93,11 +93,16 @@ def check_consistency(failures):
         # drift part vs sidecar: si el part creció sin merge, el índice queda viejo
         try:
             part_db = os.path.join(hub, "parts")
-            parts = [f for f in os.listdir(part_db) if f.endswith(".db")]
-            con = sqlite3.connect(f"file:{os.path.join(part_db, parts[0])}?mode=ro",
-                                  uri=True)
-            npart = con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-            con.close()
+            parts = sorted(f for f in os.listdir(part_db) if f.endswith(".db"))
+            # suma de TODOS los parts: el merge los concatena en orden de
+            # rowid, el total es el valor correcto (17-nov: parts[0] de un
+            # listdir sin orden comparaba contra un part cualquiera)
+            npart = 0
+            for pf in parts:
+                con = sqlite3.connect(f"file:{os.path.join(part_db, pf)}?mode=ro",
+                                      uri=True)
+                npart += con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+                con.close()
             ok = npart == ndocs
             check(f"part/sidecar sin drift ({label})", ok,
                   f"part={npart}, sidecar={ndocs}" + ("" if ok else " — falta merge"))

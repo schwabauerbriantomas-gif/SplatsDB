@@ -95,18 +95,32 @@ def load_log():
     if not LOG.exists():
         return []
     out = []
+    corrupt = 0
+    total = 0
     for line in LOG.read_text().splitlines():
+        if not line.strip():
+            continue
+        total += 1
         try:
             e = json.loads(line)
         except Exception:
+            corrupt += 1
             continue
         # schema-safe: JSON válido pero malformado se degrada, no crashea
         if not isinstance(e, dict):
+            corrupt += 1
             continue
         ts = e.get("ts")
         if not isinstance(ts, (int, float)):
+            corrupt += 1
             continue
         out.append(e)
+    if corrupt:
+        # señal explícita: telemetría fail-open sin contador es cómplice
+        # silenciosa — el caso banda-medium del 14-nov no dejaba rastro
+        # (17-nov EGM audit)
+        print(f"WARNING: {corrupt} línea(s) corrupta(s) ignoradas de {total}",
+              file=sys.stderr)
     return out
 
 
@@ -233,7 +247,12 @@ def main():
     sid = None
     last = "--last" in args
     if "--session-id" in args:
-        sid = args[args.index("--session-id") + 1]
+        i = args.index("--session-id")
+        # valor faltante → error de uso, no IndexError traceback (17-nov)
+        if i + 1 >= len(args):
+            print("uso: sac_recall_digest.py [--last | --session-id SID] [--with-recap]")
+            sys.exit(2)
+        sid = args[i + 1]
     entries = load_log()
     if not entries:
         print("sin recalls loggeados aún en", LOG)
@@ -245,8 +264,11 @@ def main():
             sys.exit(1)
     elif last:
         last_ts = max(e["ts"] for e in entries)
-        sid = next(e["session_id"] for e in entries if e["ts"] == last_ts)
-        entries = [e for e in entries if e["session_id"] == sid]
+        # .get + filtro: una entrada sin session_id (log truncado/manoseado)
+        # no debe crashear con KeyError (17-nov)
+        sid = next((e.get("session_id") or "?" for e in entries
+                    if e.get("ts") == last_ts), "?")
+        entries = [e for e in entries if e.get("session_id") == sid]
 
     db = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True)
     titles = dict(db.execute("SELECT id, title FROM sessions").fetchall())

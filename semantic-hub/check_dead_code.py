@@ -9,6 +9,7 @@ Falsos positivos aceptados y permitidos vía DEAD_CODE_ALLOW: entry
 points llamados desde CLI, schedulers o código externo.
 """
 import ast
+import re
 import sys
 from pathlib import Path
 
@@ -34,7 +35,11 @@ for p, tree in ((p, ast.parse(src)) for p, src in sources.items()):
             if name.startswith("_") or name in DEAD_CODE_ALLOW:
                 continue
             # referencias por nombre en TODOS los tools; <=1 = solo la def
-            if all_src.count(name) <= 1:
+            # bordes de palabra: 'recall' no debe 'vivir' dentro de cada
+            # mención de recall_any/recall_fts (17-nov: el conteo por
+            # subcadena daba falsos negativos estructurales, justo el caso
+            # común de este repo: recall*, merge*, check*)
+            if len(re.findall(rf"\b{re.escape(name)}\b", all_src)) <= 1:
                 fail.append(f"{p.name}:{node.lineno} función sin llamador: {name}()")
 
 if fail:

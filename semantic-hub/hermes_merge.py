@@ -36,10 +36,9 @@ def run_merge(hub=HERMES_HUB, parts=("hermes",)):
     # conservaba las filas viejas → hook sin join vectorial hasta 24h.
     tmp_path = master_path + ".tmp"
     if os.path.exists(tmp_path):
-        # nosemgrep: non-atomic-file-replace — borra un .tmp VIEJO de una
-        # corrida previa, no un archivo vivo del hub (esos van por
-        # os.replace abajo).
-        os.remove(tmp_path)
+        # borra un .tmp VIEJO de una corrida previa, no un archivo vivo del
+        # hub (esos van por os.replace abajo).
+        os.remove(tmp_path)  # nosemgrep: non-atomic-file-replace
     con = sqlite3.connect(tmp_path)
     con.execute("CREATE TABLE chunks (rowid INTEGER PRIMARY KEY, repo TEXT, "
                 "path TEXT, kind TEXT, meta TEXT, text TEXT, vec BLOB)")
@@ -47,6 +46,11 @@ def run_merge(hub=HERMES_HUB, parts=("hermes",)):
     rowid = 0
     for part in parts:
         p = os.path.join(parts_dir, f"{part}.db")
+        if not os.path.exists(p):
+            # sqlite3.connect CREARÍA el archivo: un part inexistente dejaría
+            # un .db vacío sin tabla chunks que envenena el drift-check del
+            # smoke y cualquier merge futuro (17-nov EGM audit).
+            raise SystemExit(f"ERROR: part inexistente: {p} — merge abortado")
         src = sqlite3.connect(p)
         rows = src.execute("SELECT rowid, repo, path, kind, meta, text, vec "
                            "FROM chunks ORDER BY rowid").fetchall()
@@ -62,7 +66,11 @@ def run_merge(hub=HERMES_HUB, parts=("hermes",)):
     con.commit()
     con.close()
 
-    # reemplazo atómico del sidecar + bin: o el par viejo completo o el nuevo
+    # reemplazo del par sidecar+bin: DOS os.replace independientes — NO es
+    # atómico como par, pero el ORDEN es el inocuo: sidecar primero (17-nov:
+    # sidecar nuevo + bin viejo = chunks nuevos invisibles hasta el próximo
+    # merge, los rowids viejos joinean igual; el orden inverso —bin primero—
+    # dejaría índices alcanzables SIN texto = joins a _drops de verdad).
     os.replace(tmp_path, master_path)
     bin_path = os.path.join(bin_dir, "default.bin")
     blob = pack_shard_bin(all_blobs)

@@ -4,7 +4,7 @@
 Sin efectos secundarios y solo stdlib: todo lo testeable vive acá para que
 el CI pueda validarlo sin GPU, sin servicios y sin datos reales.
 
-Formato del shard bin (idéntico a merge.py / src/storage/persistence.rs):
+Formato del shard bin (idéntico a hermes_merge.py / src/storage/persistence.rs):
   u64 le nrows | u64 le ncols | nrows*ncols f32 le row-major
 """
 import hashlib
