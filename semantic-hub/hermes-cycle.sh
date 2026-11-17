@@ -61,7 +61,24 @@ for H in "$HUB" "/mnt/d/splatdb/hermes-hub-code"; do
         kill "$(cat "$H/hub.pid")" 2>/dev/null
     fi
 done
-sleep 2
+# Espera activa de muerte REAL (17-nov: el sleep 2 fijo alcanzaba de suerte;
+# un hub lento en morir seguía respondiendo health OK y el ensure no relanzaba
+# con los bins nuevos — índice congelado sin ningún FAIL visible).
+STILL_UP=""
+for i in $(seq 1 15); do
+    STILL_UP=""
+    curl -s --max-time 2 http://127.0.0.1:8872/health | grep -q status && STILL_UP="$STILL_UP 8872"
+    curl -s --max-time 2 http://127.0.0.1:8873/health | grep -q status && STILL_UP="$STILL_UP 8873"
+    [ -z "$STILL_UP" ] && break
+    sleep 1
+done
+if [ -n "$STILL_UP" ]; then
+    say "WARN: hubs$STILL_UP siguen vivos tras 15s — SIGKILL"
+    for H in "$HUB" "/mnt/d/splatdb/hermes-hub-code"; do
+        [ -f "$H/hub.pid" ] && kill -9 "$(cat "$H/hub.pid")" 2>/dev/null
+    done
+    sleep 2
+fi
 bash "$SH/hermes-hub-ensure.sh" >> "$LOG" 2>&1
 for i in $(seq 1 60); do
     curl -s --max-time 2 http://127.0.0.1:8872/health | grep -q status \

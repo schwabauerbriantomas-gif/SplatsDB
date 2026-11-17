@@ -10,6 +10,11 @@ mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/hermes-hub.log"
 BIN="/mnt/d/splatdb/target/release/splatsdb"
 
+# Exclusión mutua (17-nov: el ensure */10 podía solaparse con el ensure del
+# ciclo 9:15; dos lanzadores en carrera envenenaban hub.pid con el pid perdedor).
+exec 9>"$LOG_DIR/.hub-ensure.lock"
+flock -n 9 || exit 0
+
 ensure_hub() { # puerto, data-dir, etiqueta
     local PORT="$1" HUB="$2" LABEL="$3"
     if curl -s --max-time 3 "http://127.0.0.1:$PORT/health" | grep -q '"status"'; then
@@ -26,6 +31,14 @@ ensure_hub() { # puerto, data-dir, etiqueta
     # v2.8.0: trainer e-means para el fit jerárquico HRM2 (medido: −13.3%
     # startup serve, −0.56% loss, /search idéntico — aprobado Brian 13-nov).
     nohup "$BIN" --dim 768 serve --port "$PORT" --host 127.0.0.1 --data-dir "$HUB" --gpu --trainer emeans >> "$LOG" 2>&1 &
+    # Solo confiar en el pid si el proceso sigue vivo tras 1s: un proceso que
+    # pierde la carrera del puerto muere y hub.pid quedaría envenenado
+    # (17-nov: el cycle mataría un pid inexistente para siempre).
+    sleep 1
+    if ! kill -0 $! 2>/dev/null; then
+        echo "$(date -u +%FT%TZ) ERROR: hub $LABEL murió al arrancar (puerto $PORT ocupado o crash) — revisar log" >> "$LOG"
+        return 1
+    fi
     echo $! > "$HUB/hub.pid"
     echo "$(date -u +%FT%TZ) hub $LABEL lanzado pid $(cat "$HUB/hub.pid") (puerto $PORT)" >> "$LOG"
 }
