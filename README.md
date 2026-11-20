@@ -9,7 +9,7 @@ Vector search with uncertainty awareness. Knowledge graph + HNSW + GPU in a sing
 </p>
 
 [![CI](https://github.com/schwabauerbriantomas-gif/splatdb/actions/workflows/ci.yml/badge.svg)](https://github.com/schwabauerbriantomas-gif/splatdb/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-2.8.1-blue.svg)](https://github.com/schwabauerbriantomas-gif/splatdb/releases/tag/v2.8.1)
+[![Version](https://img.shields.io/badge/version-2.9.0-blue.svg)](https://github.com/schwabauerbriantomas-gif/splatdb/releases/tag/v2.9.0)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
 [![Tests](https://img.shields.io/badge/tests-285%20passing-brightgreen.svg)]()
@@ -875,7 +875,7 @@ curl http://localhost:8199/health
 ```
 
 ```json
-{"status": "ok", "version": "2.8.1"}
+{"status": "ok", "version": "2.9.0"}
 ```
 
 #### `POST /status` — Store Statistics
@@ -1307,7 +1307,7 @@ Compressed (~40 tokens, 30x):
 | `hnsw_index` | `src/hnsw_index.rs` | HNSW approximate nearest neighbor with incremental insertion |
 | `lsh_index` | `src/lsh_index.rs` | Locality-sensitive hashing |
 | `storage` | `src/storage/` | SQLite persistence (WAL), JSON store |
-| `api_server` | `src/api_server.rs` | HTTP REST API (6 endpoints: health, status, store, search, field-search, recap) |
+| `api_server` | `src/api_server.rs` | HTTP REST API (7 endpoints: health, status, store, search, field-search, recap, recall) |
 | `mcp_server` | `src/mcp_server.rs` | MCP JSON-RPC 2.0 server (18 tools, production-hardened) |
 | `config` | `src/config/` | 5 presets, device auto-detection |
 | `cli` | `src/cli/` | Command-line interface (clap) |

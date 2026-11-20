@@ -30,7 +30,10 @@ ensure_hub() { # puerto, data-dir, etiqueta
     fi
     # v2.8.0: trainer e-means para el fit jerárquico HRM2 (medido: −13.3%
     # startup serve, −0.56% loss, /search idéntico — aprobado Brian 13-nov).
-    nohup "$BIN" --dim 768 serve --port "$PORT" --host 127.0.0.1 --data-dir "$HUB" --gpu --trainer emeans >> "$LOG" 2>&1 &
+    # v2.9.0: /recall nativo — el motor loggea sus fires al log canónico del
+    # digest (schema idéntico al del hook legacy; en modo nativo el hook no
+    # duplica la línea).
+    SPLATSDB_RECALL_LOG="$LOG_DIR/hermes-recalls.jsonl" nohup "$BIN" --dim 768 serve --port "$PORT" --host 127.0.0.1 --data-dir "$HUB" --gpu --trainer emeans >> "$LOG" 2>&1 &
     # Solo confiar en el pid si el proceso sigue vivo tras 1s: un proceso que
     # pierde la carrera del puerto muere y hub.pid quedaría envenenado
     # (17-nov: el cycle mataría un pid inexistente para siempre).
