@@ -92,7 +92,7 @@ SplatsDB applies **Gaussian Splatting** — a technique from 3D neural rendering
 - **Uncertainty-aware retrieval** — sparse regions have high energy, guiding active learning
 - **Knowledge graph overlay** — typed entities and relations augment vector retrieval
 
-Combined with a two-level KMeans++ retrieval pipeline (HRM2), HNSW incremental indexing, and 15 CUDA GPU kernels (7 distance + 8 extended), SplatsDB provides a full-featured vector search engine in ~26.9K lines of pure Rust + CUDA (26,937 by `wc -l` — Rust `src/` 25,913 + CUDA `kernels/` 1,024, raw lines; the single LOC criterion also used by the badge and the [Module Map](#module-map)).
+Combined with a two-level KMeans++ retrieval pipeline (HRM2), HNSW incremental indexing, and 15 CUDA GPU kernels (7 distance + 8 extended), SplatsDB provides a full-featured vector search engine in ~27.6K lines of pure Rust + CUDA (27,622 by `wc -l` — Rust `src/` 26,598 + CUDA `kernels/` 1,024, raw lines; the single LOC criterion also used by the badge and the [Module Map](#module-map)).
 
 **Key use cases:**
 - AI agent long-term memory (MCP server for Claude, GPT, open-source LLMs)
@@ -216,7 +216,7 @@ cargo build --release
 cargo build --release --no-default-features
 
 # Run tests
-cargo test   # full suite: 285 tests across 9 binaries (measured 2026-11-17): lib 202, main 2, chaos 8, integration 3, integration_gaussian 5, pentest 29, qa_validation 31, api_field_load 2, mcp_server_warmstart 3
+cargo test   # full suite: 294 tests across 9 binaries (measured 2026-11-20): lib 210, main 2, chaos 8, integration 3, integration_gaussian 5, pentest 29, qa_validation 32, api_field_load 2, mcp_server_warmstart 3
 ```
 
 ### Run
@@ -1294,7 +1294,7 @@ Compressed (~40 tokens, 30x):
 
 ## Module Map
 
-26,937 lines of Rust + CUDA by `wc -l` (raw lines: 25,913 in `src/` + 1,024 in `kernels/`) — the single LOC criterion used by the badge and the intro. Rust modules:
+27,622 lines of Rust + CUDA by `wc -l` (raw lines: 26,598 in `src/` + 1,024 in `kernels/`) — the single LOC criterion used by the badge and the intro. Rust modules:
 
 | Module | Source | Description |
 |--------|--------|-------------|
