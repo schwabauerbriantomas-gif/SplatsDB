@@ -95,6 +95,9 @@ pub struct AppState {
     /// Tamaño del corpus que atiende /search: field.raw si hay field/ (los
     /// ids de resultados son chunks), o el shard cargado (los ids son splats).
     pub corpus_n: usize,
+    /// Directorio de datos del server (flag --data-dir). /recall lo usa para
+    /// abrir {data_dir}/sidecar.db en mode=ro y loggear fires. None en tests.
+    pub data_dir: Option<String>,
 }
 
 /// A single search request queued for batch execution. The reply is delivered
@@ -878,6 +881,532 @@ async fn recap_handler(
     Ok(Json(build_recap(&req)))
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// /recall — native Hermes-memory recall endpoint (20-nov-2026)
+//
+// POST /recall {text, session_id?, top_k?} → the engine performs the FULL
+// recall pipeline that used to live in the Hermes Python hook:
+//   1. Embed the query via the OpenAI-style embed service
+//      (SPLATSDB_RECALL_EMBED_URL, default http://127.0.0.1:8860/v1/embeddings,
+//      SPLATSDB_RECALL_EMBED_PROMPT, default "Retrieval-query" — the
+//      asymmetric prompt is load-bearing for distance calibration; do NOT
+//      "fix" it away).
+//   2. Run the internal /search path by calling `search_memories` directly —
+//      zero contract drift: validation, GPU fast path and batching shared.
+//   3. Join {data_dir}/sidecar.db (mode=ro, rowid=index+1) for kind/sid/text;
+//      hits with no sidecar row are dropped (never invent text).
+//   4. Apply the hook's calibrated tiers: sessions (kind != repo) d ≤ 0.55 →
+//      up to 3 hits, code (repo) d ≤ 0.70 → 1 hit, JSON-leading pre-filter
+//      applied BEFORE the tier split (17-nov contract). Env-overridable:
+//      SPLATSDB_RECALL_SESS_STRONG/_N, SPLATSDB_RECALL_CODE_STRONG/_N.
+//   5. Fail-closed on the hook's guard: backend != "gpu" (CPU fallback)
+//      injects nothing; missing embed service → 503, never SimCos
+//      (fa1e528 parity — a hash-text embedding ranks noise as success).
+//   6. Append the fire to SPLATSDB_RECALL_LOG (default
+//      {data_dir}/recalls.jsonl) with the hook's JSONL schema
+//      {ts, session_id, qhash, qlen, n_injected, arm, backend, drops, hits}
+//      so sac_recall_digest.py keeps working unchanged. qhash is
+//      sha1(text)[:12] — bit-exact with the hook's formula.
+//
+// NOT covered here (stays in the Hermes shim): the FTS5 fallback over
+// Hermes state.db — that database belongs to the agent, not the engine.
+//
+// Tests here cover the pure logic (JSON filter, tier selection) and the
+// fail-closed paths with a dead embed URL. The happy path is validated
+// E2E against the live hubs by hermes_smoke.py + the A/B replay.
+// ═══════════════════════════════════════════════════════════════════════
+
+const RECALL_TOPK_DEFAULT: usize = 8;
+const RECALL_MAX_TOPK: usize = 32;
+const RECALL_SESS_STRONG_DEFAULT: f32 = 0.55;
+const RECALL_SESS_N_DEFAULT: usize = 3;
+const RECALL_CODE_STRONG_DEFAULT: f32 = 0.70;
+const RECALL_CODE_N_DEFAULT: usize = 1;
+const RECALL_EMBED_URL_DEFAULT: &str = "http://127.0.0.1:8860/v1/embeddings";
+const RECALL_EMBED_PROMPT_DEFAULT: &str = "Retrieval-query";
+const RECALL_EMBED_MODEL: &str = "embeddinggemma-2";
+
+/// One sidecar-joined hit (or a client-supplied FTS hit riding in the same
+/// bucket). repo/path are the chunks-table columns — only code (kind=repo)
+/// hits carry them; clients format "[código repo/path]" headers from them.
+struct JoinedHit {
+    kind: String,
+    repo: String,
+    path: String,
+    sid: String,
+    text: String,
+    dist: f32,
+    meta: serde_json::Value,
+}
+
+fn recall_env_str(name: &str, default: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
+fn recall_env_f32(name: &str, default: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn recall_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+#[derive(Deserialize)]
+pub struct RecallFtsHit {
+    /// Pseudo-distance (hook FTS literal = 0.40, head of the bucket).
+    pub dist: f32,
+    pub sid: String,
+    pub text: String,
+    /// Client-built meta ({session_id, role, date}) — passed through.
+    #[serde(default)]
+    pub meta: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+pub struct RecallRequest {
+    pub text: String,
+    pub session_id: Option<String>,
+    pub top_k: Option<usize>,
+    /// FTS5 literal hits the client fetched from Hermes state.db. They are
+    /// merged into the session bucket BEFORE the gate so there is exactly
+    /// ONE gate implementation (this endpoint): the hook gated over the
+    /// FTS+vector union, and the shim must not re-implement the gate in
+    /// Python (that duplication is what this endpoint removes). Empty on
+    /// engines without state.db access — the gate then runs vector-only.
+    #[serde(default)]
+    pub fts: Vec<RecallFtsHit>,
+}
+
+#[derive(Serialize)]
+pub struct RecallHit {
+    pub sid: String,
+    pub kind: String,
+    pub dist: f32,
+    pub text: String,
+    /// Chunks-table columns (code hits only): "[código repo/path]" headers.
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default)]
+    pub path: String,
+    /// Parsed sidecar meta (session_id/date/title/role) — clients build
+    /// their "[sesión ...]" headers from it.
+    pub meta: serde_json::Value,
+}
+
+#[derive(Serialize)]
+pub struct RecallResponse {
+    pub backend: Option<String>,
+    /// 0 = injected, -1 = cut (no tier hit / fail-closed) — hook semantics.
+    pub arm: i8,
+    pub results: Vec<RecallHit>,
+    /// Hits dropped by the JSON-leading pre-filter (sess, code) — raw counts
+    /// BEFORE the tier split, like the hook's `drops`.
+    pub drops: (usize, usize),
+    pub sidecar: bool,
+    /// Reason when the hook's fail-closed guard tripped (backend != gpu).
+    pub fail_closed: Option<String>,
+}
+
+/// JSON-leading text is unreadable thin content (blob dumps): the hook
+/// drops it BEFORE applying tiers (17-nov contract) — lstrip first, then
+/// first-char test, exactly like the Python `lstrip` + `in {'{','[','"'}`.
+fn is_json_leading(text: &str) -> bool {
+    let t = text.trim_start();
+    t.starts_with('{') || t.starts_with('[') || t.starts_with('"')
+}
+
+/// sha1(text) hex, first 12 chars — bit-exact with the hook's qhash
+/// (`hashlib.sha1(msg.encode()).hexdigest()[:12]`).
+fn recall_qhash(text: &str) -> String {
+    use sha1::{Digest, Sha1};
+    let digest = Sha1::digest(text.as_bytes());
+    let mut out = String::with_capacity(40);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out.chars().take(12).collect()
+}
+
+/// OpenAI-style embed request to the Hermes embed service (:8860) with the
+/// asymmetric Retrieval-query prompt. The vector is NOT re-normalized: the
+/// hub's d² bands were calibrated against this service's raw output.
+fn fetch_recall_embedding(text: &str, dim: usize) -> Result<Vec<f32>, String> {
+    let url = recall_env_str("SPLATSDB_RECALL_EMBED_URL", RECALL_EMBED_URL_DEFAULT);
+    let body = serde_json::json!({
+        "input": [text],
+        "model": RECALL_EMBED_MODEL,
+        "prompt_name": recall_env_str("SPLATSDB_RECALL_EMBED_PROMPT", RECALL_EMBED_PROMPT_DEFAULT),
+        "dimensions": dim,
+    })
+    .to_string();
+    let response = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(5)))
+        .build()
+        .new_agent()
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .send(&body)
+        .map_err(|e| format!("embed service: {e}"))?;
+    let resp: serde_json::Value = response
+        .into_body()
+        .read_json()
+        .map_err(|e| format!("embed json: {e}"))?;
+    let arr = resp
+        .get("data")
+        .and_then(|d| d.as_array())
+        .and_then(|a| a.first())
+        .and_then(|o| o.get("embedding"))
+        .and_then(|e| e.as_array())
+        .ok_or_else(|| "embed response missing data[0].embedding".to_string())?;
+    let vec: Vec<f32> = arr
+        .iter()
+        .filter_map(|v: &serde_json::Value| v.as_f64().map(|f| f as f32))
+        .collect();
+    if vec.len() != dim {
+        return Err(format!(
+            "embed dim mismatch: expected {dim}, got {}",
+            vec.len()
+        ));
+    }
+    if vec.iter().any(|v| !v.is_finite()) {
+        return Err("embed contains non-finite values".into());
+    }
+    Ok(vec)
+}
+
+/// Join search indices against the engine's sidecar (chunks.rowid =
+/// index+1, read-only). Returns None when sidecar.db is absent/unreadable
+/// (deploy without sidecar: search still works, recall carries no text).
+/// Hits with no sidecar row are dropped — never invent text.
+fn sidecar_join(data_dir: &str, results: &[SearchResult]) -> Option<Vec<JoinedHit>> {
+    let path = std::path::Path::new(data_dir).join("sidecar.db");
+    let conn = rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let mut out = Vec::with_capacity(results.len());
+    for r in results {
+        let row = conn
+            .query_row(
+                "SELECT kind, repo, path, meta, text FROM chunks WHERE rowid = ?1",
+                rusqlite::params![r.index as i64 + 1],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .ok();
+        let Some((kind, repo, path, meta, text)) = row else {
+            continue;
+        };
+        let meta_val = serde_json::from_str::<serde_json::Value>(&meta)
+            .ok()
+            .unwrap_or(serde_json::Value::Null);
+        let sid = meta_val
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(JoinedHit {
+            kind,
+            repo,
+            path,
+            sid,
+            text,
+            dist: r.score,
+            meta: meta_val,
+        });
+    }
+    Some(out)
+}
+
+/// Tier selection, hook-equivalent: buckets by kind (repo → code; anything
+/// else → session), JSON-leading dropped BEFORE the split, FTS pseudo-hits
+/// already merged into the session bucket by the caller, best-first by
+/// distance, sessions first in the output.
+///
+/// GATE SEMANTICS (14-nov calibration, hook byte-code): the threshold
+/// applies to the BUCKET'S BEST hit only; ranks 2..n are taken
+/// UNCONDITIONALLY once the gate passes. Per-hit thresholds would inject
+/// strictly fewer hits than the deployed hook (measured A/B 20-nov:
+/// 4/78 queries diverged, e.g. pool 0.547/0.551/0.565 → hook injects 3,
+/// per-hit gating injects 1). Returns (hits, sess_json_drops,
+/// code_json_drops).
+fn select_recall_tiers(
+    hits: Vec<JoinedHit>,
+    sess_strong: f32,
+    sess_n: usize,
+    code_strong: f32,
+    code_n: usize,
+) -> (Vec<RecallHit>, usize, usize) {
+    let mut sess: Vec<&JoinedHit> = hits
+        .iter()
+        .filter(|h| !h.kind.starts_with("repo"))
+        .collect();
+    let mut code: Vec<&JoinedHit> = hits.iter().filter(|h| h.kind.starts_with("repo")).collect();
+    sess.sort_by(|a, b| {
+        a.dist
+            .partial_cmp(&b.dist)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    code.sort_by(|a, b| {
+        a.dist
+            .partial_cmp(&b.dist)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let sess_json = sess.iter().filter(|h| is_json_leading(&h.text)).count();
+    let code_json = code.iter().filter(|h| is_json_leading(&h.text)).count();
+    // anti-JSON pre-gate BEFORE the gate itself (hook order: filter, then
+    // gate on the best surviving hit)
+    let sess_ok: Vec<&JoinedHit> = sess
+        .into_iter()
+        .filter(|h| !is_json_leading(&h.text))
+        .collect();
+    let code_ok: Vec<&JoinedHit> = code
+        .into_iter()
+        .filter(|h| !is_json_leading(&h.text))
+        .collect();
+    let mut results: Vec<RecallHit> = Vec::new();
+    if sess_ok
+        .first()
+        .is_some_and(|first| first.dist <= sess_strong)
+    {
+        results.extend(sess_ok.iter().take(sess_n).map(|h| RecallHit {
+            sid: h.sid.clone(),
+            kind: h.kind.clone(),
+            dist: h.dist,
+            text: h.text.clone(),
+            repo: h.repo.clone(),
+            path: h.path.clone(),
+            meta: h.meta.clone(),
+        }));
+    }
+    if code_ok
+        .first()
+        .is_some_and(|first| first.dist <= code_strong)
+    {
+        results.extend(code_ok.iter().take(code_n).map(|h| RecallHit {
+            sid: h.sid.clone(),
+            kind: h.kind.clone(),
+            dist: h.dist,
+            text: h.text.clone(),
+            repo: h.repo.clone(),
+            path: h.path.clone(),
+            meta: h.meta.clone(),
+        }));
+    }
+    (results, sess_json, code_json)
+}
+
+fn recall_append_log(state: &AppState, fire: &serde_json::Value) {
+    let Some(dir) = &state.data_dir else { return };
+    let path = match std::env::var("SPLATSDB_RECALL_LOG") {
+        Ok(s) if s.is_empty() => return, // explícitamente deshabilitado
+        Ok(s) => s,
+        Err(_) => std::path::Path::new(dir)
+            .join("recalls.jsonl")
+            .display()
+            .to_string(),
+    };
+    let line = format!("{fire}\n");
+    let write = || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        f.write_all(line.as_bytes())
+    };
+    if let Err(e) = write() {
+        // Logging is fail-open: a broken log file must not kill the recall.
+        eprintln!("[splatsdb] /recall: log append failed: {e}");
+    }
+}
+
+async fn recall_handler(
+    State(state): State<AppState>,
+    Json(req): Json<RecallRequest>,
+) -> Result<Json<RecallResponse>, (StatusCode, String)> {
+    // ── input validation (before anything else; cheap paths for tests)
+    if req.text.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "recall: empty text".into()));
+    }
+    if req.text.len() > MAX_TEXT_LEN {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("Text exceeds max length ({MAX_TEXT_LEN})"),
+        ));
+    }
+    let top_k = req
+        .top_k
+        .unwrap_or_else(|| recall_env_usize("SPLATSDB_RECALL_TOPK", RECALL_TOPK_DEFAULT))
+        .clamp(1, RECALL_MAX_TOPK);
+
+    let (dim, n_active) = {
+        let store = state.store.lock().await;
+        (store.get_statistics().embedding_dim, store.n_active())
+    };
+
+    // Empty store: nothing to recall — arm=-1 (hook logs empty fires too),
+    // no embed call, no fail-closed reason.
+    if n_active == 0 {
+        let resp = RecallResponse {
+            backend: None,
+            arm: -1,
+            results: vec![],
+            drops: (0, 0),
+            sidecar: false,
+            fail_closed: None,
+        };
+        recall_append_log(
+            &state,
+            &serde_json::json!({
+                "ts": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0),
+                "session_id": req.session_id,
+                "qhash": recall_qhash(&req.text),
+                "qlen": req.text.len(),
+                "n_injected": 0,
+                "arm": -1,
+                "backend": serde_json::Value::Null,
+                "drops": {"sess_json": 0, "code_json": 0},
+                "hits": [],
+            }),
+        );
+        return Ok(Json(resp));
+    }
+
+    // ── 1. Embed (fail-closed: never SimCos). ureq is blocking →
+    // spawn_blocking keeps the async runtime free.
+    let text = req.text.clone();
+    let embedding = tokio::task::spawn_blocking(move || fetch_recall_embedding(&text, dim))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("recall: {e}")))?
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, format!("recall: {e}")))?;
+
+    // ── 2. The internal /search path, called directly — one implementation,
+    // zero contract drift (validation, GPU fast path, batching, enrich).
+    let search = search_memories(
+        State(state.clone()),
+        Query(SearchQuery { rescore: None }),
+        Json(SearchRequest {
+            query: req.text.clone(),
+            embedding: Some(embedding),
+            top_k: Some(top_k),
+        }),
+    )
+    .await?
+    .0;
+
+    // ── 3-4. Sidecar join + tiers + fail-closed guard (backend != gpu)
+    let backend = search.backend.clone();
+    let mut best_sess: Option<f32> = None;
+    let mut resp = RecallResponse {
+        backend: backend.clone(),
+        arm: -1,
+        results: vec![],
+        drops: (0, 0),
+        sidecar: false,
+        fail_closed: None,
+    };
+
+    if backend.as_deref() != Some("gpu") {
+        // Hook parity: CPU fallback changes the score scale — the 0.55/0.70
+        // bands are calibrated on GPU d². Inject nothing, say why.
+        resp.fail_closed = Some(format!(
+            "backend != gpu ({:?}) — distance bands are GPU-calibrated; injecting nothing",
+            backend
+        ));
+    } else if let Some(dir) = &state.data_dir {
+        if let Some(joined) = sidecar_join(dir, &search.results) {
+            resp.sidecar = true;
+            // client FTS hits merge into the session bucket PRE-GATE (one
+            // gate implementation lives here, not in the shim). Drop
+            // malformed entries; cap the array (hook fetches ≤ 2).
+            let mut joined: Vec<JoinedHit> = joined;
+            joined.extend(
+                req.fts
+                    .iter()
+                    .take(10)
+                    .filter(|f| f.dist.is_finite() && !f.text.trim().is_empty())
+                    .map(|f| JoinedHit {
+                        kind: "fts".to_string(),
+                        repo: String::new(),
+                        path: String::new(),
+                        sid: f.sid.clone(),
+                        text: f.text.clone(),
+                        dist: f.dist,
+                        meta: f.meta.clone(),
+                    }),
+            );
+            let best_sess_dist = joined
+                .iter()
+                .filter(|h| !h.kind.starts_with("repo"))
+                .map(|h| h.dist)
+                .fold(f32::INFINITY, f32::min);
+            best_sess = if best_sess_dist.is_finite() {
+                Some(best_sess_dist)
+            } else {
+                None
+            };
+            let sess_strong =
+                recall_env_f32("SPLATSDB_RECALL_SESS_STRONG", RECALL_SESS_STRONG_DEFAULT);
+            let sess_n = recall_env_usize("SPLATSDB_RECALL_SESS_N", RECALL_SESS_N_DEFAULT);
+            let code_strong =
+                recall_env_f32("SPLATSDB_RECALL_CODE_STRONG", RECALL_CODE_STRONG_DEFAULT);
+            let code_n = recall_env_usize("SPLATSDB_RECALL_CODE_N", RECALL_CODE_N_DEFAULT);
+            let (results, sess_json, code_json) =
+                select_recall_tiers(joined, sess_strong, sess_n, code_strong, code_n);
+            resp.results = results;
+            resp.drops = (sess_json, code_json);
+        }
+    }
+    if !resp.results.is_empty() {
+        resp.arm = 0;
+    }
+
+    // ── 6. Fire log, hook schema (sac_recall_digest.py compatible)
+    recall_append_log(
+        &state,
+        &serde_json::json!({
+            "ts": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0),
+            "session_id": req.session_id,
+            "qhash": recall_qhash(&req.text),
+            "qlen": req.text.len(),
+            "n_injected": resp.results.len(),
+            "arm": resp.arm,
+            "backend": backend,
+            "drops": {"sess_json": resp.drops.0, "code_json": resp.drops.1},
+            "cut_dist": best_sess
+                .filter(|_| resp.arm == -1)
+                .map(|d| serde_json::json!((d * 1000.0).round() / 1000.0))
+                .unwrap_or(serde_json::Value::Null),
+            "hits": resp.results.iter()
+                .map(|h| serde_json::json!({"sid": h.sid, "dist": h.dist, "kind": h.kind}))
+                .collect::<Vec<_>>(),
+        }),
+    );
+
+    Ok(Json(resp))
+}
+
 // ─── Batch worker (R9 §2) ─────────────────────────────────
 
 /// Cached flat copy of the active dataset for the GPU batch path.
@@ -1490,6 +2019,7 @@ pub async fn run_server(
         gpu: gpu_index,
         field: field_data.map(Arc::new),
         corpus_n,
+        data_dir: Some(data_dir.to_string()),
     };
 
     let app = build_router(state);
@@ -1553,6 +2083,7 @@ fn build_router(state: AppState) -> Router {
         .route("/search", post(search_memories))
         .route("/field-search", post(field_search_handler))
         .route("/recap", post(recap_handler))
+        .route("/recall", post(recall_handler))
         // Layer order matters: `.layer()` wraps everything added BEFORE it,
         // so the LAST layer is the OUTERMOST. cors must be outermost so a
         // preflight OPTIONS is answered (with CORS headers) without going
@@ -1606,6 +2137,7 @@ mod tests {
             gpu: None,
             field: None,
             corpus_n: 0,
+            data_dir: None,
         };
         (build_router(state), batches_served)
     }
@@ -2210,6 +2742,7 @@ mod tests {
             gpu: None,
             field: Some(Arc::new(field)),
             corpus_n: 2,
+            data_dir: None,
         };
         let app = build_router(state);
 
@@ -2336,5 +2869,168 @@ mod tests {
         for a in ["0.0.0.0", "192.168.1.10", "::", "10.0.0.1", "", "127"] {
             assert!(!is_loopback_addr(a), "{a:?} must NOT be loopback");
         }
+    }
+
+    // ─── /recall ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn recall_json_leading_detection() {
+        assert!(is_json_leading("{\"a\": 1}"));
+        assert!(is_json_leading("  [1, 2, 3]"));
+        assert!(is_json_leading("\"quoted string\""));
+        assert!(!is_json_leading("El deploy falló otra vez"));
+        assert!(!is_json_leading(""));
+        assert!(!is_json_leading("   "));
+    }
+
+    #[test]
+    fn recall_tier_selection_matches_hook() {
+        let mk = |kind: &str, sid: &str, text: &str, d: f32| JoinedHit {
+            kind: kind.to_string(),
+            repo: String::new(),
+            path: String::new(),
+            sid: sid.to_string(),
+            text: text.to_string(),
+            dist: d,
+            meta: serde_json::json!({"session_id": sid}),
+        };
+        let hits = vec![
+            mk("hermes/session", "s1", "texto sesión 1", 0.31),
+            mk("hermes/session", "s2", "{\"json\": true}", 0.32), // JSON → pre-gate drop
+            mk("hermes/session", "s3", "texto sesión 3", 0.54),
+            mk("hermes/session", "s4", "fuera de tier", 0.61), // > 0.55 → no entra
+            mk("repo", "c1", "[1, 2, 3]", 0.65),               // JSON code → drop
+            mk("repo", "c2", "src/main.rs: ruta valida", 0.68),
+            mk("repo", "c3", "src/other.rs lejos", 0.75), // > 0.70 → no entra
+        ];
+        let (kept, sess_json, code_json) = select_recall_tiers(hits, 0.55, 3, 0.70, 1);
+        // bucket-best gate (hook semantics): sess best 0.31 ≤ 0.55 → take 3
+        // UNCONDITIONALLY (s4 at 0.61 rides along); code best 0.68 ≤ 0.70 → 1
+        assert_eq!(kept.len(), 4);
+        assert_eq!(sess_json, 1);
+        assert_eq!(code_json, 1);
+        // sessions first (best-first by dist), then the single code hit
+        assert_eq!(kept[0].sid, "s1");
+        assert_eq!(kept[1].sid, "s3");
+        assert_eq!(kept[2].sid, "s4");
+        assert_eq!(kept[3].sid, "c2");
+        assert_eq!(kept[3].kind, "repo");
+    }
+
+    #[test]
+    fn recall_gate_is_bucket_best_not_per_hit() {
+        // Regression (A/B replay 20-nov): pool 0.547/0.551/0.565 — the hook
+        // gates on the BEST hit and injects all 3; per-hit thresholds would
+        // inject only the first. Encode the deployed behavior.
+        let mk = |sid: &str, d: f32| JoinedHit {
+            kind: "hermes/session".to_string(),
+            repo: String::new(),
+            path: String::new(),
+            sid: sid.to_string(),
+            text: format!("texto {sid}"),
+            dist: d,
+            meta: serde_json::json!({"session_id": sid}),
+        };
+        let hits = vec![mk("a", 0.547), mk("b", 0.551), mk("c", 0.565)];
+        let (kept, _, _) = select_recall_tiers(hits, 0.55, 3, 0.70, 1);
+        assert_eq!(kept.len(), 3, "ranks 2..n ride along once the gate passes");
+        // and the cut case: best ABOVE the band → nothing rides along
+        let hits = vec![mk("a", 0.56), mk("b", 0.57), mk("c", 0.58)];
+        let (kept, _, _) = select_recall_tiers(hits, 0.55, 3, 0.70, 1);
+        assert!(kept.is_empty(), "gate on best hit cuts the whole bucket");
+    }
+
+    #[test]
+    fn recall_tier_limits_enforced() {
+        let mk = |i: usize| JoinedHit {
+            kind: "hermes/session".to_string(),
+            repo: String::new(),
+            path: String::new(),
+            sid: format!("s{i}"),
+            text: format!("texto {i}"),
+            dist: 0.40 + i as f32 * 0.01,
+            meta: serde_json::json!({"session_id": format!("s{i}")}),
+        };
+        // 6 candidates all ≤ 0.55 → only the 3 closest survive (sess_n=3)
+        let hits: Vec<_> = (0..6).map(mk).collect();
+        let (kept, sess_json, _) = select_recall_tiers(hits, 0.55, 3, 0.70, 1);
+        assert_eq!(kept.len(), 3);
+        assert_eq!(sess_json, 0);
+        assert_eq!(kept[0].sid, "s0");
+        assert_eq!(kept[2].sid, "s2");
+    }
+
+    #[test]
+    fn recall_embed_fail_closed_no_simcos() {
+        // Dead URL (port 1 → immediate connection refused): the embed unit
+        // returns Err and there is NO SimCos fallback in this path
+        // (fa1e528 parity — a hash-text embedding ranks noise as success).
+        std::env::set_var(
+            "SPLATSDB_RECALL_EMBED_URL",
+            "http://127.0.0.1:1/v1/embeddings",
+        );
+        let r = fetch_recall_embedding("texto de prueba", 768);
+        assert!(r.is_err(), "dead embed URL must fail");
+        let err = r.unwrap_err().to_lowercase();
+        assert!(!err.contains("simcos"));
+    }
+
+    #[tokio::test]
+    async fn recall_fail_closed_without_embed_service() {
+        // Store populated so the handler actually reaches the embed step
+        // (empty stores short-circuit before embedding). Store dim is 32
+        // (test_app default — same as the /store unit_vec(32, _) tests).
+        // Dead embed URL → 503 with a reason, never a silent success /
+        // SimCos fallback (fa1e528 parity in /recall).
+        std::env::set_var(
+            "SPLATSDB_RECALL_EMBED_URL",
+            "http://127.0.0.1:1/v1/embeddings",
+        );
+        let (app, _batches) = test_app().await;
+        let (s, body) = send(
+            app.clone(),
+            "POST",
+            "/store",
+            Some(json!({ "text": "anchor", "embedding": unit_vec(32, 0) })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "store anchor failed: {body}");
+        let (status, body) = send(
+            app,
+            "POST",
+            "/recall",
+            Some(json!({ "text": "¿cómo quedó lo del túnel?" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let body_str = body.to_string().to_lowercase();
+        assert!(!body_str.contains("simcos"));
+    }
+
+    #[tokio::test]
+    async fn recall_empty_text_is_400() {
+        let (app, _batches) = test_app().await;
+        let (status, _) = send(
+            app,
+            "POST",
+            "/recall",
+            Some(serde_json::json!({ "text": "   " })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn recall_oversize_text_is_413() {
+        let (app, _batches) = test_app().await;
+        let big = "x".repeat(MAX_TEXT_LEN + 1);
+        let (status, _) = send(
+            app,
+            "POST",
+            "/recall",
+            Some(serde_json::json!({ "text": big })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

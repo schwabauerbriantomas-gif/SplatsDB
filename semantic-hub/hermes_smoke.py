@@ -6,6 +6,9 @@ Valida, contra servicios reales:
   2. sidecar y shard bin consistentes (mismo número de docs)
   3. recall semántico: queries de paráfrasis (sin compartir keywords con
      el target) encuentran la sesión esperada en top-k
+  4. sanidad de la métrica: literal < basura (distancia)
+  5. /recall NATIVO del motor (≥ 2.9.0): pipeline completo dentro de
+     splatDB (embed → search → sidecar → tiers → fail-closed → log)
 
 Las tripletas (query, sesión esperada, k) están tomadas del benchmark
 medido el 2026-11-05 (corpus real, MRR sesión 0.60 vs 0.27 FTS). Si el
@@ -22,6 +25,7 @@ import os
 import sqlite3
 import sys
 import time
+import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -188,6 +192,76 @@ def check_metric_sanity(failures):
     return failures
 
 
+def check_recall_native(failures):
+    """5. endpoint /recall NATIVO (motor ≥ 2.9.0): embed+search+sidecar+
+    tiers+fail-closed+log dentro del motor. Contrato: backend gpu,
+    sidecar true, tiers respetados (≤3 sess ≤0.55 / ≤1 repo ≤0.70),
+    vacío → 400. El fire vectorial lo loggea el motor (no el hook)."""
+    def _recall(port, text, timeout=20):
+        body = json.dumps({"text": text, "session_id": "smoke-native"}).encode()
+        r = urllib.request.urlopen(urllib.request.Request(
+            f"http://127.0.0.1:{port}/recall", body,
+            {"Content-Type": "application/json"}), timeout=timeout)
+        return json.loads(r.read())
+
+    # sesiones: query canónica del túnel → inyección esperada
+    try:
+        t0 = time.monotonic()
+        resp = _recall(8872, CASES[0][1])
+        dt = (time.monotonic() - t0) * 1000
+        results = resp.get("results", [])
+        # gate por BEST del bucket (semántica del hook): primer hit ≤0.55,
+        # ranks 2..n viajan sin umbral propio (≤3 total)
+        ok = (resp.get("backend") == "gpu" and resp.get("sidecar") is True
+              and resp.get("arm") == 0 and 0 < len(results) <= 3
+              and results[0].get("dist", 99) <= 0.55
+              and all(h.get("sid") and h.get("text") for h in results))
+        check("recall nativo sesiones (:8872)", ok,
+              f"arm={resp.get('arm')}, n={len(results)}, backend={resp.get('backend')}, "
+              f"sidecar={resp.get('sidecar')} ({dt:.0f} ms)"
+              + (f" FAIL_CLOSED={str(resp.get('fail_closed'))[:60]}"
+                 if resp.get("fail_closed") else ""))
+        failures += 0 if ok else 1
+    except Exception as e:
+        failures += 1
+        check("recall nativo sesiones (:8872)", False,
+              f"{str(e)[:60]} — ¿motor sin /recall (pre-2.9.0)?")
+
+    # código: hits inyectados deben ser kind repo y ≤ 1
+    try:
+        resp = _recall(8873, "funcion que empaqueta vectores en archivo binario con "
+                             "header de counts y dimensiones")
+        results = resp.get("results", [])
+        ok = (resp.get("backend") == "gpu" and resp.get("sidecar") is True
+              and resp.get("arm") in (0, -1)
+              and all(h.get("kind") == "repo" for h in results)
+              and len(results) <= 1)
+        check("recall nativo código (:8873)", ok,
+              f"arm={resp.get('arm')}, n={len(results)}, "
+              f"kinds={[h.get('kind') for h in results]}")
+        failures += 0 if ok else 1
+    except Exception as e:
+        failures += 1
+        check("recall nativo código (:8873)", False, str(e)[:80])
+
+    # contrato: texto vacío → 400 BAD_REQUEST
+    try:
+        body = json.dumps({"text": "   "}).encode()
+        try:
+            urllib.request.urlopen(urllib.request.Request(
+                "http://127.0.0.1:8872/recall", body,
+                {"Content-Type": "application/json"}), timeout=5)
+            ok, detail = False, "vacío NO rechazado (esperaba 400)"
+        except urllib.error.HTTPError as e:
+            ok, detail = e.code == 400, f"HTTP {e.code}"
+        check("recall nativo: vacío → 400", ok, detail)
+        failures += 0 if ok else 1
+    except Exception as e:
+        failures += 1
+        check("recall nativo: vacío → 400", False, str(e)[:80])
+    return failures
+
+
 def main():
     failures = 0
     print("smoke hermes-hub:")
@@ -195,6 +269,7 @@ def main():
     failures = check_consistency(failures)
     failures = check_recall_cases(failures)
     failures = check_metric_sanity(failures)
+    failures = check_recall_native(failures)
     print(f"\n{'PASS ✓' if failures == 0 else f'FAIL ✗ ({failures} checks)'}")
     return 1 if failures else 0
 

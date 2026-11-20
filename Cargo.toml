@@ -1,6 +1,6 @@
 [package]
 name = "splatsdb"
-version = "2.8.1"
+version = "2.9.0"
 edition = "2021"
 description = "SplatsDB - Gaussian Splat vector search engine"
 license = "GPL-3.0"
@@ -26,6 +26,7 @@ axum = "0.7"
 tower-http = { version = "0.5", features = ["cors"] }
 anyhow = "1"
 ureq = { version = "3", features = ["json"] }
+sha1 = "0.10"
 bytemuck = "1"
 parking_lot = "0.12"
 libc = "0.2"

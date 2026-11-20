@@ -18,6 +18,8 @@ hermes-hub/parts/hermes.db ──► hermes_merge.py ──► hermes-hub/data/v
 embeddinggemma-2 (:8860, GPU 3090, 768d)          splatsdb serve (:8872) ◄──┘
         ▲                                                  │
         └──── hermes_recall.py (embed query → search → join sidecar)
+              ↳ ≥ 2.9.0: POST /recall — pipeline completo EN el motor
+                (hook = shim: FTS5 de state.db + formateo)
 
 14 repos locales (código) ──► ingest.py --hub hermes-hub-code ──► hermes-hub-code/
                                                                       └─► splatsdb (:8873)
@@ -144,7 +146,37 @@ sección está medido, no asumido.
 - `max_words` clamp **50..2000**: con <41 las secciones mínimas
   state-critical no cabían y el recap degeneraba a OBJECTIVE-only.
 
-### Telemetría (JSONL del hook, /mnt/d/WSL/orch/hermes-recalls.jsonl)
+### Contrato /recall (NATIVO, motor ≥ 2.9.0 — 20-nov-2026)
+
+El pipeline completo del hook vive DENTRO del motor: embed (mismo servicio
+:8860, prompt asimétrico) → /search interno (misma función, cero drift de
+contrato) → join sidecar mode=ro → gate → log JSONL. El hook queda como
+**shim** (flag `~/.hermes/agent-hooks/.recall-native`): fetch FTS5 de
+state.db + formateo; cualquier fallo cae al pipeline legacy completo
+(fail-open, cero comportamiento cambiado en la migración).
+
+- `POST /recall {text, session_id?, top_k?, fts?: [{dist, sid, text, meta}]}`
+- Los hits FTS viajan en el request y se merges PRE-GATE en el bucket de
+  sesiones: hay UNA implementación del gate (en Rust), no dos.
+- **Gate = bucket-best** (semántica del hook, 14-nov): el umbral aplica al
+  BEST hit del bucket; los ranks 2..n viajan sin umbral propio. Per-hit
+  gating inyecta estrictamente menos (A/B 20-nov: 4/78 queries divergían).
+- Buckets por `kind` (`repo` → código; resto → sesiones). En producción
+  los sidecars son homogéneos por hub → equivale al split por puerto del
+  hook legacy (verificado: 7008×hermes/session, 6024×repo).
+- Fail-closed: backend ≠ gpu inyecta nada con `fail_closed` seteado;
+  embed caído → 503 (NUNCA SimCos, fa1e528); texto vacío → 400.
+- `rowid = index+1` verificado contiguo en ambos sidecars; hits sin row
+  se descartan (jamás inventar texto).
+- Equivalencia medida (20-nov, mismo corpus + instante, 78 queries):
+  **DIFF=0** (69 idénticas + 9 cortes consistentes). El hook legacy y el
+  nativo producen contexto byte-idéntico en los payloads canónicos.
+- El fire lo loggea el MOTOR (una sola línea por fire, con `kind` por
+  hit — fts incluido): el shim en modo nativo no loggea. El ensure setea
+  `SPLATSDB_RECALL_LOG=/mnt/d/WSL/orch/hermes-recalls.jsonl` para que el
+  motor escriba al log canónico del digest; env vacía = log deshabilitado.
+
+### Telemetría (JSONL, /mnt/d/WSL/orch/hermes-recalls.jsonl)
 
 ```json
 {"ts": ..., "session_id": "...", "qhash": "sha1-12", "qlen": N,
@@ -154,8 +186,8 @@ sección está medido, no asumido.
 - `arm=-1` + `cut_dist`: query cortada por la banda medium (falsificable).
 - `backend` ≠ "gpu": falla de escala detectada.
 - `drops` > 0: join index↔rowid roto (invariant roto — investigar merge).
-- El log mide FIRES del hook, no turnos: el digest dedupea por
-  (session_id, qhash).
+- El log mide FIRES (del hook legacy o del motor nativo), no turnos: el
+  digest dedupea por (session_id, qhash).
 
 ### Smoke y validación
 
