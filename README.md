@@ -9,11 +9,11 @@ Vector search with uncertainty awareness. Knowledge graph + HNSW + GPU in a sing
 </p>
 
 [![CI](https://github.com/schwabauerbriantomas-gif/splatdb/actions/workflows/ci.yml/badge.svg)](https://github.com/schwabauerbriantomas-gif/splatdb/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-2.9.0-blue.svg)](https://github.com/schwabauerbriantomas-gif/splatdb/releases/tag/v2.9.0)
+[![Version](https://img.shields.io/badge/version-2.10.0-blue.svg)](https://github.com/schwabauerbriantomas-gif/splatdb/releases/tag/v2.10.0)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
 [![Tests](https://img.shields.io/badge/tests-285%20passing-brightgreen.svg)]()
-[![LOC](https://img.shields.io/badge/LOC-26.9K-informational.svg)]()
+[![LOC](https://img.shields.io/badge/LOC-27.6K-informational.svg)]()
 [![CUDA](https://img.shields.io/badge/GPU-RTX%203090-76B900.svg)]()
 
 ---
@@ -92,7 +92,7 @@ SplatsDB applies **Gaussian Splatting** — a technique from 3D neural rendering
 - **Uncertainty-aware retrieval** — sparse regions have high energy, guiding active learning
 - **Knowledge graph overlay** — typed entities and relations augment vector retrieval
 
-Combined with a two-level KMeans++ retrieval pipeline (HRM2), HNSW incremental indexing, and 15 CUDA GPU kernels (7 distance + 8 extended), SplatsDB provides a full-featured vector search engine in ~27.6K lines of pure Rust + CUDA (27,622 by `wc -l` — Rust `src/` 26,598 + CUDA `kernels/` 1,024, raw lines; the single LOC criterion also used by the badge and the [Module Map](#module-map)).
+Combined with a two-level KMeans++ retrieval pipeline (HRM2), HNSW incremental indexing, and 15 CUDA GPU kernels (7 distance + 8 extended), SplatsDB provides a full-featured vector search engine in ~27.6K lines of pure Rust + CUDA (27,648 by `wc -l` — Rust `src/` 26,624 + CUDA `kernels/` 1,024, raw lines; the single LOC criterion also used by the badge and the [Module Map](#module-map)).
 
 **Key use cases:**
 - AI agent long-term memory (MCP server for Claude, GPT, open-source LLMs)
@@ -216,7 +216,7 @@ cargo build --release
 cargo build --release --no-default-features
 
 # Run tests
-cargo test   # full suite: 294 tests across 9 binaries (measured 2026-11-20): lib 210, main 2, chaos 8, integration 3, integration_gaussian 5, pentest 29, qa_validation 32, api_field_load 2, mcp_server_warmstart 3
+cargo test   # full suite: 294 tests across 9 binaries (re-measured 2026-11-21): lib 211, main 2, chaos 8, integration 3, integration_gaussian 5, pentest_security 29, qa_validation 31, api_field_load 2, mcp_server_warmstart 3
 ```
 
 ### Run
@@ -875,7 +875,7 @@ curl http://localhost:8199/health
 ```
 
 ```json
-{"status": "ok", "version": "2.9.0"}
+{"status": "ok", "version": "2.10.0"}
 ```
 
 #### `POST /status` — Store Statistics

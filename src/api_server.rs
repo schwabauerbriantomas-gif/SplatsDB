@@ -919,7 +919,10 @@ async fn recap_handler(
 const RECALL_TOPK_DEFAULT: usize = 8;
 const RECALL_MAX_TOPK: usize = 32;
 const RECALL_SESS_STRONG_DEFAULT: f32 = 0.55;
-const RECALL_SESS_N_DEFAULT: usize = 3;
+/// 3 → 5 (21-nov LongMemEval-S: recall@contexto 53.2%→63.1%, multi-session
+/// +13.4 pts, preference +23.4 pts; w5 vs base3 con answer_session_ids GT).
+/// Rollback instantáneo por env: SPLATSDB_RECALL_SESS_N=3.
+const RECALL_SESS_N_DEFAULT: usize = 5;
 const RECALL_CODE_STRONG_DEFAULT: f32 = 0.70;
 const RECALL_CODE_N_DEFAULT: usize = 1;
 const RECALL_EMBED_URL_DEFAULT: &str = "http://127.0.0.1:8860/v1/embeddings";
@@ -2958,6 +2961,29 @@ mod tests {
         assert_eq!(sess_json, 0);
         assert_eq!(kept[0].sid, "s0");
         assert_eq!(kept[2].sid, "s2");
+    }
+
+    #[test]
+    fn recall_sess_window_five_measured_default() {
+        // 21-nov LongMemEval-S (500 Q, judge GLM): recall@contexto 53.2%→63.1%
+        // con ventana 3→5 (multi-session +13.4 pts, preference +23.4 pts).
+        // El default del gate es decisión MEDIDA, no estética; rollback por
+        // env SPLATSDB_RECALL_SESS_N=3 (el handler lo respeta).
+        assert_eq!(RECALL_SESS_N_DEFAULT, 5);
+        let mk = |i: usize| JoinedHit {
+            kind: "hermes/session".to_string(),
+            repo: String::new(),
+            path: String::new(),
+            sid: format!("s{i}"),
+            text: format!("texto {i}"),
+            dist: 0.30 + i as f32 * 0.01,
+            meta: serde_json::json!({"session_id": format!("s{i}")}),
+        };
+        let hits: Vec<_> = (0..7).map(mk).collect();
+        let sess_n = recall_env_usize("SPLATSDB_RECALL_SESS_N", RECALL_SESS_N_DEFAULT);
+        let (kept, _, _) = select_recall_tiers(hits, 0.55, sess_n, 0.70, 1);
+        assert_eq!(kept.len(), 5, "ventana 5 con todos los hits ≤ 0.55");
+        assert_eq!(kept[4].sid, "s4", "best-first: los 5 más cercanos");
     }
 
     #[test]

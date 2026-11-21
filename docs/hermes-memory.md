@@ -117,7 +117,7 @@ sección está medido, no asumido.
 
 | consumidor | trigger | qué hace | config clave |
 |---|---|---|---|
-| **hook de memoria** (`~/.hermes/agent-hooks/hermes-memory-recall.py`) | cada API-call (dispara varias veces por turno — bursts medidos hasta 29×) | inyecta bloque `[Memoria vectorial]` en el contexto | STRONG_SESS ≤0.55 → 3 hits + STRONG_CODE ≤0.70 → 1 (banda medium 0.55-0.62 ELIMINADA: uso 4% medido por replay, Fisher p=0.029) |
+| **hook de memoria** (`~/.hermes/agent-hooks/hermes-memory-recall.py`) | cada API-call (dispara varias veces por turno — bursts medidos hasta 29×) | inyecta bloque `[Memoria vectorial]` en el contexto | STRONG_SESS ≤0.55 → 5 hits + STRONG_CODE ≤0.70 → 1 (ventana 3→5 medida 21-nov en LongMemEval-S: recall@contexto 53.2→63.1%, MAX_CHARS 1300→2400; banda medium 0.55-0.62 ELIMINADA: uso 4% medido por replay, Fisher p=0.029) |
 | **sac_recap** (`semantic-hub/sac_recap.py` → POST /recap) | a pedido (handoff/recall) | recap de sesión: qué pasó, LLM-free | extrae acciones de state.db él mismo; el hub solo rankea |
 | **sac_recall_digest** (`semantic-hub/sac_recall_digest.py`) | a pedido (auditoría) | qué memoria se inyectó y qué mostró uso | turn-level (dedupe por session+qhash), cortes aparte |
 
@@ -147,6 +147,16 @@ sección está medido, no asumido.
   state-critical no cabían y el recap degeneraba a OBJECTIVE-only.
 
 ### Contrato /recall (NATIVO, motor ≥ 2.9.0 — 20-nov-2026)
+
+**Ventana del gate (2.10.0 — 21-nov-2026)**: `RECALL_SESS_N_DEFAULT` 3→5,
+medido en LongMemEval-S (500 Q, judge GLM-5.3-flash): recall@contexto con
+`answer_session_ids` GT 53.2%→63.1% (multi-session +13.4 pts, preference
++23.4 pts, temporal +10.5 pts). El presupuesto del hook subió con ella
+(`MAX_CHARS` 1300→2400 — con 1300 los hits 4-5 morían en el corte).
+Rollback instantáneo por env `SPLATSDB_RECALL_SESS_N=3` (el handler lo lee
+en cada fire). Recency-weighting (`dist*(1-w·strength)`) quedó DESCARTADO
+por el sweep: diferencia ≈0 con GT (63.1 vs 62.8) — no entra sin beneficio
+medido.
 
 El pipeline completo del hook vive DENTRO del motor: embed (mismo servicio
 :8860, prompt asimétrico) → /search interno (misma función, cero drift de
