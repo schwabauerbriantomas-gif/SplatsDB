@@ -46,6 +46,6 @@ ensure_hub() { # puerto, data-dir, etiqueta
     echo "$(date -u +%FT%TZ) hub $LABEL lanzado pid $(cat "$HUB/hub.pid") (puerto $PORT)" >> "$LOG"
 }
 
-ensure_hub 8872 "/mnt/d/splatdb/hermes-hub" "sesiones"
-ensure_hub 8873 "/mnt/d/splatdb/hermes-hub-code" "código"
+ensure_hub 8872 "/home/schwabauer/hermes-hubs/ses/hermes-hub" "sesiones"
+ensure_hub 8873 "/home/schwabauer/hermes-hubs/code/hermes-hub-code" "código"
 exit 0

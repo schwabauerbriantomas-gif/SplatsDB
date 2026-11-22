@@ -211,9 +211,9 @@ def check_recall_native(failures):
         dt = (time.monotonic() - t0) * 1000
         results = resp.get("results", [])
         # gate por BEST del bucket (semántica del hook): primer hit ≤0.55,
-        # ranks 2..n viajan sin umbral propio (≤3 total)
+        # ranks 2..n viajan sin umbral propio (≤5 total, ventana 2.10.0)
         ok = (resp.get("backend") == "gpu" and resp.get("sidecar") is True
-              and resp.get("arm") == 0 and 0 < len(results) <= 3
+              and resp.get("arm") == 0 and 0 < len(results) <= 5
               and results[0].get("dist", 99) <= 0.55
               and all(h.get("sid") and h.get("text") for h in results))
         check("recall nativo sesiones (:8872)", ok,
