@@ -42,7 +42,7 @@ use axum::{
 };
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -50,6 +50,8 @@ use tower_http::cors::CorsLayer;
 
 use crate::config::SplatsDBConfig;
 use crate::splats::SplatStore;
+use crate::storage::persistence::{SplatsDBPersistence, StorageBackend};
+use crate::storage::wal::WriteAheadLog;
 
 // ─── Security constants ──────────────────────────────────
 const MAX_TEXT_LEN: usize = 100_000; // 100KB max text input
@@ -98,6 +100,112 @@ pub struct AppState {
     /// Directorio de datos del server (flag --data-dir). /recall lo usa para
     /// abrir {data_dir}/sidecar.db en mode=ro y loggear fires. None en tests.
     pub data_dir: Option<String>,
+    /// Durabilidad: WAL append-only + shard "default" en --data-dir. Un
+    /// /store se loggea al WAL y cada COMPACT_EVERY se persiste el shard.
+    /// None en tests sin data-dir (comportamiento in-memory clásico).
+    pub durability: Option<Arc<Durability>>,
+}
+
+/// Durabilidad del `serve` cuando hay --data-dir: cada /store agregado se
+/// escribe en un WAL append-only (bajo el lock del store, así el orden del
+/// WAL == orden de índices y el replay reconstruye el dataset idéntico), y
+/// cada COMPACT_EVERY stores — y en el shutdown — se persiste el shard
+/// "default" completo y se trunca el WAL. Un crash de proceso pierde a lo
+/// sumo los últimos stores bufferados, no el dataset entero.
+pub struct Durability {
+    wal: WriteAheadLog,
+    persist: SplatsDBPersistence,
+    /// Último LSN asignado a un "store" (fetch_max: monotónico).
+    last_lsn: AtomicU64,
+    /// Stores loggeados desde la última compactación.
+    since_compact: AtomicUsize,
+}
+
+impl Durability {
+    /// Stores entre compactaciones (persistir shard + truncar WAL).
+    const COMPACT_EVERY: usize = 1000;
+    /// Stores entre checkpoints del WAL (flush + fsync — protege contra
+    /// corte de luz; el flush por store ya protege contra crash de proceso).
+    const CHECKPOINT_EVERY: u32 = 32;
+
+    fn open(data_dir: &str) -> anyhow::Result<Self> {
+        let persist = SplatsDBPersistence::with_backend(
+            data_dir,
+            StorageBackend::Sqlite,
+            false, // WAL propio: {data_dir}/wal/store.wal, no el interno del persistence
+        )
+        .map_err(|e| anyhow::anyhow!("persistence init falló: {e}"))?;
+        // sync_interval=1: flush del WAL en CADA store (page cache: un kill
+        // -9 no lo pierde; el fsync real viene con CHECKPOINT_EVERY).
+        let wal = WriteAheadLog::new(&format!("{data_dir}/wal/store.wal"), 1)?;
+        Ok(Self {
+            wal,
+            persist,
+            last_lsn: AtomicU64::new(0),
+            since_compact: AtomicUsize::new(0),
+        })
+    }
+
+    /// Loggea un store YA insertado en el store en memoria. DEBE llamarse
+    /// con el lock del store tomado (ver orden WAL == orden índices).
+    fn log_store(
+        &self,
+        id: &str,
+        auto_id: Option<usize>,
+        idx: usize,
+        vector: &[f32],
+    ) -> std::io::Result<()> {
+        let data = serde_json::json!({
+            "id": id,
+            "auto_id": auto_id,
+            "idx": idx,
+            "vector": vector,
+        });
+        let lsn = self.wal.log_operation("store", data)?;
+        self.last_lsn.fetch_max(lsn, Ordering::SeqCst);
+        let n = self.since_compact.fetch_add(1, Ordering::SeqCst) + 1;
+        if (n as u32).is_multiple_of(Self::CHECKPOINT_EVERY) {
+            self.wal.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    fn stores_since_compact(&self) -> usize {
+        self.since_compact.load(Ordering::SeqCst)
+    }
+
+    /// Flush + fsync del WAL. Solo tests: simular un crash determinista
+    /// (el flush por store de `log_store` ya cubre el caso real).
+    #[cfg(test)]
+    fn flush(&self) -> std::io::Result<()> {
+        self.wal.checkpoint()
+    }
+
+    /// Persiste el shard "default" con el estado ACTUAL del store y trunca
+    /// el WAL (todo lo loggeado ya quedó en el shard). Llamar con el lock
+    /// del store tomado. Devuelve la cantidad de splats persistidos.
+    fn compact(&self, store: &SplatStore) -> std::io::Result<usize> {
+        let n = store.n_active();
+        if n > 0 {
+            let Some(mu) = store.get_mu() else {
+                return Err(std::io::Error::other(
+                    "get_mu() devolvió None con n_active > 0",
+                ));
+            };
+            self.persist.save_vectors(&mu, "default")?;
+        }
+        let before = self.last_lsn.load(Ordering::SeqCst).saturating_add(1);
+        self.wal.truncate(before)?;
+        Ok(n)
+    }
+}
+
+/// Al dropear (panic, exit() sin TERM, tests): flush del WAL — lo mismo que
+/// un kill -9 respeta vía el flush por store de `log_store`.
+impl Drop for Durability {
+    fn drop(&mut self) {
+        let _ = self.wal.checkpoint();
+    }
 }
 
 /// A single search request queued for batch execution. The reply is delivered
@@ -250,20 +358,41 @@ async fn store_memory(
         .embedding
         .unwrap_or_else(|| simple_hash_embedding(&req.text, dim));
 
-    let arr = Array2::from_shape_vec((1, dim), embedding)
+    let arr = Array2::from_shape_vec((1, dim), embedding.clone())
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Bad embedding shape: {e}")))?;
 
     let id_num = state.next_id.fetch_add(1, Ordering::SeqCst);
+    let user_supplied = req.id.is_some();
     let id = req.id.unwrap_or_else(|| format!("mem_{id_num}"));
 
     // Wrap CPU-intensive work in spawn_blocking to avoid blocking the tokio runtime
     let store = state.store.clone();
+    let durability = state.durability.clone();
+    let emb_for_wal = embedding.clone();
+    let id_for_wal = id.clone();
+    let auto_id = (!user_supplied).then_some(id_num);
     let added = tokio::task::spawn_blocking(move || {
         let mut store = store.blocking_lock();
         let added = store.add_splat(&arr);
         if added {
             // Incrementally insert the new vector into HNSW (no full rebuild)
             store.hnsw_sync_incremental();
+            if let Some(d) = durability.as_ref() {
+                // Mismo lock que add_splat: el orden del WAL replica el orden
+                // de índices del store, así el replay es determinista.
+                let idx = store.n_active().saturating_sub(1);
+                if let Err(e) = d.log_store(&id_for_wal, auto_id, idx, &emb_for_wal) {
+                    eprintln!("[splatsdb] WAL: fallo al loggear store (queda en memoria): {e}");
+                }
+                if d.stores_since_compact() % Durability::COMPACT_EVERY == 0 {
+                    match d.compact(&store) {
+                        Ok(n) => {
+                            eprintln!("[splatsdb] compact: shard 'default' persistido ({n} splats)")
+                        }
+                        Err(e) => eprintln!("[splatsdb] compact falló (el WAL continúa): {e}"),
+                    }
+                }
+            }
         }
         added
     })
@@ -485,8 +614,9 @@ fn enrich_topics(state: &AppState, results: &mut [SearchResult], squared: bool) 
 // alpha·exp(−kappa·d²) NO es una cota y destruye el ranking en 768d; la
 // desigualdad triangular d(q,x) ≥ d(q,mu_c) − R_c SÍ lo es → sweep exacto.
 
-/// Crudos + splats + membresías CSR + radios, persistidos por
-/// `field_cmds::persist_field` tras cada ingest.
+/// Crudos + splats + membresías CSR + radios. El field se persiste vía el
+/// shard "raw" del data-dir (ver `load_field`); el store del `/store` se
+/// persiste por chunks con `Durability` (v2.11.0).
 pub struct FieldData {
     pub raw: Array2<f32>,
     pub splats: Array2<f32>,
@@ -2003,6 +2133,33 @@ pub async fn run_server(
     #[cfg(not(feature = "cuda"))]
     drop(corpus);
 
+    // ── Durabilidad: el shard "default" ya lo cargó load_serve_inputs. Se
+    // abre el WAL, se re-aplica lo no compactado y queda listo para
+    // persistir por chunks (COMPACT_EVERY) y en el shutdown.
+    let durability = match Durability::open(data_dir) {
+        Ok(d) => match replay_wal(&mut store, &d) {
+            Ok((n, max_auto)) => {
+                if n > 0 {
+                    eprintln!("[splatsdb] WAL replay: {n} stores re-aplicados desde el WAL");
+                }
+                Some((Arc::new(d), max_auto))
+            }
+            Err(e) => {
+                eprintln!("[splatsdb] WAL replay falló (arrancando sin replay): {e}");
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("[splatsdb] durabilidad desactivada: {e}");
+            None
+        }
+    };
+    let next_id_seed = durability
+        .as_ref()
+        .map(|(_, max_auto)| *max_auto)
+        .unwrap_or(0);
+    let durability = durability.map(|(d, _)| d);
+
     let store = Arc::new(Mutex::new(store));
     let (batch_tx, batch_rx) = mpsc::channel(BATCH_CHANNEL_CAP);
     let batches_served = Arc::new(AtomicUsize::new(0));
@@ -2014,8 +2171,8 @@ pub async fn run_server(
     ));
 
     let state = AppState {
-        store,
-        next_id: Arc::new(AtomicUsize::new(0)),
+        store: store.clone(),
+        next_id: Arc::new(AtomicUsize::new(next_id_seed)),
         batch_tx,
         batches_served,
         #[cfg(feature = "cuda")]
@@ -2023,6 +2180,7 @@ pub async fn run_server(
         field: field_data.map(Arc::new),
         corpus_n,
         data_dir: Some(data_dir.to_string()),
+        durability: durability.clone(),
     };
 
     let app = build_router(state);
@@ -2044,7 +2202,101 @@ pub async fn run_server(
         crate::gpu::is_cuda_available()
     );
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    Ok(axum::serve(listener, app).await?)
+    // Shutdown graceful: en SIGINT/SIGTERM persiste el shard "default" y
+    // trunca el WAL antes de soltar el listener — un restart re-levanta el
+    // dataset entero desde disco.
+    let shutdown_store = store.clone();
+    let shutdown_durability = durability.clone();
+    Ok(axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            wait_shutdown_signal().await;
+            if let Some(d) = shutdown_durability.as_ref() {
+                let store = shutdown_store.lock().await;
+                match d.compact(&store) {
+                    Ok(n) => eprintln!(
+                        "[splatsdb] shutdown: shard 'default' persistido ({n} splats), WAL truncado"
+                    ),
+                    Err(e) => eprintln!("[splatsdb] shutdown: compact falló: {e}"),
+                }
+            }
+        })
+        .await?)
+}
+
+/// Bloquea hasta SIGINT o SIGTERM (shutdown graceful del serve).
+async fn wait_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => {
+                tokio::signal::ctrl_c().await.ok();
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.ok();
+    }
+}
+
+/// Re-aplica las entradas "store" del WAL que el shard "default" aún no
+/// contiene (idx >= splats ya cargados). Devuelve (aplicados, siguiente
+/// auto_id) para sembrar el contador `next_id` del server.
+fn replay_wal(store: &mut SplatStore, d: &Durability) -> anyhow::Result<(usize, usize)> {
+    let entries = d.wal.recover()?;
+    let dim = store.get_statistics().embedding_dim;
+    let shard_n = store.n_active();
+    let mut applied = 0usize;
+    let mut max_auto = 0usize;
+    for e in entries {
+        if e.operation != "store" {
+            continue;
+        }
+        let idx = e
+            .data
+            .get("idx")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(usize::MAX);
+        if idx < shard_n {
+            continue; // ya está dentro del shard persistido
+        }
+        let Some(vals) = e.data.get("vector").and_then(|v| v.as_array()) else {
+            eprintln!("[splatsdb] WAL: entrada {} sin vector, salteada", e.lsn);
+            continue;
+        };
+        let vec: Vec<f32> = vals
+            .iter()
+            .filter_map(|x| x.as_f64())
+            .map(|x| x as f32)
+            .collect();
+        if vec.len() != dim {
+            eprintln!(
+                "[splatsdb] WAL: entrada {} con dim {} != {dim}, salteada",
+                e.lsn,
+                vec.len()
+            );
+            continue;
+        }
+        let Ok(arr) = Array2::from_shape_vec((1, dim), vec) else {
+            continue;
+        };
+        if store.add_splat(&arr) {
+            store.hnsw_sync_incremental();
+            applied += 1;
+        }
+        if let Some(a) = e.data.get("auto_id").and_then(|v| v.as_u64()) {
+            max_auto = max_auto.max(a as usize + 1);
+        }
+    }
+    Ok((applied, max_auto))
 }
 
 /// Server preset applied on top of the CLI-provided config: HNSW ENABLED with
@@ -2141,6 +2393,7 @@ mod tests {
             field: None,
             corpus_n: 0,
             data_dir: None,
+            durability: None,
         };
         (build_router(state), batches_served)
     }
@@ -2181,6 +2434,150 @@ mod tests {
         let mut v = vec![0.0f32; dim];
         v[axis] = 1.0;
         v
+    }
+
+    /// App con durabilidad sobre `dir`, espejando el boot de `run_server`:
+    /// shard "default" + replay del WAL + next_id sembrado con el máximo
+    /// auto_id del WAL. Devuelve también la Durability para forzar flush.
+    async fn test_app_with_durability(dir: &std::path::Path) -> (Router, Arc<Durability>) {
+        let config = test_config();
+        let mut store = SplatStore::new(config.clone());
+        let d = Arc::new(Durability::open(dir.to_str().unwrap()).expect("durability init"));
+        let _ = load_default_shard(&mut store, dir.to_str().unwrap());
+        let (replayed, max_auto) = replay_wal(&mut store, &d).expect("wal replay");
+        let _ = replayed;
+        let store = Arc::new(Mutex::new(store));
+        let (batch_tx, batch_rx) = mpsc::channel(BATCH_CHANNEL_CAP);
+        let batches_served = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(batch_worker(
+            batch_rx,
+            store.clone(),
+            batches_served.clone(),
+            false,
+        ));
+        let state = AppState {
+            store,
+            next_id: Arc::new(AtomicUsize::new(max_auto)),
+            batch_tx,
+            batches_served,
+            #[cfg(feature = "cuda")]
+            gpu: None,
+            field: None,
+            corpus_n: 0,
+            data_dir: Some(dir.to_string_lossy().into_owned()),
+            durability: Some(d.clone()),
+        };
+        (build_router(state), d)
+    }
+
+    fn temp_wal_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "splatdb_wal_test_{}_{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    // ── durabilidad: WAL + shard "default" ─────────────────────
+
+    #[tokio::test]
+    async fn store_survives_restart_via_wal() {
+        let dir = temp_wal_dir("restart");
+        {
+            let (app, d) = test_app_with_durability(&dir).await;
+            for axis in 0..3 {
+                let (status, body) = send(
+                    app.clone(),
+                    "POST",
+                    "/store",
+                    Some(json!({ "text": format!("vec {axis}"), "embedding": unit_vec(32, axis) })),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "store {axis}: {body}");
+                assert_eq!(body["status"], "stored");
+                assert_eq!(body["id"], format!("mem_{axis}"));
+            }
+            // Simular crash: flush explícito (kill -9 pierde lo bufferado,
+            // acá forceamos el fsync de los 3 stores) y drop SIN compact.
+            d.flush().expect("wal flush");
+        }
+        // Reinicio: shard vacío + WAL con 3 entradas → dataset idéntico.
+        let (app, _) = test_app_with_durability(&dir).await;
+        let (status, body) = send(app.clone(), "POST", "/status", Some(json!({}))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["n_active"], 3, "status tras restart: {body}");
+        // El orden de índices sobrevive: el vec del eje 0 es el índice 0.
+        let (status, body) = send(
+            app.clone(),
+            "POST",
+            "/search",
+            Some(json!({ "query": "vec 0", "embedding": unit_vec(32, 0), "top_k": 1 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["results"][0]["index"], 0,
+            "orden de índices tras replay: {body}"
+        );
+        // El contador next_id continúa (no reusa mem_0..2).
+        let (status, body) = send(
+            app.clone(),
+            "POST",
+            "/store",
+            Some(json!({ "text": "vec 3", "embedding": unit_vec(32, 3) })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["id"], "mem_3", "next_id sin continuidad: {body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn compact_persists_shard_and_wal_replay_completes_it() {
+        let dir = temp_wal_dir("compact");
+        let config = test_config();
+        {
+            let d = Arc::new(Durability::open(dir.to_str().unwrap()).expect("durability"));
+            let mut store = SplatStore::new(config.clone());
+            // 2 stores + compact: quedan en el shard "default".
+            for axis in 0..2 {
+                let arr = Array2::from_shape_vec((1, 32), unit_vec(32, axis)).unwrap();
+                assert!(store.add_splat(&arr));
+                store.hnsw_sync_incremental();
+                let idx = store.n_active() - 1;
+                d.log_store(&format!("mem_{axis}"), Some(axis), idx, &unit_vec(32, axis))
+                    .expect("wal log");
+            }
+            let n = d.compact(&store).expect("compact");
+            assert_eq!(n, 2);
+            // 2 stores post-compact: solo WAL (crash sin shutdown).
+            for axis in 2..4 {
+                let arr = Array2::from_shape_vec((1, 32), unit_vec(32, axis)).unwrap();
+                assert!(store.add_splat(&arr));
+                store.hnsw_sync_incremental();
+                let idx = store.n_active() - 1;
+                d.log_store(&format!("mem_{axis}"), Some(axis), idx, &unit_vec(32, axis))
+                    .expect("wal log");
+            }
+            d.flush().expect("wal flush");
+            // drop: el store en memoria muere, disco tiene shard(2)+WAL(2).
+        }
+        // Reapertura: shard + replay → dataset completo con índices exactos.
+        let mut store = SplatStore::new(config.clone());
+        load_default_shard(&mut store, dir.to_str().unwrap()).expect("shard load");
+        let d = Arc::new(Durability::open(dir.to_str().unwrap()).expect("durability"));
+        let (applied, max_auto) = replay_wal(&mut store, &d).expect("replay");
+        assert_eq!(applied, 2, "el replay debe re-aplicar SOLO los post-compact");
+        assert_eq!(store.n_active(), 4);
+        assert_eq!(max_auto, 4, "siguiente auto_id tras mem_3");
+        // Exactitud de índices: el índice 3 es el vec del eje 3.
+        let query_vec = unit_vec(32, 3);
+        let hits = store.find_neighbors(&ndarray::ArrayView1::from(&query_vec), 1);
+        assert_eq!(hits[0].index, 3);
+        assert!(hits[0].distance < 1e-3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── recap: SAC handoff builder ─────────────────────────────
@@ -2746,6 +3143,7 @@ mod tests {
             field: Some(Arc::new(field)),
             corpus_n: 2,
             data_dir: None,
+            durability: None,
         };
         let app = build_router(state);
 

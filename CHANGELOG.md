@@ -1,6 +1,16 @@
 # Changelog
 
-## [v2.8.1] - 2026-11-14
+## [v2.11.0] - 2026-11-22
+
+### Added
+- **api/serve**: persistencia por chunks del store cuando hay `--data-dir`. Cada `/store` agrega una entrada a un WAL append-only propio (`{data_dir}/wal/store.wal`, formato length-prefixed JSON con `id/auto_id/idx/vector`), escrito **bajo el lock del store** para que el orden del WAL replique exactamente el orden de índices. El WAL hace flush por store (un `kill -9` no pierde nada) y checkpoint con fsync cada 32 stores (protege contra corte de luz). Cada 1000 stores se compacta: shard `"default"` completo a SQLite (`data/vectors/default.bin`, mismo formato que el CLI vía `save_vectors`) + truncate crash-safe del WAL. Boot: shard + replay de las entradas post-compact (dedup por `idx`, seeds `next_id` con el máximo `auto_id`). Shutdown graceful en SIGINT/SIGTERM (`with_graceful_shutdown`): persiste shard y trunca WAL antes de soltar el listener — un restart re-levanta el dataset entero; un `kill -9` pierde a lo sumo lo no flusheado (con flush por store: nada), no el dataset entero (antes: TODO, y `ingested.json` externo quedaba envenenado). Drop de `Durability` flushea (panic/exit sin TERM).
+- **AppState**: campo `durability: Option<Arc<Durability>>` (WAL + persistence + contadores). None en tests sin data-dir → comportamiento in-memory clásico intacto.
+- **tests**: `store_survives_restart_via_wal` (crash sin compact → replay idéntico, orden de índices y continuidad de `next_id`) y `compact_persists_shard_and_wal_replay_completes_it` (shard+post-compact → reaplicación exacta de índices y distancias). Helper `test_app_with_durability` espeja el boot de `run_server`.
+
+### Fixed
+- `api_server.rs`: doc-comment de `field_cmds::persist_field` referenciaba un call site inexistente — la ruta `/store` del server HTTP jamás persistió a disco (el MCP server sí persiste docs; el HTTP no). Con v2.11.0 el hueco queda cerrado.
+
+
 
 ### Added
 - **api**: `POST /recap` — recap SAC-style de handoff, LLM-free (ver módulo `src/recap.rs`). Recibe `{objective, actions[], max_words}` inline (stateless: sin store, sin mutex) y devuelve un recap determinista por extracción: clasificación por heurística (changes/verification/dead-ends/facts) + ranking TF-IDF contra objetivo y acciones recientes + `semantic_compress`, con trim post-render que garantiza el contrato de palabras (max 397/400 sobre 30 recaps reales). 8 tests nuevos (6 unit + 2 router). Latencia: 9.1ms server mediana, p90 13.3ms sobre 30 recaps de trayectorias reales.
