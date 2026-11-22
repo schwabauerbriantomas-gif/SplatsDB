@@ -90,3 +90,4 @@ semantic-hub/data/metadata/*.db-wal
 .vscode/
 .github/copilot-instructions.md
 .claude/
+semantic-hub/wal/
