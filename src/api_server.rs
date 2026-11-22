@@ -2471,10 +2471,8 @@ mod tests {
     }
 
     fn temp_wal_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "splatdb_wal_test_{}_{tag}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("splatdb_wal_test_{}_{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
@@ -2569,7 +2567,10 @@ mod tests {
         load_default_shard(&mut store, dir.to_str().unwrap()).expect("shard load");
         let d = Arc::new(Durability::open(dir.to_str().unwrap()).expect("durability"));
         let (applied, max_auto) = replay_wal(&mut store, &d).expect("replay");
-        assert_eq!(applied, 2, "el replay debe re-aplicar SOLO los post-compact");
+        assert_eq!(
+            applied, 2,
+            "el replay debe re-aplicar SOLO los post-compact"
+        );
         assert_eq!(store.n_active(), 4);
         assert_eq!(max_auto, 4, "siguiente auto_id tras mem_3");
         // Exactitud de índices: el índice 3 es el vec del eje 3.
