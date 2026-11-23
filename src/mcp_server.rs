@@ -248,6 +248,14 @@ struct McpState {
     next_id: usize,
     /// Knowledge graph store (Gaussian splat graph)
     graph: crate::graph_splat::GaussianGraphStore,
+    /// Durable home of the graph (A04-F10): with `Some(dir)` every graph
+    /// mutation is saved to `<dir>/graph_state.json` BEFORE the tool
+    /// answers, and a failed save rolls the mutation back. `None` →
+    /// in-memory only, reported as ephemeral.
+    graph_dir: Option<std::path::PathBuf>,
+    /// A persisted graph exists but could not be loaded (corrupt, foreign
+    /// version): fail closed — mutators refuse and the file is never written.
+    graph_load_error: Option<String>,
     /// Spatial memory: maps (wing, room, hall) → vector indices for pre-filter search.
     /// Updated when docs are stored/loaded with spatial metadata.
     spatial_index: crate::spatial::SpatialIndex,
@@ -366,6 +374,8 @@ impl McpState {
             doc_texts: DocTextCache::default(),
             next_id: 0,
             graph: crate::graph_splat::GaussianGraphStore::new(),
+            graph_dir: None,
+            graph_load_error: None,
             spatial_index: crate::spatial::SpatialIndex::new(),
             doc_sources: HashMap::new(),
             warm_start: WarmStartStats::default(),
@@ -490,6 +500,126 @@ impl McpState {
             .map(|(id, src)| (id, VectorProvenance::Stored(src)))
             .collect();
         state
+    }
+
+    /// Attach the durable home of the knowledge graph and load what a
+    /// previous process persisted there (A04-F10). `None` keeps the graph in
+    /// memory only (explicitly ephemeral).
+    ///
+    /// A state file that exists but cannot be loaded is NEVER treated as "no
+    /// graph": the in-memory graph stays empty, every mutation is refused and
+    /// the file is not written — overwriting it would destroy the only copy
+    /// of the state the operator still has to repair.
+    fn init_graph_persistence(&mut self, dir: Option<std::path::PathBuf>) {
+        self.graph_dir = dir;
+        self.graph_load_error = None;
+        let Some(dir) = self.graph_dir.clone() else {
+            return;
+        };
+        match crate::graph_splat::GaussianGraphStore::load_or_empty(dir.as_path()) {
+            Ok(graph) => self.graph = graph,
+            Err(e) => self.graph_load_error = Some(e.to_string()),
+        }
+    }
+
+    /// Startup line that says where the graph lives — or that it is lost on
+    /// exit.
+    fn report_graph_persistence(&self) {
+        match (&self.graph_dir, &self.graph_load_error) {
+            (None, _) => eprintln!(
+                "[splatsdb] graph state: EPHEMERAL (no data dir) — knowledge-graph nodes and edges are lost when the process exits; set SPLATSDB_GRAPH_DIR, or a persistent SPLATSDB_DOC_PATH, to persist them"
+            ),
+            (Some(_), Some(err)) => eprintln!(
+                "[splatsdb] graph state file is UNREADABLE: {err} — graph mutations are REFUSED and the file was left untouched (fix or remove it, then restart); graph reads see an EMPTY graph until then"
+            ),
+            (Some(dir), None) => {
+                let path = dir.join(crate::graph_splat::GRAPH_STATE_FILENAME);
+                if path.exists() {
+                    eprintln!(
+                        "[splatsdb] graph state: {} (loaded {} nodes / {} edges; durable: every graph mutation is saved here before it is answered)",
+                        path.display(),
+                        self.graph.n_nodes(),
+                        self.graph.n_edges()
+                    );
+                } else {
+                    eprintln!(
+                        "[splatsdb] graph state: {} (no state file yet; the graph is saved here on the first mutation)",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Apply one graph mutation so that it is acknowledged only once it is
+    /// persisted (A04-F10). Without a data dir the mutation is in-memory only
+    /// (ephemeral by configuration). Otherwise the mutation is applied to a
+    /// copy, the copy is saved — atomically — and only then does it become the
+    /// live graph: a failed save leaves the live graph equal to the last
+    /// persisted state (the failed node is invisible and its id unused) and
+    /// answers with an error instead of a node id that nobody stored.
+    fn graph_mutate<T>(
+        &mut self,
+        mutation: impl FnOnce(
+            &mut crate::graph_splat::GaussianGraphStore,
+        ) -> Result<T, crate::graph_splat::GraphError>,
+    ) -> Result<T, String> {
+        if let Some(err) = &self.graph_load_error {
+            return Err(format!(
+                "graph state file is unreadable ({err}): the mutation was NOT applied — the file was left untouched and is never overwritten; fix or remove it and restart the server"
+            ));
+        }
+        let Some(dir) = self.graph_dir.clone() else {
+            return mutation(&mut self.graph).map_err(|e| e.to_string());
+        };
+        let mut next = self.graph.clone();
+        let outcome = mutation(&mut next).map_err(|e| e.to_string())?;
+        match next.save_to_dir(dir.as_path()) {
+            Ok(path) => {
+                eprintln!(
+                    "[mcp] graph persisted: {} ({} nodes / {} edges)",
+                    path.display(),
+                    next.n_nodes(),
+                    next.n_edges()
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[mcp] graph save FAILED — mutation rolled back, previous state intact: {e}"
+                );
+                return Err(format!(
+                    "graph mutation was not persisted and was rolled back (the in-memory graph still equals the last persisted state): {e}"
+                ));
+            }
+        }
+        self.graph = next;
+        Ok(outcome)
+    }
+
+    /// Whether graph mutations are persisted before they are answered.
+    fn graph_is_durable(&self) -> bool {
+        self.graph_dir.is_some() && self.graph_load_error.is_none()
+    }
+
+    fn graph_persistence_json(&self) -> Value {
+        let state = if self.graph_dir.is_none() {
+            "ephemeral"
+        } else if self.graph_load_error.is_some() {
+            "corrupt"
+        } else {
+            "durable"
+        };
+        json!({
+            "persisted": self.graph_is_durable(),
+            "ephemeral": self.graph_dir.is_none(),
+            "state": state,
+            "path": self.graph_dir.as_ref().map(|dir| {
+                dir.join(crate::graph_splat::GRAPH_STATE_FILENAME)
+                    .display()
+                    .to_string()
+            }),
+            "error": self.graph_load_error,
+        })
     }
 
     fn cache_doc_text(&mut self, id: String, text: String) {
@@ -1178,6 +1308,7 @@ fn handle_status(state: &Mutex<McpState>) -> Result<Value, String> {
         "ephemeral": !s.doc_store_persistent,
         "embedding_fallback": if SIMCOS_ALLOWED.load(Ordering::Relaxed) { "simcos" } else { "none" },
         "vector_persistence": s.vector_persistence_json(),
+        "graph_persistence": s.graph_persistence_json(),
         "has_hnsw": s.store.has_hnsw(),
         "has_lsh": s.store.has_lsh(),
         "has_quantization": s.store.has_quantization(),
@@ -1366,17 +1497,17 @@ fn handle_graph_add_doc(state: &Mutex<McpState>, params: &Value) -> Result<Value
         "internal server error".to_string()
     })?;
 
-    let node_id = s
-        .graph
-        .add_document(text, &embedding)
-        .map_err(|e| e.to_string())?;
+    let node_id = s.graph_mutate(|g| g.add_document(text, &embedding))?;
 
     eprintln!(
-        "[mcp] graph_add_doc: node_id={}, text_len={}",
+        "[mcp] graph_add_doc: node_id={}, text_len={}, persisted={}",
         node_id,
-        text.len()
+        text.len(),
+        s.graph_is_durable()
     );
-    Ok(json!({ "node_id": node_id, "node_type": "document", "embedding": embedding_src.label() }))
+    Ok(
+        json!({ "node_id": node_id, "node_type": "document", "embedding": embedding_src.label(), "persisted": s.graph_is_durable() }),
+    )
 }
 
 fn handle_graph_add_entity(state: &Mutex<McpState>, params: &Value) -> Result<Value, String> {
@@ -1408,10 +1539,7 @@ fn handle_graph_add_entity(state: &Mutex<McpState>, params: &Value) -> Result<Va
         "internal server error".to_string()
     })?;
 
-    let node_id = s
-        .graph
-        .add_entity(name, &embedding, entity_type)
-        .map_err(|e| e.to_string())?;
+    let node_id = s.graph_mutate(|g| g.add_entity(name, &embedding, entity_type))?;
 
     eprintln!(
         "[mcp] graph_add_entity: node_id={}, name_len={}, type='{}'",
@@ -1420,7 +1548,7 @@ fn handle_graph_add_entity(state: &Mutex<McpState>, params: &Value) -> Result<Va
         entity_type
     );
     Ok(
-        json!({ "node_id": node_id, "name": name, "entity_type": entity_type, "embedding": embedding_src.label() }),
+        json!({ "node_id": node_id, "name": name, "entity_type": entity_type, "embedding": embedding_src.label(), "persisted": s.graph_is_durable() }),
     )
 }
 
@@ -1442,9 +1570,7 @@ fn handle_graph_add_relation(state: &Mutex<McpState>, params: &Value) -> Result<
         eprintln!("[mcp] mutex poisoned: {}", e);
         "internal server error".to_string()
     })?;
-    s.graph
-        .add_relation(source_id, target_id, relation_type, weight)
-        .map_err(|e| e.to_string())?;
+    s.graph_mutate(|g| g.add_relation(source_id, target_id, relation_type, weight))?;
 
     eprintln!(
         "[mcp] graph_add_relation: {} --{}--> {} (w={})",
@@ -1455,7 +1581,8 @@ fn handle_graph_add_relation(state: &Mutex<McpState>, params: &Value) -> Result<
         "source_id": source_id,
         "target_id": target_id,
         "relation_type": relation_type,
-        "weight": weight
+        "weight": weight,
+        "persisted": s.graph_is_durable()
     }))
 }
 
@@ -1604,6 +1731,7 @@ fn handle_graph_stats(state: &Mutex<McpState>) -> Result<Value, String> {
 /// Spatial search: uses SpatialIndex for O(|candidates|×dim) pre-filter search.
 ///
 /// Pipeline:
+///
 ///   1. SpatialIndex.filter() → candidate doc IDs (in-memory, no SQLite)
 ///   2. doc_id → vector_idx mapping (in-memory HashMap)
 ///   3. SplatStore.find_neighbors_filtered() → distance only against candidates
@@ -2167,6 +2295,41 @@ fn dispatch_request(state: &Mutex<McpState>, req: &JsonRpcRequest) -> JsonRpcRes
 /// are rejected and drained (see `read_request_line`).
 const MAX_JSONRPC_LINE_LEN: usize = 10_000_000;
 
+/// Where the MCP knowledge graph is persisted (A04-F10).
+///
+/// `SPLATSDB_GRAPH_DIR` decides explicitly: a directory, or an off-value
+/// (`memory`, `off`, `none`, `0`, `false`, empty) for an in-memory graph.
+/// Without it the graph follows the doc store: beside the SQLite file when
+/// that one is durable, in memory when the doc store itself fell back to
+/// `:memory:`. The file is `graph_state.json` — the name and format the CLI
+/// `graph` commands use in their working directory — so one directory holds
+/// one graph.
+fn graph_dir_for(
+    doc_db: &std::path::Path,
+    doc_store_persistent: bool,
+) -> Option<std::path::PathBuf> {
+    if let Ok(explicit) = std::env::var("SPLATSDB_GRAPH_DIR") {
+        let dir = explicit.trim();
+        if ["", "memory", "off", "none", "0", "false"]
+            .iter()
+            .any(|off| dir.eq_ignore_ascii_case(off))
+        {
+            return None;
+        }
+        return Some(std::path::PathBuf::from(dir));
+    }
+    if !doc_store_persistent || doc_db == std::path::Path::new(":memory:") {
+        return None;
+    }
+    Some(
+        doc_db
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from(".")),
+    )
+}
+
 pub fn run_mcp_server() {
     eprintln!(
         "[splatsdb] MCP server v{} starting (stdio transport)...",
@@ -2182,7 +2345,7 @@ pub fn run_mcp_server() {
     let mut store = SplatStore::new(config);
 
     // Initialize SQLite doc store
-    let (doc_store, doc_store_persistent) = init_doc_store();
+    let (doc_store, doc_store_persistent, doc_db_path) = init_doc_store();
 
     // Warm start: reload documents from SQLite into vector store.
     // SPLATDB_SPATIAL_WARMSTART=0|off|false skips the spatial registration
@@ -2198,12 +2361,14 @@ pub fn run_mcp_server() {
         warm_start_t0,
     );
 
-    let state = Mutex::new(McpState::from_warm_start(
-        store,
-        doc_store,
-        doc_store_persistent,
-        &mut outcome,
-    ));
+    let mut live_state =
+        McpState::from_warm_start(store, doc_store, doc_store_persistent, &mut outcome);
+    // Knowledge graph (A04-F10): load what a previous process persisted and
+    // attach its durable home BEFORE the first request. A state file that
+    // cannot be loaded is reported here and fail-closes the graph mutators.
+    live_state.init_graph_persistence(graph_dir_for(&doc_db_path, doc_store_persistent));
+    live_state.report_graph_persistence();
+    let state = Mutex::new(live_state);
 
     register_warm_start_spatial(
         &state,
@@ -2387,7 +2552,11 @@ fn register_warm_start_spatial(
 ///
 /// Extracted from `run_mcp_server`; messages and behavior identical,
 /// including the FATAL exit when even `:memory:` fails.
-fn init_doc_store() -> (SqliteMetadataStore, bool /* persistent */) {
+fn init_doc_store() -> (
+    SqliteMetadataStore,
+    bool,               /* persistent */
+    std::path::PathBuf, /* the configured path, even after a fallback */
+) {
     let db_path = std::env::var("SPLATSDB_DOC_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
@@ -2397,7 +2566,7 @@ fn init_doc_store() -> (SqliteMetadataStore, bool /* persistent */) {
     match SqliteMetadataStore::new(db_path.clone()) {
         Ok(ds) => {
             eprintln!("[splatsdb] SQLite doc store: {:?}", db_path);
-            (ds, true)
+            (ds, true, db_path)
         }
         Err(e) => {
             eprintln!(
@@ -2409,7 +2578,7 @@ fn init_doc_store() -> (SqliteMetadataStore, bool /* persistent */) {
                     eprintln!("[splatsdb] FATAL: in-memory SQLite failed: {}", e);
                     std::process::exit(1);
                 });
-            (ephemeral, false)
+            (ephemeral, false, db_path)
         }
     }
 }
