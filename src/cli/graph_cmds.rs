@@ -115,12 +115,13 @@ pub fn cmd_graph_add_relation(
 ) {
     let mut store = load_graph();
     match store.add_relation(source_id, target_id, &relation_type, weight) {
-        Ok(()) => {
+        Ok(created) => {
             save_graph(&store);
             println!(
                 "{}",
                 serde_json::json!({
                     "status": "ok",
+                    "created": created,
                     "source_id": source_id,
                     "target_id": target_id,
                     "relation_type": relation_type,
@@ -213,13 +214,23 @@ pub fn cmd_graph_search(query: String, k: usize, search_type: String) {
 
     match search_type.as_str() {
         "hybrid" => {
-            let results = store.hybrid_search(&emb_vec, k);
+            // `score` is the raw cosine (A04-F11); the degree prior travels
+            // as `graph_boost`, an annotation the CLI never ranks by.
+            let results = match store.hybrid_search(&emb_vec, k) {
+                Ok(results) => results,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
             let entries: Vec<serde_json::Value> = results
                 .iter()
                 .map(|r| {
                     serde_json::json!({
                         "node_id": r.node_id,
                         "score": (r.score * 10000.0).round() / 10000.0,
+                        "graph_boost": (r.graph_boost * 10000.0).round() / 10000.0,
+                        "score_mode": r.score_mode.label(),
                         "content": r.content,
                     })
                 })
@@ -234,7 +245,13 @@ pub fn cmd_graph_search(query: String, k: usize, search_type: String) {
             );
         }
         "entities" => {
-            let results = store.search_entities(&emb_vec, k);
+            let results = match store.search_entities(&emb_vec, k) {
+                Ok(results) => results,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
             let entries: Vec<serde_json::Value> = results
                 .iter()
                 .map(|n| {

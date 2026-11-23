@@ -58,6 +58,11 @@ pub struct GraphNode {
 struct GraphFile {
     version: u32,
     next_id: usize,
+    /// Embedding dimension of the graph (A04-F12). Absent in files written
+    /// before F05d: it is then derived from the nodes and checked for
+    /// consistency, so the on-disk format stays version 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dim: Option<usize>,
     nodes: Vec<GraphNode>,
     edges: Vec<GraphEdge>,
 }
@@ -81,6 +86,17 @@ pub enum GraphError {
     /// saved as: writing would discard another writer's nodes, or resurrect
     /// a file that was removed on purpose. The file is never touched.
     OutOfSync { path: String, reason: &'static str },
+    /// An embedding has another dimension than the graph. The FIRST node
+    /// fixes it; every later node and every query must match (A04-F12).
+    DimMismatch {
+        expected: usize,
+        got: usize,
+        context: &'static str,
+    },
+    /// An embedding holds NaN or ±inf: `index` is the first such component.
+    NonFiniteEmbedding { index: usize, context: &'static str },
+    /// An embedding has no components at all.
+    EmptyEmbedding { context: &'static str },
 }
 
 impl std::fmt::Display for GraphError {
@@ -101,6 +117,17 @@ impl std::fmt::Display for GraphError {
                     f,
                     "graph state {path} {reason}; it was NOT overwritten — reload it before saving"
                 )
+            }
+            Self::DimMismatch { expected, got, context } => write!(
+                f,
+                "embedding dimension mismatch in {context}: this graph holds {expected}-dim vectors, got {got}"
+            ),
+            Self::NonFiniteEmbedding { index, context } => write!(
+                f,
+                "embedding has a non-finite value (NaN/inf) at component {index} in {context}"
+            ),
+            Self::EmptyEmbedding { context } => {
+                write!(f, "embedding is empty in {context}")
             }
         }
     }
@@ -123,6 +150,9 @@ pub struct GaussianGraphStore {
     type_index: HashMap<NodeType, HashSet<usize>>,
     entity_name_index: HashMap<String, usize>,
     next_id: usize,
+    /// Embedding dimension of the graph, fixed by the FIRST node and
+    /// persisted with it (A04-F12). `None` only while the graph is empty.
+    dim: Option<usize>,
     /// Fingerprint of the state file this store is in sync with (see
     /// `FileFingerprint`); `synced_set == false` → no file existed when it
     /// was built. Atomic so that `save_to_dir(&self)` — the CLI signature —
@@ -143,21 +173,50 @@ impl GaussianGraphStore {
             type_index: HashMap::new(),
             entity_name_index: HashMap::new(),
             next_id: 1,
+            dim: None,
             synced_len: AtomicU64::new(0),
             synced_hash: AtomicU64::new(0),
             synced_set: AtomicBool::new(false),
         }
     }
 
-    /// Validate embedding dimensions are within bounds.
-    fn validate_embedding(embedding: &[f32]) -> Result<(), GraphError> {
+    /// An embedding usable as a vector of this graph: within bounds, not
+    /// empty, every component finite (NaN and ±inf would turn every
+    /// similarity into NaN and the ranking into an arbitrary order).
+    fn validate_embedding(embedding: &[f32], context: &'static str) -> Result<(), GraphError> {
         if embedding.len() > MAX_EMBEDDING_DIM {
             return Err(GraphError::EmbeddingTooLarge {
                 dim: embedding.len(),
                 max: MAX_EMBEDDING_DIM,
             });
         }
+        if embedding.is_empty() {
+            return Err(GraphError::EmptyEmbedding { context });
+        }
+        if let Some(index) = embedding.iter().position(|v| !v.is_finite()) {
+            return Err(GraphError::NonFiniteEmbedding { index, context });
+        }
         Ok(())
+    }
+
+    /// The dimension is an invariant of the store: fixed by the first node,
+    /// never changed. A node or a query of another dimension is an error —
+    /// never a silent similarity of 0.0 (A04-F12).
+    fn check_dim(&self, embedding: &[f32], context: &'static str) -> Result<(), GraphError> {
+        match self.dim {
+            Some(expected) if expected != embedding.len() => Err(GraphError::DimMismatch {
+                expected,
+                got: embedding.len(),
+                context,
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// A query vector must be usable and live in the graph's vector space.
+    fn check_query(&self, query_emb: &[f32]) -> Result<(), GraphError> {
+        Self::validate_embedding(query_emb, "query")?;
+        self.check_dim(query_emb, "query")
     }
 
     /// Validate content string length.
@@ -176,12 +235,16 @@ impl GaussianGraphStore {
     /// # Errors
     /// Returns `GraphError::EmbeddingTooLarge` if embedding dimension exceeds `MAX_EMBEDDING_DIM`.
     /// Returns `GraphError::ContentTooLong` if content exceeds `MAX_CONTENT_LEN`.
+    /// Returns `GraphError::NonFiniteEmbedding` / `GraphError::EmptyEmbedding` for an unusable vector.
+    /// Returns `GraphError::DimMismatch` if the graph already holds vectors of another dimension.
     pub fn add_document(&mut self, text: &str, embedding: &[f32]) -> Result<usize, GraphError> {
-        Self::validate_embedding(embedding)?;
+        Self::validate_embedding(embedding, "add_document")?;
         Self::validate_content(text)?;
+        self.check_dim(embedding, "add_document")?;
 
         let id = self.next_id;
         self.next_id += 1;
+        self.dim.get_or_insert(embedding.len());
         self.nodes.insert(
             id,
             GraphNode {
@@ -211,8 +274,12 @@ impl GaussianGraphStore {
         embedding: &[f32],
         entity_type: &str,
     ) -> Result<usize, GraphError> {
-        Self::validate_embedding(embedding)?;
+        Self::validate_embedding(embedding, "add_entity")?;
         Self::validate_content(name)?;
+        // Checked BEFORE the name dedup: an existing entity re-added with a
+        // vector of another dimension is a misconfiguration to report, not
+        // to hide behind its old id.
+        self.check_dim(embedding, "add_entity")?;
 
         let key = name.to_lowercase();
         if let Some(&id) = self.entity_name_index.get(&key) {
@@ -221,6 +288,7 @@ impl GaussianGraphStore {
 
         let id = self.next_id;
         self.next_id += 1;
+        self.dim.get_or_insert(embedding.len());
         let mut node = GraphNode {
             id,
             node_type: NodeType::Entity,
@@ -254,6 +322,11 @@ impl GaussianGraphStore {
 
     /// Add a relation edge between two nodes.
     ///
+    /// Idempotent on `(source, target, relation_type)` (A04-F11): `Ok(true)`
+    /// when the edge was created, `Ok(false)` when that same relation
+    /// already exists — nothing is inserted, the degree does not change and
+    /// the existing edge keeps its weight. Another type is another relation.
+    ///
     /// # Errors
     /// Returns `GraphError::NodeNotFound` if source or target doesn't exist.
     /// Returns `GraphError::InvalidWeight` if weight is NaN or infinite.
@@ -263,7 +336,7 @@ impl GaussianGraphStore {
         target_id: usize,
         relation_type: &str,
         weight: f64,
-    ) -> Result<(), GraphError> {
+    ) -> Result<bool, GraphError> {
         if !weight.is_finite() {
             return Err(GraphError::InvalidWeight);
         }
@@ -272,6 +345,9 @@ impl GaussianGraphStore {
         }
         if !self.nodes.contains_key(&target_id) {
             return Err(GraphError::NodeNotFound { id: target_id });
+        }
+        if self.has_relation(source_id, target_id, relation_type) {
+            return Ok(false);
         }
 
         let edge_idx = self.edges.len();
@@ -283,7 +359,21 @@ impl GaussianGraphStore {
         });
         self.outgoing.entry(source_id).or_default().push(edge_idx);
         self.incoming.entry(target_id).or_default().push(edge_idx);
-        Ok(())
+        Ok(true)
+    }
+
+    /// Whether the exact relation `(source, target, relation_type)` exists.
+    fn has_relation(&self, source_id: usize, target_id: usize, relation_type: &str) -> bool {
+        self.outgoing.get(&source_id).is_some_and(|indices| {
+            indices
+                .iter()
+                .filter_map(|&i| self.edges.get(i))
+                .any(|edge| {
+                    edge.source_id == source_id
+                        && edge.target_id == target_id
+                        && edge.relation_type == relation_type
+                })
+        })
     }
 
     /// Get a node by ID.
@@ -327,32 +417,41 @@ impl GaussianGraphStore {
 
     /// Search entities by embedding similarity.
     ///
-    /// Returns the top-k entities most similar to `query_emb`.
-    /// Returns empty Vec if no entities exist.
-    pub fn search_entities(&self, query_emb: &[f32], k: usize) -> Vec<&GraphNode> {
-        let entity_ids = self
+    /// The top-k entities most similar to `query_emb`, ordered by
+    /// `(similarity descending, node id ascending)` — equal scores never
+    /// depend on hash iteration order (A04-F12). An empty graph answers an
+    /// empty list.
+    ///
+    /// # Errors
+    /// Returns `GraphError::DimMismatch` if `query_emb` has another dimension
+    /// than the graph (never "everything is similar at 0.0"),
+    /// `GraphError::NonFiniteEmbedding` / `GraphError::EmptyEmbedding` /
+    /// `GraphError::EmbeddingTooLarge` for an unusable query vector.
+    pub fn search_entities(
+        &self,
+        query_emb: &[f32],
+        k: usize,
+    ) -> Result<Vec<&GraphNode>, GraphError> {
+        self.check_query(query_emb)?;
+        let mut scored: Vec<(usize, f64)> = self
             .type_index
             .get(&NodeType::Entity)
-            .map(|s| s.iter().copied().collect::<Vec<_>>())
-            .unwrap_or_default();
-        if entity_ids.is_empty() {
-            return Vec::new();
-        }
-
-        let mut scored: Vec<(usize, f32)> = entity_ids
-            .iter()
-            .filter_map(|&id| {
-                self.nodes
-                    .get(&id)
-                    .map(|n| (id, cosine_sim(query_emb, &n.embedding)))
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|&id| {
+                        self.nodes
+                            .get(&id)
+                            .map(|n| (id, cosine_sim(query_emb, &n.embedding)))
+                    })
+                    .collect()
             })
-            .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            .unwrap_or_default();
+        order_by_score_then_id(&mut scored);
         scored.truncate(k);
-        scored
+        Ok(scored
             .into_iter()
             .filter_map(|(id, _)| self.nodes.get(&id))
-            .collect()
+            .collect())
     }
 
     /// BFS traversal from a start node.
@@ -396,41 +495,77 @@ impl GaussianGraphStore {
         result
     }
 
-    /// Hybrid search: vector similarity + graph context boost.
-    pub fn hybrid_search(&self, query_emb: &[f32], k: usize) -> Vec<HybridResult> {
-        let doc_ids = self
-            .type_index
-            .get(&NodeType::Document)
-            .map(|s| s.iter().copied().collect::<Vec<_>>())
-            .unwrap_or_default();
-        if doc_ids.is_empty() {
-            return Vec::new();
-        }
+    /// Hybrid search: vector similarity, with the graph degree prior as an
+    /// opt-in (A04-F11).
+    ///
+    /// `score` is the RAW cosine similarity of the document to the query —
+    /// the ranking is the same whatever the node's degree. The degree prior
+    /// `min(GRAPH_BOOST_PER_EDGE × outgoing edges, GRAPH_BOOST_CAP)` is
+    /// reported in [`HybridResult::graph_boost`] as an annotation and
+    /// reorders only through [`Self::hybrid_search_with`] with
+    /// [`ScoreMode::CosinePlusGraphBoost`]. Results are ordered by
+    /// `(score descending, node id ascending)`; an empty graph answers an
+    /// empty list.
+    ///
+    /// # Errors
+    /// Same contract as [`Self::search_entities`].
+    pub fn hybrid_search(
+        &self,
+        query_emb: &[f32],
+        k: usize,
+    ) -> Result<Vec<HybridResult>, GraphError> {
+        self.hybrid_search_with(query_emb, k, ScoreMode::Cosine)
+    }
 
-        let mut scored: Vec<(usize, f64)> = doc_ids
+    /// [`Self::hybrid_search`] under an explicit `mode`.
+    pub fn hybrid_search_with(
+        &self,
+        query_emb: &[f32],
+        k: usize,
+        mode: ScoreMode,
+    ) -> Result<Vec<HybridResult>, GraphError> {
+        self.check_query(query_emb)?;
+        let Some(doc_ids) = self.type_index.get(&NodeType::Document) else {
+            return Ok(Vec::new());
+        };
+
+        let mut scored: Vec<(usize, f64, f64)> = doc_ids
             .iter()
             .filter_map(|&id| {
                 self.nodes.get(&id).map(|node| {
-                    let sim = cosine_sim(query_emb, &node.embedding) as f64;
-                    let graph_boost = (self.outgoing_count(id) as f64 * 0.05).min(0.2);
-                    (id, sim + graph_boost)
+                    let cosine = cosine_sim(query_emb, &node.embedding);
+                    let boost = degree_prior(self.outgoing_count(id));
+                    let score = match mode {
+                        ScoreMode::Cosine => cosine,
+                        ScoreMode::CosinePlusGraphBoost => cosine + boost,
+                    };
+                    (id, score, boost)
                 })
             })
             .collect();
-
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // (score desc, node id asc): a total order — cosine is finite for
+        // every finite input (f64 accumulation), and `total_cmp` orders the rest.
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         scored.truncate(k);
-        scored
+        Ok(scored
             .into_iter()
-            .filter_map(|(id, score)| {
+            .filter_map(|(id, score, boost)| {
                 self.nodes.get(&id).map(|n| HybridResult {
                     node_id: id,
                     content: n.content.clone(),
                     score,
+                    graph_boost: boost,
+                    score_mode: mode,
                     node_type: n.node_type,
                 })
             })
-            .collect()
+            .collect())
+    }
+
+    /// Embedding dimension of the graph: `None` while it has no node,
+    /// `Some(dim)` fixed by the first node from then on (A04-F12).
+    pub fn embedding_dim(&self) -> Option<usize> {
+        self.dim
     }
 
     /// Graph statistics.
@@ -473,6 +608,7 @@ impl GaussianGraphStore {
         let doc = GraphFile {
             version: GRAPH_STATE_VERSION,
             next_id: self.next_id,
+            dim: self.dim,
             nodes,
             edges: self.edges.clone(),
         };
@@ -595,7 +731,16 @@ impl GaussianGraphStore {
         }
 
         let mut store = GaussianGraphStore::new();
+        // A04-F12: one vector space per graph. The file's `dim` (when it has
+        // one — files older than F05d don't) and the first node both fix it;
+        // a node of another dimension, empty or non-finite, is a corrupt
+        // state: refused here, never searched as "similarity 0.0".
+        store.dim = doc.dim;
         for node in doc.nodes {
+            Self::validate_embedding(&node.embedding, "state file")
+                .and_then(|()| store.check_dim(&node.embedding, "state file"))
+                .map_err(|e| GraphError::Io(format!("parse {}: {e}", path.display())))?;
+            store.dim.get_or_insert(node.embedding.len());
             let id = node.id;
             if store.nodes.insert(id, node).is_some() {
                 return Err(GraphError::Io(format!(
@@ -623,13 +768,28 @@ impl GaussianGraphStore {
 
         // Adjacency rebuilt in this store's edge-index space; both endpoints
         // must exist (no silent dangling edges in a corrupt file).
-        for (edge_idx, edge) in doc.edges.into_iter().enumerate() {
+        // One edge per (source, target, relation_type): a file written before
+        // F05d may repeat a relation (add_relation did not dedupe) — the
+        // first occurrence wins, so a loaded degree is never inflated.
+        for edge in doc.edges {
             if !store.nodes.contains_key(&edge.source_id) {
                 return Err(GraphError::NodeNotFound { id: edge.source_id });
             }
             if !store.nodes.contains_key(&edge.target_id) {
                 return Err(GraphError::NodeNotFound { id: edge.target_id });
             }
+            if !edge.weight.is_finite() {
+                return Err(GraphError::Io(format!(
+                    "parse {}: edge {} -> {} has a non-finite weight",
+                    path.display(),
+                    edge.source_id,
+                    edge.target_id
+                )));
+            }
+            if store.has_relation(edge.source_id, edge.target_id, &edge.relation_type) {
+                continue;
+            }
+            let edge_idx = store.edges.len();
             let (s, t) = (edge.source_id, edge.target_id);
             store.edges.push(edge);
             store.outgoing.entry(s).or_default().push(edge_idx);
@@ -751,6 +911,7 @@ impl Clone for GaussianGraphStore {
         copy.type_index = self.type_index.clone();
         copy.entity_name_index = self.entity_name_index.clone();
         copy.next_id = self.next_id;
+        copy.dim = self.dim;
         copy.set_synced(self.synced());
         copy
     }
@@ -767,8 +928,50 @@ impl Default for GaussianGraphStore {
 pub struct HybridResult {
     pub node_id: usize,
     pub content: String,
+    /// What the ranking used: the raw cosine, or cosine + `graph_boost`
+    /// under explicit opt-in. See `score_mode`.
     pub score: f64,
+    /// Degree prior `min(GRAPH_BOOST_PER_EDGE × outgoing edges,
+    /// GRAPH_BOOST_CAP)` — always reported, never part of `score` unless
+    /// `score_mode` is [`ScoreMode::CosinePlusGraphBoost`] (A04-F11).
+    pub graph_boost: f64,
+    pub score_mode: ScoreMode,
     pub node_type: NodeType,
+}
+
+/// What `HybridResult::score` is (A04-F11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoreMode {
+    /// Raw cosine similarity — the default; the degree never reorders.
+    Cosine,
+    /// Explicit opt-in: `cosine + min(GRAPH_BOOST_PER_EDGE × outgoing
+    /// edges, GRAPH_BOOST_CAP)`.
+    CosinePlusGraphBoost,
+}
+
+impl ScoreMode {
+    /// The label the MCP and CLI responses carry as `score_mode`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cosine => "cosine",
+            Self::CosinePlusGraphBoost => "cosine+graph_boost",
+        }
+    }
+}
+
+/// Degree prior per outgoing edge (opt-in boost, A04-F11).
+pub const GRAPH_BOOST_PER_EDGE: f64 = 0.05;
+/// Ceiling of the degree prior: four or more outgoing edges saturate it.
+pub const GRAPH_BOOST_CAP: f64 = 0.2;
+
+fn degree_prior(outgoing_edges: usize) -> f64 {
+    (outgoing_edges as f64 * GRAPH_BOOST_PER_EDGE).min(GRAPH_BOOST_CAP)
+}
+
+/// `(score descending, node id ascending)`: a total order, so equal scores
+/// never depend on hash iteration order (A04-F12).
+fn order_by_score_then_id(scored: &mut [(usize, f64)]) {
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 }
 
 /// Graph statistics.
@@ -781,20 +984,37 @@ pub struct GraphStats {
     pub concepts: usize,
 }
 
-/// Compute cosine similarity between two vectors.
-/// Returns 0.0 if either vector has zero magnitude.
-fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
+/// Cosine similarity between two vectors of the SAME dimension, accumulated
+/// in f64: finite for every finite f32 input, so scores are a total order.
+/// Returns 0.0 if either vector has zero magnitude. The dimension equality is
+/// the store's invariant (`GaussianGraphStore::check_dim`), never papered
+/// over here with a 0.0 (A04-F12).
+fn cosine_sim(a: &[f32], b: &[f32]) -> f64 {
+    debug_assert_eq!(
+        a.len(),
+        b.len(),
+        "cosine over vectors of different dimensions"
+    );
+    let dot: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(&x, &y)| f64::from(x) * f64::from(y))
+        .sum();
+    let norm = |v: &[f32]| {
+        v.iter()
+            .map(|&x| f64::from(x) * f64::from(x))
+            .sum::<f64>()
+            .sqrt()
+    };
+    let d = norm(a) * norm(b);
+    if d < 1e-8 {
         return 0.0;
     }
-    let dot: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum();
-    let na: f32 = a.iter().map(|v| v * v).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|v| v * v).sum::<f32>().sqrt();
-    let d = na * nb;
-    if d < 1e-8 {
+    let sim = (dot / d).clamp(-1.0, 1.0);
+    if sim == 0.0 {
         0.0
     } else {
-        dot / d
+        sim
     }
 }
 
@@ -848,7 +1068,7 @@ mod tests {
         g.add_entity("Cat", &[1.0, 0.0], "animal").unwrap();
         g.add_entity("Dog", &[0.9, 0.1], "animal").unwrap();
         g.add_entity("Car", &[0.0, 1.0], "vehicle").unwrap();
-        let r = g.search_entities(&[1.0, 0.0], 2);
+        let r = g.search_entities(&[1.0, 0.0], 2).unwrap();
         assert!(!r.is_empty());
         assert_eq!(r[0].content, "Cat");
     }
@@ -905,7 +1125,7 @@ mod tests {
             .unwrap();
         let e = g.add_entity("Python", &[0.9, 0.1, 0.0], "lang").unwrap();
         g.add_relation(d, e, "MENTIONS", 0.9).unwrap();
-        let r = g.hybrid_search(&[1.0, 0.0, 0.0], 5);
+        let r = g.hybrid_search(&[1.0, 0.0, 0.0], 5).unwrap();
         assert!(!r.is_empty());
         assert!(r[0].score > 0.0);
     }
@@ -937,11 +1157,9 @@ mod tests {
         assert!(matches!(result, Err(GraphError::ContentTooLong { .. })));
     }
 
-    #[test]
-    fn test_cosine_sim_mismatched_dims() {
-        let sim = cosine_sim(&[1.0, 0.0], &[1.0]);
-        assert_eq!(sim, 0.0);
-    }
+    // `test_cosine_sim_mismatched_dims` used to pin the 0.0 of a dimension
+    // mismatch — the bug of A04-F12. The contract is now an explicit error,
+    // pinned by `f05d_query_with_another_dimension_is_not_a_zero_similarity`.
 
     #[test]
     fn test_cosine_sim_zero_vectors() {
@@ -1256,11 +1474,14 @@ mod tests {
             .collect();
         assert_eq!(
             keys,
-            ["edges", "next_id", "nodes", "version"]
+            ["dim", "edges", "next_id", "nodes", "version"]
                 .into_iter()
                 .collect()
         );
         assert_eq!(doc["version"], serde_json::json!(1));
+        // A04-F12: the embedding dimension travels with the state (v1 +
+        // one optional field; older files simply lack it).
+        assert_eq!(doc["dim"], serde_json::json!(2));
         let nodes = doc["nodes"].as_array().unwrap();
         let ids: Vec<u64> = nodes.iter().map(|n| n["id"].as_u64().unwrap()).collect();
         assert_eq!(
@@ -1464,7 +1685,7 @@ mod tests {
     #[test]
     fn f05d_default_ranking_is_the_raw_cosine_and_degree_does_not_reorder() {
         let (g, a, b) = f05d_graph_with_a_popular_b();
-        let r = g.hybrid_search(&F05D_QUERY, 10);
+        let r = g.hybrid_search(&F05D_QUERY, 10).unwrap();
         assert_eq!(
             r[0].node_id, a,
             "A (cos 0.90, 0 edges) must rank first, not B (cos 0.75, 5 edges)"
@@ -1480,6 +1701,72 @@ mod tests {
             "`score` must be the raw cosine, got {}",
             r[1].score
         );
+        assert_eq!(r[0].score_mode, ScoreMode::Cosine);
+        assert_eq!(r[0].graph_boost, 0.0);
+        // The prior is still reported for B — as an annotation.
+        assert!((r[1].graph_boost - 0.2).abs() < 1e-9);
+        assert_eq!(r[1].score_mode, ScoreMode::Cosine);
+    }
+
+    #[test]
+    fn f05d_boost_reorders_only_on_opt_in_and_follows_the_documented_formula() {
+        let (g, a, b) = f05d_graph_with_a_popular_b();
+        let opt_in = g
+            .hybrid_search_with(&F05D_QUERY, 10, ScoreMode::CosinePlusGraphBoost)
+            .unwrap();
+        assert_eq!(opt_in[0].node_id, b, "opt-in: cosine + boost ranks B first");
+        assert_eq!(opt_in[1].node_id, a);
+        assert!((opt_in[0].score - 0.95).abs() < 1e-5, "{}", opt_in[0].score);
+        assert!((opt_in[1].score - 0.90).abs() < 1e-5, "{}", opt_in[1].score);
+        assert_eq!(opt_in[0].score_mode, ScoreMode::CosinePlusGraphBoost);
+        assert_eq!(opt_in[1].score_mode, ScoreMode::CosinePlusGraphBoost);
+        assert_eq!(opt_in[0].score_mode.label(), "cosine+graph_boost");
+
+        // The prior saturates at GRAPH_BOOST_CAP, whatever the degree.
+        let mut g = GaussianGraphStore::new();
+        let d = g.add_document("D", &f05d_doc_at(0.5)).unwrap();
+        for i in 0..40 {
+            let e = g
+                .add_entity(&format!("e{i}"), &[0.0, 0.0, 1.0, 0.0], "x")
+                .unwrap();
+            g.add_relation(d, e, "R", 1.0).unwrap();
+        }
+        assert_eq!(g.outgoing_count(d), 40);
+        let r = g
+            .hybrid_search_with(&F05D_QUERY, 1, ScoreMode::CosinePlusGraphBoost)
+            .unwrap();
+        assert_eq!(r[0].graph_boost, GRAPH_BOOST_CAP);
+        assert!((r[0].score - (0.5 + GRAPH_BOOST_CAP)).abs() < 1e-5);
+        // ... and never leaks into the default.
+        let r = g.hybrid_search(&F05D_QUERY, 1).unwrap();
+        assert!((r[0].score - 0.5).abs() < 1e-5, "{}", r[0].score);
+    }
+
+    #[test]
+    fn f05d_empty_graph_answers_empty_and_an_unusable_query_is_an_error() {
+        let g = GaussianGraphStore::new();
+        assert_eq!(g.embedding_dim(), None);
+        assert!(g.hybrid_search(&F05D_QUERY, 5).unwrap().is_empty());
+        assert!(g.search_entities(&F05D_QUERY, 5).unwrap().is_empty());
+        assert!(matches!(
+            g.hybrid_search(&[f32::NAN], 5),
+            Err(GraphError::NonFiniteEmbedding {
+                context: "query",
+                ..
+            })
+        ));
+        assert!(matches!(
+            g.hybrid_search(&[], 5),
+            Err(GraphError::EmptyEmbedding { context: "query" })
+        ));
+        assert!(matches!(
+            g.search_entities(&[f32::INFINITY, 0.0], 5),
+            Err(GraphError::NonFiniteEmbedding {
+                context: "query",
+                index: 0
+            })
+        ));
+        assert!(g.embedding_dim().is_none(), "a refused query fixed nothing");
     }
 
     #[test]
@@ -1487,9 +1774,13 @@ mod tests {
         let mut g = GaussianGraphStore::new();
         let d = g.add_document("D", &[1.0, 0.0]).unwrap();
         let e = g.add_entity("E", &[0.0, 1.0], "concept").unwrap();
-        g.add_relation(d, e, "MENTIONS", 0.9).unwrap();
+        assert_eq!(g.add_relation(d, e, "MENTIONS", 0.9), Ok(true));
         for _ in 0..4 {
-            g.add_relation(d, e, "MENTIONS", 0.9).unwrap();
+            assert_eq!(
+                g.add_relation(d, e, "MENTIONS", 0.9),
+                Ok(false),
+                "a repeated relation was inserted again"
+            );
         }
         assert_eq!(g.n_edges(), 1, "repeating a relation must not duplicate it");
         assert_eq!(
@@ -1536,11 +1827,13 @@ mod tests {
             "a NaN embedding was accepted"
         );
         assert!(
-            g.add_document("inf", &[f32::INFINITY, 0.0, 0.0, 0.0]).is_err(),
+            g.add_document("inf", &[f32::INFINITY, 0.0, 0.0, 0.0])
+                .is_err(),
             "an infinite embedding was accepted"
         );
         assert!(
-            g.add_document("-inf", &[f32::NEG_INFINITY, 0.0, 0.0, 0.0]).is_err(),
+            g.add_document("-inf", &[f32::NEG_INFINITY, 0.0, 0.0, 0.0])
+                .is_err(),
             "a -inf embedding was accepted"
         );
         assert!(
@@ -1554,17 +1847,28 @@ mod tests {
     #[test]
     fn f05d_query_with_another_dimension_is_not_a_zero_similarity() {
         let (g, _a, _b) = f05d_graph_with_a_popular_b();
-        let entities = g.search_entities(&[1.0, 0.0], 5);
-        assert!(
-            entities.is_empty(),
-            "a 2-d query against a 4-d graph returned {} 'most similar' entities",
-            entities.len()
+        assert_eq!(g.embedding_dim(), Some(4));
+        assert_eq!(
+            g.search_entities(&[1.0, 0.0], 5).err(),
+            Some(GraphError::DimMismatch {
+                expected: 4,
+                got: 2,
+                context: "query"
+            })
         );
-        let docs = g.hybrid_search(&[1.0, 0.0], 5);
+        assert_eq!(
+            g.hybrid_search(&[1.0, 0.0], 5).err(),
+            Some(GraphError::DimMismatch {
+                expected: 4,
+                got: 2,
+                context: "query"
+            })
+        );
+        // ... and the error says what happened.
+        let err = g.hybrid_search(&[1.0; 7], 5).unwrap_err().to_string();
         assert!(
-            docs.is_empty(),
-            "a 2-d query against a 4-d graph returned {} 'most similar' documents",
-            docs.len()
+            err.contains("4-dim") && err.contains("got 7") && err.contains("query"),
+            "{err}"
         );
     }
 
@@ -1575,7 +1879,7 @@ mod tests {
             g.add_entity(&format!("same {i}"), &[0.0, 1.0, 0.0, 0.0], "concept")
                 .unwrap();
         }
-        let entities = g.search_entities(&F05D_QUERY, 16);
+        let entities = g.search_entities(&F05D_QUERY, 16).unwrap();
         let ids: Vec<usize> = entities.iter().map(|n| n.id).collect();
         assert_eq!(
             ids,
@@ -1583,9 +1887,10 @@ mod tests {
             "equal scores must be ordered by ascending node id"
         );
         for i in 0..16u32 {
-            g.add_document(&format!("doc {i}"), &[0.0, 1.0, 0.0, 0.0]).unwrap();
+            g.add_document(&format!("doc {i}"), &[0.0, 1.0, 0.0, 0.0])
+                .unwrap();
         }
-        let docs = g.hybrid_search(&F05D_QUERY, 16);
+        let docs = g.hybrid_search(&F05D_QUERY, 16).unwrap();
         let ids: Vec<usize> = docs.iter().map(|r| r.node_id).collect();
         assert_eq!(
             ids,
@@ -1616,16 +1921,51 @@ mod tests {
         let path = g.save_to_dir(&dir).unwrap();
         assert!(path.exists());
         let mut g2 = GaussianGraphStore::load_from_dir(&dir).unwrap();
+        assert_eq!(g2.embedding_dim(), Some(4), "the dimension is persisted");
         assert!(
             g2.add_document("3-d", &[1.0, 0.0, 0.0]).is_err(),
             "after a reload the 4-d invariant was forgotten"
         );
         assert!(
-            g2.hybrid_search(&[1.0, 0.0], 5).is_empty(),
+            g2.hybrid_search(&[1.0, 0.0], 5).is_err(),
             "after a reload a 3-d query ranked the 4-d graph"
         );
         g2.add_document("4-d", &f05d_doc_at(0.5)).unwrap();
         assert_eq!(g2.n_nodes(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file written before F05d has no `dim`: its nodes fix it, and a
+    /// relation the old `add_relation` duplicated loads as ONE edge.
+    #[test]
+    fn f05d_legacy_state_without_dim_field_loads_and_derives_the_dimension() {
+        let dir = f05c_dir("legacy-no-dim");
+        let legacy = br#"{"version":1,"next_id":3,"nodes":[{"id":1,"node_type":"Document","content":"doc","embedding":[1.0,0.0,0.0],"alpha":1.0,"kappa":10.0},{"id":2,"node_type":"Entity","content":"ent","embedding":[0.0,1.0,0.0],"alpha":0.8,"kappa":15.0}],"edges":[{"source_id":1,"target_id":2,"relation_type":"MENTIONS","weight":1.0},{"source_id":1,"target_id":2,"relation_type":"MENTIONS","weight":1.0}]}"#;
+        std::fs::write(f05c_state(&dir), &legacy[..]).unwrap();
+        let mut g = GaussianGraphStore::load_from_dir(&dir).unwrap();
+        assert_eq!(g.embedding_dim(), Some(3));
+        assert_eq!(g.n_nodes(), 2);
+        assert_eq!(g.n_edges(), 1, "a duplicated relation inflated the degree");
+        assert!(g.add_document("4-d", &f05d_doc_at(0.5)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `dim` a file declares is binding: a node that contradicts it is a
+    /// corrupt state, refused without touching the file.
+    #[test]
+    fn f05d_declared_dim_that_the_nodes_contradict_fails_closed() {
+        let dir = f05c_dir("dim-contradiction");
+        let lie = br#"{"version":1,"next_id":3,"dim":5,"nodes":[{"id":1,"node_type":"Document","content":"doc","embedding":[1.0,0.0,0.0],"alpha":1.0,"kappa":10.0}],"edges":[]}"#;
+        std::fs::write(f05c_state(&dir), &lie[..]).unwrap();
+        let err = GaussianGraphStore::load_from_dir(&dir)
+            .err()
+            .expect("a file whose dim contradicts its nodes loaded")
+            .to_string();
+        assert!(
+            err.contains("dimension") && err.contains(GRAPH_STATE_FILENAME),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(f05c_state(&dir)).unwrap(), lie.as_slice());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

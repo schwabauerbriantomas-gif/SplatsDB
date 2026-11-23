@@ -136,11 +136,7 @@ impl Server {
 
     /// `tools/call` → (is_error, parsed tool payload or the raw error text).
     fn tool(&mut self, id: u64, name: &str, args: Value) -> (bool, Value) {
-        let v = self.rpc(
-            id,
-            "tools/call",
-            json!({ "name": name, "arguments": args }),
-        );
+        let v = self.rpc(id, "tools/call", json!({ "name": name, "arguments": args }));
         let is_error = v
             .pointer("/result/isError")
             .and_then(|b| b.as_bool())
@@ -189,7 +185,10 @@ impl Server {
     fn wait_ready(&mut self) -> bool {
         let ready = self.wait_stderr_containing("MCP server ready", STARTUP_TIMEOUT);
         if !ready {
-            eprintln!("server never became ready; stderr:\n{}", self.err_log.join("\n"));
+            eprintln!(
+                "server never became ready; stderr:\n{}",
+                self.err_log.join("\n")
+            );
         }
         ready
     }
@@ -225,7 +224,11 @@ impl Server {
     /// Send `sig` to the server process (by pid — never by name).
     fn signal(&self, sig: i32) {
         let pid: i32 = self.child.id().try_into().expect("pid fits in i32");
-        assert_eq!(unsafe { libc::kill(pid, sig) }, 0, "kill({pid}, {sig}) failed");
+        assert_eq!(
+            unsafe { libc::kill(pid, sig) },
+            0,
+            "kill({pid}, {sig}) failed"
+        );
     }
 
     /// Wait for the exit, for at most `bound`. Returns the status and the
@@ -346,7 +349,9 @@ fn state_path(dir: &Path) -> PathBuf {
 }
 
 fn cosine_of(result: &Value) -> f64 {
-    result["score"].as_f64().unwrap_or_else(|| panic!("no score in {result}"))
+    result["score"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("no score in {result}"))
 }
 
 /// Fake embed service with CHOSEN vectors: a text carrying `V:<x>:<y>` gets
@@ -370,8 +375,7 @@ fn spawn_vector_server(dim: usize) -> String {
                     let head = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
                     break (
                         pos + 4,
-                        head
-                            .lines()
+                        head.lines()
                             .find_map(|l| l.strip_prefix("content-length:"))
                             .and_then(|v| v.trim().parse::<usize>().ok())
                             .unwrap_or(0),
@@ -388,7 +392,8 @@ fn spawn_vector_server(dim: usize) -> String {
                     Ok(n) => buf.extend_from_slice(&chunk[..n]),
                 }
             }
-            let body = String::from_utf8_lossy(&buf[head_end.min(buf.len())..]).to_ascii_lowercase();
+            let body =
+                String::from_utf8_lossy(&buf[head_end.min(buf.len())..]).to_ascii_lowercase();
             let mut vector = vec![0.0f64; dim];
             vector[2] = 1.0;
             if let Some((x, y)) = parse_xy(&body) {
@@ -532,11 +537,7 @@ fn s02_graph_search_reorders_by_the_boost_only_with_explicit_opt_in() {
         (results[0]["graph_boost"].as_f64().unwrap() - 0.2).abs() < 1e-9,
         "{r}"
     );
-    assert_eq!(
-        results[0]["score_mode"],
-        json!("cosine+graph_boost"),
-        "{r}"
-    );
+    assert_eq!(results[0]["score_mode"], json!("cosine+graph_boost"), "{r}");
 
     // The default is unchanged after an opt-in call.
     let r = srv.ok(
@@ -559,13 +560,24 @@ fn s03_add_relation_is_idempotent_and_the_degree_stays_at_one_edge() {
     assert_eq!(first["created"], json!(true), "{first}");
     for i in 41..45u64 {
         let again = srv.add_relation(i, a, b, "CITES");
-        assert_eq!(again["created"], json!(false), "a repeated relation was inserted again: {again}");
+        assert_eq!(
+            again["created"],
+            json!(false),
+            "a repeated relation was inserted again: {again}"
+        );
     }
     let stats = srv.stats(50);
-    assert_eq!(stats["total_edges"], json!(6), "5 MENTIONS + 1 CITES: {stats}");
     assert_eq!(
-        srv.ok(51, "splatsdb_graph_search", json!({ "query": "QUERY V:1:0", "k": 10 }))
-            ["results"][1]["graph_boost"],
+        stats["total_edges"],
+        json!(6),
+        "5 MENTIONS + 1 CITES: {stats}"
+    );
+    assert_eq!(
+        srv.ok(
+            51,
+            "splatsdb_graph_search",
+            json!({ "query": "QUERY V:1:0", "k": 10 })
+        )["results"][1]["graph_boost"],
         json!(0.2),
         "A's degree did not change by repeating the relation"
     );
@@ -643,22 +655,24 @@ fn s05_query_of_another_dimension_than_the_graph_is_a_controlled_error() {
     let url = spawn_vector_server(embedding_dim());
     let mut srv = spawn(&dir.join("docs.db"), &[("SPLATSDB_EMBED_URL", &url)]);
     assert!(srv.wait_ready(), "{}", srv.err_log.join("\n"));
-    assert_eq!(srv.stats(1)["total_nodes"], json!(2), "the 3-d legacy graph must load");
+    assert_eq!(
+        srv.stats(1)["total_nodes"],
+        json!(2),
+        "the 3-d legacy graph must load"
+    );
 
     // The query vector has the STORE's dimension, the graph has 3: an error,
     // never "the most similar" nodes at a silent similarity of 0.0.
-    for (i, tool) in [
-        "splatsdb_graph_search",
-        "splatsdb_graph_search_entities",
-    ]
-    .into_iter()
-    .enumerate()
+    for (i, tool) in ["splatsdb_graph_search", "splatsdb_graph_search_entities"]
+        .into_iter()
+        .enumerate()
     {
-        let err = srv.error(10 + i as u64, tool, json!({ "query": "QUERY V:1:0", "k": 5 }));
-        assert!(
-            err.to_lowercase().contains("dimension"),
-            "{tool}: {err}"
+        let err = srv.error(
+            10 + i as u64,
+            tool,
+            json!({ "query": "QUERY V:1:0", "k": 5 }),
         );
+        assert!(err.to_lowercase().contains("dimension"), "{tool}: {err}");
     }
     // A node of the store's dimension does not join a 3-d graph either.
     let err = srv.error(20, "splatsdb_graph_add_doc", json!({ "text": "new" }));
@@ -681,7 +695,11 @@ fn s06_legacy_state_mixing_dimensions_fails_closed_and_is_never_overwritten() {
     let mut srv = spawn(&dir.join("docs.db"), &[]);
     assert!(srv.wait_ready(), "{}", srv.err_log.join("\n"));
     let status = srv.status(1);
-    assert_eq!(status["graph_persistence"]["state"], json!("corrupt"), "{status}");
+    assert_eq!(
+        status["graph_persistence"]["state"],
+        json!("corrupt"),
+        "{status}"
+    );
     let err = srv.error(2, "splatsdb_graph_add_doc", json!({ "text": "not stored" }));
     assert!(err.contains("unreadable"), "{err}");
     assert_eq!(
@@ -690,7 +708,10 @@ fn s06_legacy_state_mixing_dimensions_fails_closed_and_is_never_overwritten() {
         "a state file that failed to load must never be overwritten"
     );
     // Still corrupt after the refused mutation, and nothing was persisted.
-    assert_eq!(srv.status(3)["graph_persistence"]["state"], json!("corrupt"));
+    assert_eq!(
+        srv.status(3)["graph_persistence"]["state"],
+        json!("corrupt")
+    );
     assert_eq!(srv.stats(4)["total_nodes"], json!(0));
     srv.shutdown();
 }
@@ -752,7 +773,8 @@ fn t01_search_keeps_the_text_of_a_doc_evicted_from_the_10k_cache_with_top_k_100(
 
     let status = srv.status(1);
     assert_eq!(
-        status["vector_persistence"]["warm_start"]["documents"], json!(10_001),
+        status["vector_persistence"]["warm_start"]["documents"],
+        json!(10_001),
         "{status}"
     );
 

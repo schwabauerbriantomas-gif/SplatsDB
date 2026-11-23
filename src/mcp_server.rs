@@ -764,7 +764,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "splatsdb_graph_add_relation",
-            "description": "Add a directed edge between two nodes in the knowledge graph.",
+            "description": "Add a directed edge between two nodes in the knowledge graph. Idempotent on (source_id, target_id, relation_type): repeating an existing relation changes nothing (created=false) and never inflates the degree.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -790,12 +790,13 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "splatsdb_graph_search",
-            "description": "Hybrid search over the knowledge graph (vector similarity + graph context boost). Auto-embeds query.",
+            "description": "Search over the document nodes of the knowledge graph. `score` is the RAW cosine similarity (score_mode=cosine): results rank by similarity to the query, never by popularity. Each result also reports `graph_boost`, a degree prior min(0.05 x outgoing edges, 0.2) that is an annotation only — it reorders results solely under the explicit opt-in boost=true (score_mode=cosine+graph_boost, score = cosine + graph_boost). Auto-embeds query.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search query text" },
-                    "k": { "type": "number", "description": "Number of results (default: 10)" }
+                    "k": { "type": "number", "description": "Number of results (default: 10)" },
+                    "boost": { "type": "boolean", "description": "Opt in to rank by cosine + graph_boost (degree prior). Default false: raw cosine only." }
                 },
                 "required": ["query"]
             }
@@ -1570,14 +1571,17 @@ fn handle_graph_add_relation(state: &Mutex<McpState>, params: &Value) -> Result<
         eprintln!("[mcp] mutex poisoned: {}", e);
         "internal server error".to_string()
     })?;
-    s.graph_mutate(|g| g.add_relation(source_id, target_id, relation_type, weight))?;
+    // Idempotent: a relation that already exists is not inserted again.
+    let created =
+        s.graph_mutate(|g| g.add_relation(source_id, target_id, relation_type, weight))?;
 
     eprintln!(
-        "[mcp] graph_add_relation: {} --{}--> {} (w={})",
-        source_id, relation_type, target_id, weight
+        "[mcp] graph_add_relation: {} --{}--> {} (w={}, created={})",
+        source_id, relation_type, target_id, weight, created
     );
     Ok(json!({
         "ok": true,
+        "created": created,
         "source_id": source_id,
         "target_id": target_id,
         "relation_type": relation_type,
@@ -1629,6 +1633,15 @@ fn handle_graph_search(state: &Mutex<McpState>, params: &Value) -> Result<Value,
         return Err("query too long".into());
     }
     let k = params["k"].as_u64().unwrap_or(10).min(1000) as usize;
+    // A04-F11: raw cosine by default. The degree prior reorders only under
+    // this explicit opt-in, and `score_mode` tells the client which one it
+    // got.
+    use crate::graph_splat::ScoreMode;
+    let score_mode = if params["boost"].as_bool().unwrap_or(false) {
+        ScoreMode::CosinePlusGraphBoost
+    } else {
+        ScoreMode::Cosine
+    };
 
     let s = state.lock().map_err(|e| {
         eprintln!("[mcp] mutex poisoned: {}", e);
@@ -1644,7 +1657,12 @@ fn handle_graph_search(state: &Mutex<McpState>, params: &Value) -> Result<Value,
         "internal server error".to_string()
     })?;
 
-    let results = s.graph.hybrid_search(&embedding, k);
+    // A graph of another dimension than the query is a controlled error
+    // (A04-F12) — never "the most similar" nodes at a silent 0.0.
+    let results = s
+        .graph
+        .hybrid_search_with(&embedding, k, score_mode)
+        .map_err(|e| e.to_string())?;
 
     let out: Vec<Value> = results
         .iter()
@@ -1653,17 +1671,24 @@ fn handle_graph_search(state: &Mutex<McpState>, params: &Value) -> Result<Value,
                 "node_id": r.node_id,
                 "content": r.content,
                 "score": r.score,
+                "score_mode": r.score_mode.label(),
+                "graph_boost": r.graph_boost,
                 "node_type": format!("{:?}", r.node_type).to_lowercase(),
             })
         })
         .collect();
 
     eprintln!(
-        "[mcp] graph_search: query_len={}, results={}",
+        "[mcp] graph_search: query_len={}, score_mode={}, results={}",
         query.len(),
+        score_mode.label(),
         out.len()
     );
-    Ok(json!({ "results": out, "embedding": embedding_src.label() }))
+    Ok(json!({
+        "results": out,
+        "embedding": embedding_src.label(),
+        "score_mode": score_mode.label(),
+    }))
 }
 
 fn handle_graph_search_entities(state: &Mutex<McpState>, params: &Value) -> Result<Value, String> {
@@ -1687,7 +1712,10 @@ fn handle_graph_search_entities(state: &Mutex<McpState>, params: &Value) -> Resu
         "internal server error".to_string()
     })?;
 
-    let results = s.graph.search_entities(&embedding, k);
+    let results = s
+        .graph
+        .search_entities(&embedding, k)
+        .map_err(|e| e.to_string())?;
 
     let out: Vec<Value> = results
         .iter()
