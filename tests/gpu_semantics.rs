@@ -713,3 +713,294 @@ fn gpu_search_with_a_field_corpus_agrees_with_cpu_before_and_after_a_store() {
     std::fs::remove_dir_all(&gpu_dir).ok();
     std::fs::remove_dir_all(&cpu_dir).ok();
 }
+
+// ─── F02e1: exact ties resolve by (score, then ascending id) on every route ───
+
+/// Splats of the tie corpus: more than the 256 threads of a kernel block
+/// hold, so the kernel's thread-major scan order (thread 0: ids 0, 256, …;
+/// then thread 1: ids 1, 257, …) is NOT the id order.
+const TIE_N: usize = 300;
+
+/// One splat per axis, so every squared distance is a single exact product.
+/// ids {1, 2, 3, 256, 257, 258} share d² = 4.25 (a six-way tie for the
+/// top-5 after id 0 at d² = 1.25); every other id has its own d² ≥ 16.25.
+fn tie_row(i: usize) -> Vec<f32> {
+    let mut v = vec![0.0f32; DIM];
+    match i {
+        0 => v[3] = 1.0,
+        1 => v[0] = 2.0,
+        2 => v[0] = -2.0,
+        3 => v[1] = 2.0,
+        256 => v[1] = -2.0,
+        257 => v[2] = 2.0,
+        258 => v[2] = -2.0,
+        i => v[7 + i % 24] = 4.0 + 0.03125 * i as f32,
+    }
+    v
+}
+
+/// Query on the one axis no splat uses (+0.25 on every d²): all ties survive.
+fn tie_query() -> Vec<f32> {
+    let mut q = vec![0.0f32; DIM];
+    q[31] = 0.5;
+    q
+}
+
+/// Stored far away: its own top-1 at the next splat id, outside every top-k.
+fn tie_far() -> Vec<f32> {
+    let mut v = vec![0.0f32; DIM];
+    v[31] = 60.0;
+    v
+}
+
+/// The layout `ingest` leaves behind for the tie corpus: shard `default` =
+/// the splats, plus an energy landscape with `alpha[257] = 1000` (kappa = 1),
+/// so the gaussian ranking differs from L2: [257, 0, 1, 2, 3].
+fn write_tie_corpus(dir: &Path) {
+    let mu: Vec<Vec<f32>> = (0..TIE_N).map(tie_row).collect();
+    write_shard(&dir.join("data").join("vectors").join("default.bin"), &mu);
+    let mut alpha = vec![1.0f32; TIE_N];
+    alpha[257] = 1000.0;
+    let kappa = vec![1.0f32; TIE_N];
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(TIE_N as u64).to_le_bytes());
+    buf.extend_from_slice(&(DIM as u64).to_le_bytes());
+    for r in &mu {
+        for x in r {
+            buf.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    buf.extend_from_slice(&(TIE_N as u64).to_le_bytes());
+    for a in &alpha {
+        buf.extend_from_slice(&a.to_le_bytes());
+    }
+    buf.extend_from_slice(&(TIE_N as u64).to_le_bytes());
+    for k in &kappa {
+        buf.extend_from_slice(&k.to_le_bytes());
+    }
+    std::fs::create_dir_all(dir.join("energy")).unwrap();
+    std::fs::write(dir.join("energy").join("landscape.bin"), buf).unwrap();
+}
+
+/// Contractual reference over the tie corpus (+ `extra` rows appended by
+/// `/store`): `(id, score)` by score (d² ascending / gaussian descending),
+/// then ascending id.
+fn tie_reference(gaussian: bool, extra: &[Vec<f32>]) -> Vec<(u64, f64)> {
+    let mut rows: Vec<Vec<f32>> = (0..TIE_N).map(tie_row).collect();
+    rows.extend_from_slice(extra);
+    let q = tie_query();
+    let mut all: Vec<(usize, f64)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let d2 = d2(r, &q);
+            let score = if gaussian {
+                f64::from(if i == 257 { 1000.0 } else { 1.0 }) * (-d2).exp()
+            } else {
+                d2
+            };
+            (i, score)
+        })
+        .collect();
+    all.sort_by(|a, b| {
+        let by_score = a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal);
+        let by_score = if gaussian {
+            by_score.reverse()
+        } else {
+            by_score
+        };
+        by_score.then(a.0.cmp(&b.0))
+    });
+    all.truncate(TOP_K);
+    all.into_iter().map(|(i, s)| (i as u64, s)).collect()
+}
+
+/// `/search` rows == the contractual reference: ids in (score, id) order and
+/// scores within f32/`__expf` noise.
+fn assert_tie_rows(v: &Value, gaussian: bool, extra: &[Vec<f32>], what: &str) {
+    let got = rows(v);
+    let want = tie_reference(gaussian, extra);
+    assert_eq!(
+        got.iter().map(|r| r.0).collect::<Vec<_>>(),
+        want.iter().map(|r| r.0).collect::<Vec<_>>(),
+        "{what}: ids/order must be (score, then ascending id): got {got:?} want {want:?}"
+    );
+    for ((_, score, _, _), (_, want_score)) in got.iter().zip(&want) {
+        assert!(
+            (score - want_score).abs() <= 1e-9 + 1e-5 * want_score.abs(),
+            "{what}: score {score}, expected {want_score}: {got:?}"
+        );
+    }
+}
+
+/// CPU route (`serve` without `--gpu`), every build: the six-way tie
+/// {1, 2, 3, 256, 257, 258} for the four places behind id 0 resolves to the
+/// four lowest ids — in L2 and in gaussian — before and after a `/store`.
+#[test]
+fn exact_ties_resolve_by_id_on_the_cpu_route() {
+    let dir = scratch("ties-cpu");
+    let port = probe_port();
+    write_tie_corpus(&dir);
+    let (q, far) = (tie_query(), tie_far());
+
+    let mut server = spawn_serve(&dir, port, false);
+    wait_healthy(port, &mut server);
+
+    assert_tie_rows(
+        &search(port, false, &q, TOP_K),
+        false,
+        &[],
+        "CPU L2 before /store",
+    );
+    assert_tie_rows(
+        &search(port, true, &q, TOP_K),
+        true,
+        &[],
+        "CPU gaussian before /store",
+    );
+
+    store(port, &far);
+    assert_tie_rows_ordered(
+        &search(port, false, &q, TOP_K),
+        false,
+        &[far.clone()],
+        "CPU L2 after /store",
+    );
+    assert_tie_rows_ordered(
+        &search(port, true, &q, TOP_K),
+        true,
+        &[far.clone()],
+        "CPU gaussian after /store",
+    );
+
+    let code = shutdown(&mut server);
+    assert_eq!(
+        code,
+        Some(0),
+        "serve must exit 0 after SIGTERM: {}",
+        stderr_of(&server)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Rows of an ANN route — CPU after the index is built (HNSW candidates +
+/// exact re-rank, DECISIONS D2): the ORDER is contractual, (score, id), but
+/// which tied rows the candidate set holds follows the backend's recall.
+fn assert_tie_rows_ordered(v: &Value, gaussian: bool, _extra: &[Vec<f32>], what: &str) {
+    let got = rows(v);
+    assert_eq!(got.len(), TOP_K, "{what}: {got:?}");
+    for w in got.windows(2) {
+        let better = if gaussian {
+            w[0].1 >= w[1].1
+        } else {
+            w[0].1 <= w[1].1
+        };
+        assert!(
+            better && (w[0].1 != w[1].1 || w[0].0 < w[1].0),
+            "{what}: rows must be (score, then ascending id): {got:?}"
+        );
+    }
+}
+
+/// Real CUDA: the startup fast path (l2_topk kernel), the GPU batch worker
+/// (l2_topk / gaussian_topk kernels, before and after a `/store`) and the
+/// CPU route all answer the contractual order — and the same SET: the
+/// kernel's thread-major tie order returned {…, 257, 258} where the contract
+/// wants {…, 3, 256}.
+#[cfg(feature = "cuda")]
+#[test]
+fn exact_ties_resolve_by_id_on_the_gpu_fast_path_the_gpu_batch_and_the_cpu_route() {
+    if !splatsdb::gpu::is_cuda_available() {
+        eprintln!("[f02e1] SKIPPED: CUDA is not available on this host");
+        return;
+    }
+    let gpu_dir = scratch("ties-gpu");
+    let cpu_dir = scratch("ties-cpu-ref");
+    let (port_gpu, port_cpu) = (probe_port(), probe_port());
+    write_tie_corpus(&gpu_dir);
+    write_tie_corpus(&cpu_dir);
+    let (q, far) = (tie_query(), tie_far());
+
+    let mut gpu = spawn_serve(&gpu_dir, port_gpu, true);
+    wait_healthy(port_gpu, &mut gpu);
+    let mut cpu = spawn_serve(&cpu_dir, port_cpu, false);
+    wait_healthy(port_cpu, &mut cpu);
+
+    // Unmutated store: the startup fast path answers L2 (backend "gpu");
+    // `rescore=gaussian` always goes through the batch worker.
+    let fast = search(port_gpu, false, &q, TOP_K);
+    assert_eq!(
+        fast["backend"], "gpu",
+        "expected the startup GPU fast path: {fast}"
+    );
+    assert_tie_rows(&fast, false, &[], "GPU fast path L2 before /store");
+    assert_tie_rows(
+        &search(port_gpu, true, &q, TOP_K),
+        true,
+        &[],
+        "GPU batch gaussian before /store",
+    );
+    assert_tie_rows(
+        &search(port_cpu, false, &q, TOP_K),
+        false,
+        &[],
+        "CPU L2 before /store",
+    );
+    assert_tie_rows(
+        &search(port_cpu, true, &q, TOP_K),
+        true,
+        &[],
+        "CPU gaussian before /store",
+    );
+
+    // Mutation: the fast path is invalidated, the GPU batch worker answers.
+    store(port_gpu, &far);
+    store(port_cpu, &far);
+    let after = search(port_gpu, false, &q, TOP_K);
+    assert_eq!(
+        after["backend"],
+        Value::Null,
+        "the fast path must stay invalid after a mutation (A03-F05): {after}"
+    );
+    assert_tie_rows(&after, false, &[far.clone()], "GPU batch L2 after /store");
+    assert_tie_rows(
+        &search(port_gpu, true, &q, TOP_K),
+        true,
+        &[far.clone()],
+        "GPU batch gaussian after /store",
+    );
+    assert_tie_rows_ordered(
+        &search(port_cpu, false, &q, TOP_K),
+        false,
+        &[far.clone()],
+        "CPU L2 after /store",
+    );
+    assert_tie_rows_ordered(
+        &search(port_cpu, true, &q, TOP_K),
+        true,
+        &[far.clone()],
+        "CPU gaussian after /store",
+    );
+
+    let code = shutdown(&mut gpu);
+    assert_eq!(
+        code,
+        Some(0),
+        "serve --gpu must exit 0 after SIGTERM: {}",
+        stderr_of(&gpu)
+    );
+    let code = shutdown(&mut cpu);
+    assert_eq!(
+        code,
+        Some(0),
+        "serve must exit 0 after SIGTERM: {}",
+        stderr_of(&cpu)
+    );
+    let err = stderr_of(&gpu);
+    assert!(
+        err.contains(&format!("GPU exact index listo ({TIE_N} vectores")),
+        "the GPU index must hold the {TIE_N} splats: {err}"
+    );
+    std::fs::remove_dir_all(&gpu_dir).ok();
+    std::fs::remove_dir_all(&cpu_dir).ok();
+}

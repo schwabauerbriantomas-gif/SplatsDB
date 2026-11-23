@@ -122,30 +122,42 @@ fn gpu_fast_path_results(
     embedding: &[f32],
     k: usize,
 ) -> Option<Vec<SearchResult>> {
-    let rows = fast.index.topk_search(embedding, 1, k, "l2")?;
-    let [(idxs, dists)] = rows.as_slice() else {
-        eprintln!(
-            "[splatsdb] GPU topk devolvió {} filas para 1 query; query cae a CPU",
-            rows.len()
-        );
-        return None;
+    // F02e1: the kernel orders exact ties by scan position, not by id.
+    // `contractual_topk` asks for k+1 pairs, proves the k-set against a tie
+    // at the boundary (escalating to the kernel's largest window) and
+    // returns the canonical (d², id) order — untied answers are the kernel's
+    // own k pairs, bit for bit. A tie the kernel cannot resolve, or a
+    // malformed row, falls through to the batch worker (host-exact there).
+    let fetch = |window: usize| -> Option<Vec<(usize, f32)>> {
+        let rows = fast.index.topk_search(embedding, 1, window, "l2")?;
+        let [(idxs, dists)] = rows.as_slice() else {
+            eprintln!(
+                "[splatsdb] GPU topk devolvió {} filas para 1 query; query cae a CPU",
+                rows.len()
+            );
+            return None;
+        };
+        if idxs.len() != dists.len() || idxs.iter().any(|&i| i >= fast.key.n) {
+            eprintln!(
+                "[splatsdb] GPU topk devolvió una fila inválida ({} índices / {} distancias sobre \
+                 {} vectores); query cae a CPU",
+                idxs.len(),
+                dists.len(),
+                fast.key.n
+            );
+            return None;
+        }
+        Some(
+            idxs.iter()
+                .zip(dists.iter())
+                .map(|(&i, &d)| (i, d))
+                .collect(),
+        )
     };
-    if idxs.len() != dists.len() || idxs.iter().any(|&i| i >= fast.key.n) {
-        eprintln!(
-            "[splatsdb] GPU topk devolvió una fila inválida ({} índices / {} distancias sobre \
-             {} vectores); query cae a CPU",
-            idxs.len(),
-            dists.len(),
-            fast.key.n
-        );
-        return None;
-    }
-    let mut pairs: Vec<(usize, f32)> = idxs
-        .iter()
-        .zip(dists.iter())
-        .map(|(&i, &d)| (i, d))
-        .collect();
-    pairs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let pairs = match crate::splats::contractual_topk(fast.key.n, k, false, fetch) {
+        crate::splats::Contract::Exact(pairs) => pairs,
+        crate::splats::Contract::Saturated(_) | crate::splats::Contract::NoFetch => return None,
+    };
     Some(
         pairs
             .into_iter()
@@ -2140,6 +2152,8 @@ fn split_and_run_gpu_kernels(
         .map_err(|e| format!("snapshot reshape failed: {e}"))?;
 
     let gauss_out = if n_gauss > 0 {
+        // F02e1: one pair beyond the largest k, so every query can prove
+        // its k-set against a tie at the boundary (see `canonicalize_gpu_rows`).
         let kmax_g = gauss_ks.iter().copied().max().unwrap_or(1).min(snap.n);
         crate::gpu::gaussian_topk_scores_cached(
             snap.version,
@@ -2148,7 +2162,7 @@ fn split_and_run_gpu_kernels(
             &snap.alpha,
             &snap.kappa,
             n_gauss,
-            kmax_g,
+            gpu_window(kmax_g, snap.n),
         )
         .ok_or_else(|| "gaussian_topk_scores failed".to_string())?
     } else {
@@ -2157,7 +2171,14 @@ fn split_and_run_gpu_kernels(
 
     let l2_out = if n_l2 > 0 {
         let kmax_l = l2_ks.iter().copied().max().unwrap_or(1).min(snap.n);
-        crate::gpu::batch_search_cached(snap.version, &l2_flat, n_l2, &data_view, kmax_l, "l2")
+        crate::gpu::batch_search_cached(
+            snap.version,
+            &l2_flat,
+            n_l2,
+            &data_view,
+            gpu_window(kmax_l, snap.n),
+            "l2",
+        )
     } else {
         Vec::new()
     };
@@ -2181,7 +2202,11 @@ fn gpu_batch_path(
         .as_ref()
         .ok_or_else(|| "store is empty".to_string())?;
 
-    let (gauss_out, l2_out) = split_and_run_gpu_kernels(snap, queries, ks, rescore)?;
+    let (mut gauss_out, mut l2_out) = split_and_run_gpu_kernels(snap, queries, ks, rescore)?;
+
+    // ── F02e1: contractual (score, id) rows — ties at the k-th score are
+    // proven against the kernel's window and resolved by id.
+    canonicalize_gpu_rows(snap, queries, ks, rescore, &mut gauss_out, &mut l2_out);
 
     // ── Reassemble rows in original request order (shape-validated).
     let per_query = reassemble_gpu_rows(snap.n, ks, rescore, gauss_out, l2_out)?;
@@ -2194,6 +2219,144 @@ fn gpu_batch_path(
     store.blocking_lock().touch(&touched);
 
     Ok(per_query)
+}
+
+/// Kernel K requested for a batch whose largest k is `kmax` (F02e1): `kmax+1`
+/// — the extra pair lets every query prove its k-set against a tie at the
+/// boundary — within what the kernel takes; `kmax` itself when it cannot
+/// take one more (then its host fallback answers) or the dataset is smaller.
+fn gpu_window(kmax: usize, n: usize) -> usize {
+    if kmax < crate::splats::GPU_TOPK_MAX_K {
+        (kmax + 1).min(n)
+    } else {
+        kmax
+    }
+}
+
+/// Host-exact L2 top-k over a flat row-major dataset: `(id, d²)` in
+/// contractual order (d² ascending, then id). The same f32 arithmetic as
+/// `SplatStore::find_neighbors`.
+fn host_exact_l2(data: &[f32], n: usize, dim: usize, q: &[f32], k: usize) -> Vec<(usize, f32)> {
+    if q.len() != dim || data.len() < n.saturating_mul(dim) {
+        return Vec::new();
+    }
+    let mut all: Vec<(usize, f32)> = (0..n)
+        .map(|i| {
+            let row = &data[i * dim..(i + 1) * dim];
+            let d2: f32 = row
+                .iter()
+                .zip(q)
+                .map(|(a, b)| {
+                    let d = a - b;
+                    d * d
+                })
+                .sum();
+            (i, d2)
+        })
+        .collect();
+    crate::splats::sort_score_then_id(&mut all, false);
+    all.truncate(k);
+    all
+}
+
+/// F02e1: contractual rows on the GPU batch route.
+///
+/// The kernels answered `gpu_window(kmax)` pairs per query in their own
+/// order. Each query's row is reduced to its contractual top-k with
+/// [`crate::splats::contractual_topk`]: canonical (score, id) order, and a
+/// tie at the k-th score proven against the extra pair — escalated, for that
+/// query alone, to the kernel's largest window. A tie the kernel cannot
+/// resolve is computed on the host from the same snapshot (`host_exact_l2` /
+/// `gpu::cpu_gaussian_topk`): exact and canonical, O(n·dim), only for queries
+/// whose k-th score ties with everything up to the window's end. Rows of a
+/// malformed shape are left untouched for [`reassemble_gpu_rows`] to reject.
+fn canonicalize_gpu_rows(
+    snap: &DatasetSnapshot,
+    queries: &[Vec<f32>],
+    ks: &[usize],
+    rescore: &[bool],
+    gauss_out: &mut [Vec<(usize, f32)>],
+    l2_out: &mut [(Vec<usize>, Vec<f32>)],
+) {
+    if ks.len() != rescore.len() || queries.len() < ks.len() {
+        return;
+    }
+    let Ok(view) = ndarray::ArrayView2::from_shape((snap.n, snap.dim), &snap.data) else {
+        return;
+    };
+    let (mut g, mut l) = (0usize, 0usize);
+    for (i, (&k, &gaussian)) in ks.iter().zip(rescore.iter()).enumerate() {
+        let q: &[f32] = &queries[i];
+        if gaussian {
+            let Some(slot) = gauss_out.get_mut(g) else {
+                break;
+            };
+            g += 1;
+            let fetched = slot.clone();
+            let fetch = |window: usize| -> Option<Vec<(usize, f32)>> {
+                if window <= fetched.len() {
+                    return Some(fetched[..window].to_vec());
+                }
+                crate::gpu::gaussian_topk_scores_cached(
+                    snap.version,
+                    q,
+                    &view,
+                    &snap.alpha,
+                    &snap.kappa,
+                    1,
+                    window,
+                )?
+                .into_iter()
+                .next()
+            };
+            *slot = match crate::splats::contractual_topk(snap.n, k, true, fetch) {
+                crate::splats::Contract::Exact(row) => row,
+                _ => crate::gpu::cpu_gaussian_topk(
+                    q,
+                    &snap.data,
+                    &snap.alpha,
+                    &snap.kappa,
+                    snap.n,
+                    snap.dim,
+                    1,
+                    k,
+                )
+                .pop()
+                .unwrap_or_default(),
+            };
+        } else {
+            let Some(slot) = l2_out.get_mut(l) else {
+                break;
+            };
+            l += 1;
+            if slot.0.len() != slot.1.len() {
+                continue;
+            }
+            let fetched: Vec<(usize, f32)> = slot
+                .0
+                .iter()
+                .zip(&slot.1)
+                .map(|(&ix, &d)| (ix, d))
+                .collect();
+            let fetch = |window: usize| -> Option<Vec<(usize, f32)>> {
+                if window <= fetched.len() {
+                    return Some(fetched[..window].to_vec());
+                }
+                let (idxs, dists) =
+                    crate::gpu::batch_search_cached(snap.version, q, 1, &view, window, "l2")
+                        .pop()?;
+                Some(idxs.into_iter().zip(dists).collect())
+            };
+            let row = match crate::splats::contractual_topk(snap.n, k, false, fetch) {
+                crate::splats::Contract::Exact(row) => row,
+                _ => host_exact_l2(&snap.data, snap.n, snap.dim, q, k),
+            };
+            *slot = (
+                row.iter().map(|p| p.0).collect(),
+                row.iter().map(|p| p.1).collect(),
+            );
+        }
+    }
 }
 
 /// Validate the GPU kernel outputs against the batch they were requested
@@ -4785,5 +4948,311 @@ mod tests {
         assert_eq!(v["persistence"], "ephemeral", "{body}");
         assert_eq!(v["durable"], false, "{body}");
         assert_eq!(v["wal_pending"], 0, "{body}");
+    }
+}
+
+#[cfg(test)]
+mod f02e1_energy_reload_tests {
+    use super::*;
+    use ndarray::Array2;
+
+    fn dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir()
+            .join("F02e1-unit")
+            .join(format!("{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn new_store() -> SplatStore {
+        SplatStore::new(SplatsDBConfig {
+            latent_dim: 4,
+            max_splats: 16,
+            ..Default::default()
+        })
+    }
+
+    fn mu_of(rows: usize) -> Array2<f32> {
+        Array2::from_shape_fn((rows, 4), |(i, j)| (i * 4 + j) as f32 - 2.0)
+    }
+
+    /// The layout `persistence::save_energy_state` writes — through the real
+    /// persistence layer.
+    fn write_energy(data_dir: &std::path::Path, mu: &Array2<f32>) -> (Vec<f32>, Vec<f32>) {
+        let alpha: Vec<f32> = (0..mu.nrows()).map(|i| 0.5 + 0.1 * i as f32).collect();
+        let kappa: Vec<f32> = (0..mu.nrows()).map(|i| 1.0 + 2.0 * i as f32).collect();
+        let persist = crate::storage::persistence::SplatsDBPersistence::with_backend(
+            data_dir.to_str().unwrap(),
+            crate::storage::persistence::StorageBackend::Sqlite,
+            false,
+        )
+        .unwrap();
+        persist.save_energy_state(mu, &alpha, &kappa).unwrap();
+        (alpha, kappa)
+    }
+
+    fn assert_init(store: &SplatStore, n: usize) {
+        let (init_alpha, init_kappa) = (
+            SplatsDBConfig::default().init_alpha as f32,
+            SplatsDBConfig::default().init_kappa as f32,
+        );
+        assert!(store
+            .get_alpha()
+            .unwrap()
+            .iter()
+            .take(n)
+            .all(|a| *a == init_alpha));
+        assert!(store
+            .get_kappa()
+            .unwrap()
+            .iter()
+            .take(n)
+            .all(|k| *k == init_kappa));
+    }
+
+    #[test]
+    fn serve_loads_the_energy_state_with_the_shard() {
+        let d = dir("full");
+        let mu = mu_of(3);
+        let (alpha, kappa) = write_energy(&d, &mu);
+        let mut store = new_store();
+        assert_eq!(
+            load_shard_with_energy(&mut store, d.to_str().unwrap(), &mu).unwrap(),
+            3
+        );
+        assert_eq!(store.get_alpha().unwrap().as_slice().unwrap(), &alpha[..]);
+        assert_eq!(store.get_kappa().unwrap().as_slice().unwrap(), &kappa[..]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn serve_loads_a_prefix_and_keeps_the_init_for_appended_rows() {
+        let d = dir("prefix");
+        let mu = mu_of(5);
+        let (alpha, kappa) = write_energy(&d, &mu.slice(ndarray::s![..3, ..]).to_owned());
+        let mut store = new_store();
+        assert_eq!(
+            load_shard_with_energy(&mut store, d.to_str().unwrap(), &mu).unwrap(),
+            5
+        );
+        assert_eq!(
+            &store.get_alpha().unwrap().as_slice().unwrap()[..3],
+            &alpha[..]
+        );
+        assert_eq!(
+            &store.get_kappa().unwrap().as_slice().unwrap()[..3],
+            &kappa[..]
+        );
+        let (init_alpha, init_kappa) = (
+            SplatsDBConfig::default().init_alpha as f32,
+            SplatsDBConfig::default().init_kappa as f32,
+        );
+        assert!(store
+            .get_alpha()
+            .unwrap()
+            .iter()
+            .skip(3)
+            .all(|a| *a == init_alpha));
+        assert!(store
+            .get_kappa()
+            .unwrap()
+            .iter()
+            .skip(3)
+            .all(|k| *k == init_kappa));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn serve_ignores_a_foreign_energy_state() {
+        let d = dir("foreign");
+        let mu = mu_of(3);
+        write_energy(&d, &mu_of(3).mapv(|x| x + 100.0));
+        let mut store = new_store();
+        assert_eq!(
+            load_shard_with_energy(&mut store, d.to_str().unwrap(), &mu).unwrap(),
+            3
+        );
+        assert_init(&store, 3);
+        // a landscape of another dimension
+        let d2 = dir("foreign-dim");
+        write_energy(&d2, &Array2::zeros((3, 5)));
+        let mut store = new_store();
+        assert_eq!(
+            load_shard_with_energy(&mut store, d2.to_str().unwrap(), &mu).unwrap(),
+            3
+        );
+        assert_init(&store, 3);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    #[test]
+    fn serve_fails_closed_on_a_corrupt_energy_state() {
+        let d = dir("corrupt");
+        let mu = mu_of(3);
+        write_energy(&d, &mu);
+        let path = crate::loaders::EnergyLandscape::path_in(&d);
+        let mut store = new_store();
+        let bytes = std::fs::read(&path).unwrap();
+        // truncated
+        std::fs::write(&path, &bytes[..bytes.len() - 4]).unwrap();
+        let err = load_shard_with_energy(&mut store, d.to_str().unwrap(), &mu)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bytes"), "{err}");
+        // trailing garbage
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        std::fs::write(&path, &trailing).unwrap();
+        let mut store = new_store();
+        assert!(load_shard_with_energy(&mut store, d.to_str().unwrap(), &mu).is_err());
+        // hostile header (rows = u64::MAX)
+        let mut bomb = bytes.clone();
+        bomb[0..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&path, &bomb).unwrap();
+        let mut store = new_store();
+        let err = load_shard_with_energy(&mut store, d.to_str().unwrap(), &mu)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Allocation too large"), "{err}");
+        // NaN alpha
+        let mut nan = bytes.clone();
+        let o = 16 + 3 * 4 * 4 + 8;
+        nan[o..o + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        std::fs::write(&path, &nan).unwrap();
+        let mut store = new_store();
+        let err = load_shard_with_energy(&mut store, d.to_str().unwrap(), &mu)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-finite"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn serve_without_energy_state_loads_mu_only() {
+        let d = dir("absent");
+        let mu = mu_of(3);
+        let mut store = new_store();
+        assert_eq!(
+            load_shard_with_energy(&mut store, d.to_str().unwrap(), &mu).unwrap(),
+            3
+        );
+        assert_init(&store, 3);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn tie_snapshot() -> (DatasetSnapshot, Vec<f32>) {
+        let n = 300;
+        let row = |i: usize| -> Vec<f32> {
+            let mut v = vec![0.0f32; 32];
+            match i {
+                0 => v[3] = 1.0,
+                1 => v[0] = 2.0,
+                2 => v[0] = -2.0,
+                3 => v[1] = 2.0,
+                256 => v[1] = -2.0,
+                257 => v[2] = 2.0,
+                258 => v[2] = -2.0,
+                _ => v[7 + i % 24] = 4.0 + 0.03125 * i as f32,
+            }
+            v
+        };
+        let mut alpha = vec![1.0f32; n];
+        alpha[257] = 1000.0;
+        (
+            DatasetSnapshot {
+                version: 0,
+                n,
+                dim: 32,
+                data: (0..n).flat_map(row).collect(),
+                alpha,
+                kappa: vec![1.0f32; n],
+            },
+            {
+                let mut q = vec![0.0f32; 32];
+                q[31] = 0.5;
+                q
+            },
+        )
+    }
+
+    /// The kernel's thread-major order over the tie corpus.
+    fn kernel_row(scores: &[f32], descending: bool, w: usize) -> Vec<(usize, f32)> {
+        let mut all: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
+        all.sort_by(|a, b| {
+            let s = a.1.partial_cmp(&b.1).unwrap();
+            let s = if descending { s.reverse() } else { s };
+            s.then((a.0 % 256).cmp(&(b.0 % 256))).then(a.0.cmp(&b.0))
+        });
+        all.truncate(w);
+        all
+    }
+
+    #[test]
+    fn gpu_batch_rows_become_contractual() {
+        let (snap, q) = tie_snapshot();
+        let scores: Vec<f32> = (0..snap.n)
+            .map(|i| {
+                let r = &snap.data[i * 32..(i + 1) * 32];
+                r.iter()
+                    .zip(&q)
+                    .map(|(a, b)| {
+                        let d = a - b;
+                        d * d
+                    })
+                    .sum()
+            })
+            .collect();
+        // what the kernels return for the batch window (k=5 → 6 pairs)
+        let mut gauss_out = vec![kernel_row(
+            &scores
+                .iter()
+                .zip(&snap.alpha)
+                .map(|(d, a)| a * (-d).exp())
+                .collect::<Vec<_>>(),
+            true,
+            6,
+        )];
+        let mut l2_out = vec![(
+            kernel_row(&scores, false, 6)
+                .iter()
+                .map(|p| p.0)
+                .collect::<Vec<_>>(),
+            kernel_row(&scores, false, 6)
+                .iter()
+                .map(|p| p.1)
+                .collect::<Vec<_>>(),
+        )];
+        canonicalize_gpu_rows(
+            &snap,
+            &[q.clone(), q.clone()],
+            &[5, 5],
+            &[true, false],
+            &mut gauss_out,
+            &mut l2_out,
+        );
+        assert_eq!(
+            gauss_out[0].iter().map(|p| p.0).collect::<Vec<_>>(),
+            vec![257, 0, 1, 2, 3]
+        );
+        assert_eq!(l2_out[0].0.clone(), vec![0, 1, 2, 3, 256]);
+        assert!((l2_out[0].1[1] - 4.25).abs() < 1e-5, "{:?}", l2_out[0].1);
+        // malformed shapes are left for reassemble_gpu_rows to reject
+        let mut bad = vec![(vec![0usize, 1], vec![1.0f32])];
+        canonicalize_gpu_rows(&snap, &[q.clone()], &[5], &[false], &mut [], &mut bad);
+        assert_eq!(bad[0].0.len(), 2);
+        assert_eq!(bad[0].1.len(), 1);
+        // host fallbacks are contractual on their own
+        let exact = host_exact_l2(&snap.data, snap.n, 32, &q, 5);
+        assert_eq!(
+            exact.iter().map(|p| p.0).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 256]
+        );
+        assert_eq!(gpu_window(5, 300), 6);
+        assert_eq!(gpu_window(5, 6), 6);
+        assert_eq!(gpu_window(5, 4), 4);
+        assert_eq!(gpu_window(32, 300), 32);
+        assert_eq!(gpu_window(40, 300), 40);
     }
 }
