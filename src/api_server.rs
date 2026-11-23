@@ -50,7 +50,7 @@ use axum::{
 };
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -100,6 +100,150 @@ impl GpuIndexKey {
     /// True iff `version` / `n` describe the dataset this index holds.
     pub(crate) fn is_current(&self, version: u64, n: usize) -> bool {
         self.version == version && self.n == n
+    }
+}
+
+/// Serve-level holder of the exact GPU index (feature `cuda`), F06a.
+///
+/// The resident index is a snapshot of ONE dataset version. `/store` (WAL
+/// replay, compact) bumps `data_version`; the first request that no longer
+/// matches rebuilds the index ONCE for the version current at that moment
+/// and swaps it in — concurrent stale requests wait on `rebuild_lock` and
+/// reuse the fresh index (a burst of mutations costs one upload, not one per
+/// query or per store). Requests whose version matches never touch the GPU
+/// state beyond a read lock. An explicit GPU failure (no CUDA, failed upload)
+/// disables the fast path for the process: those requests take the batch
+/// worker, as before. Before F06a the startup key went stale on the first
+/// mutation and every later `/search` took the batch worker (`backend:
+/// null`, 2 ms coalescing window: after-mutation p50 was 2.0-2.3× the base).
+#[cfg(feature = "cuda")]
+pub struct GpuExactIndex {
+    current: parking_lot::RwLock<Option<Arc<GpuFastPath>>>,
+    rebuild_lock: parking_lot::Mutex<()>,
+    /// Set by an explicit GPU failure: no more rebuild attempts.
+    disabled: AtomicBool,
+    /// Dataset versions uploaded after the startup one (observability/tests).
+    rebuilds: AtomicUsize,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuExactIndex {
+    /// Startup upload of the current dataset, read straight from the store's
+    /// buffer (no host copy). Returns `(holder, corpus_n)`; the holder is
+    /// `None` only when CUDA is not available at all.
+    fn startup(store: &SplatStore) -> (Option<Arc<Self>>, usize) {
+        let n = store.n_active();
+        let holder = Self {
+            current: parking_lot::RwLock::new(None),
+            rebuild_lock: parking_lot::Mutex::new(()),
+            disabled: AtomicBool::new(false),
+            rebuilds: AtomicUsize::new(0),
+        };
+        let Some(mut index) = crate::gpu::cuda_kernel::GpuIndex::new() else {
+            eprintln!("[splatsdb] serve: GPU no disponible (--gpu ignorado); búsqueda en CPU");
+            return (None, n);
+        };
+        match store.mu_view() {
+            Some(view) => {
+                let dim = view.ncols();
+                let uploaded = view
+                    .as_slice()
+                    .map(|flat| index.upload_dataset(flat, n, dim))
+                    == Some(true);
+                if uploaded {
+                    let version = store.data_version();
+                    eprintln!(
+                        "[splatsdb] serve: GPU exact index listo ({n} vectores, dim {dim}, \
+                         data_version {version})"
+                    );
+                    *holder.current.write() = Some(Arc::new(GpuFastPath {
+                        key: GpuIndexKey { version, n },
+                        index,
+                    }));
+                } else {
+                    eprintln!("[splatsdb] serve: upload GPU falló; búsqueda en CPU");
+                    holder.disabled.store(true, Ordering::Relaxed);
+                }
+            }
+            None => eprintln!("[splatsdb] serve: store vacío, GPU sin dataset"),
+        }
+        (Some(Arc::new(holder)), n)
+    }
+
+    /// The resident index when it is exactly the dataset `(version, n)` this
+    /// request read — a read lock and an Arc clone, nothing else.
+    fn current_index(&self, version: u64, n: usize) -> Option<Arc<GpuFastPath>> {
+        self.current
+            .read()
+            .as_ref()
+            .filter(|f| f.key.is_current(version, n))
+            .cloned()
+    }
+
+    /// [`Self::current_index`], rebuilding the index once when stale.
+    fn index_for_request(
+        &self,
+        store: &Arc<Mutex<SplatStore>>,
+        version: u64,
+        n: usize,
+    ) -> Option<Arc<GpuFastPath>> {
+        if let Some(fast) = self.current_index(version, n) {
+            return Some(fast);
+        }
+        // One rebuild at a time: the others re-check and reuse its result.
+        let _serial = self.rebuild_lock.lock();
+        if let Some(fast) = self.current_index(version, n) {
+            return Some(fast);
+        }
+        if self.disabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let Some(mut index) = crate::gpu::cuda_kernel::GpuIndex::new() else {
+            self.fail("CUDA no disponible al reconstruir el índice");
+            return None;
+        };
+        // Upload straight from the store's buffer — no host copy (each copy of
+        // a 10000×768 dataset is ~30 MB of RSS). The store lock is held only
+        // for the duration of the H2D copy, never during a kernel launch.
+        let (key, uploaded) = {
+            let s = store.blocking_lock();
+            let (version, n) = (s.data_version(), s.n_active());
+            if let Some(fast) = self.current_index(version, n) {
+                return Some(fast);
+            }
+            let uploaded = match s.mu_view() {
+                Some(view) => match view.as_slice() {
+                    Some(flat) => index.upload_dataset(flat, n, view.ncols()),
+                    None => false,
+                },
+                None => false,
+            };
+            (GpuIndexKey { version, n }, uploaded)
+        };
+        if !uploaded {
+            self.fail("upload del dataset falló al reconstruir el índice");
+            return None;
+        }
+        let fast = Arc::new(GpuFastPath { key, index });
+        *self.current.write() = Some(fast.clone());
+        self.rebuilds.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "[splatsdb] serve: GPU exact index reconstruido ({} vectores, data_version {})",
+            key.n, key.version
+        );
+        Some(fast)
+    }
+
+    /// Dataset versions uploaded after the startup one.
+    pub fn rebuilds(&self) -> usize {
+        self.rebuilds.load(Ordering::Relaxed)
+    }
+
+    /// Explicit GPU failure: drop the resident index and stop trying.
+    fn fail(&self, why: &str) {
+        self.disabled.store(true, Ordering::Relaxed);
+        *self.current.write() = None;
+        eprintln!("[splatsdb] serve: GPU fast path desactivada ({why}); batch worker");
     }
 }
 
@@ -191,12 +335,13 @@ pub struct AppState {
     pub batch_tx: mpsc::Sender<BatchRequest>,
     /// Number of batches served by the worker (observability / tests).
     pub batches_served: Arc<AtomicUsize>,
-    /// Índice exacto en GPU (kernel PTX l2_topk) construido en el arranque
-    /// de serve --gpu, junto con la clave del dataset que subió
-    /// (`GpuIndexKey`). topk_search es &self → se comparte sin Mutex. El
-    /// handler sólo lo usa mientras la clave siga vigente (A03-F05).
+    /// Índice exacto en GPU (kernel PTX l2_topk): subido en el arranque de
+    /// serve --gpu y reconstruido UNA vez por versión de dataset tras una
+    /// mutación (F06a), con la clave del dataset que subió (`GpuIndexKey`).
+    /// topk_search es &self → se comparte sin Mutex. El handler sólo lo usa
+    /// mientras la clave siga vigente (A03-F05).
     #[cfg(feature = "cuda")]
-    pub gpu: Option<Arc<GpuFastPath>>,
+    pub gpu: Option<Arc<GpuExactIndex>>,
     /// Campo splat (celdas con radio) para /field-search exacto. None si no
     /// hay field/ persistido en el data-dir.
     pub field: Option<Arc<FieldData>>,
@@ -839,22 +984,44 @@ async fn search_memories(
     // Exacto, sin store mutex (índice compartido &self). Rescore gaussiano y
     // query de texto (hash embedding) siguen por el camino CPU.
     //
-    // A03-F05: el índice es una foto del arranque, así que sólo puede
-    // responder mientras el store siga siendo EXACTAMENTE el dataset que se
+    // A03-F05: el índice es una foto de UNA versión del dataset, así que sólo
+    // puede responder mientras el store siga siendo EXACTAMENTE el dataset que
     // subió (`GpuIndexKey::is_current` sobre la `data_version` que esta
-    // request acaba de leer). Cualquier mutación posterior — /store, replay
-    // del WAL, reload, compact — cambia la versión, la clave deja de
-    // calzar y la query cae al batch worker, que refresca su snapshot por
-    // `data_version`. Antes de este guard, toda búsqueda posterior al primer
-    // /store se respondía desde el dataset congelado del arranque.
+    // request acaba de leer). Antes de este guard, toda búsqueda posterior al
+    // primer /store se respondía desde el dataset congelado del arranque.
+    //
+    // F06a: cuando la clave no calza (un /store, replay o compact movió la
+    // versión), el índice se reconstruye UNA vez por versión de dataset —las
+    // mutaciones continuas coalescen— y la query vuelve a la ruta GPU. Antes
+    // la clave quedaba vieja para siempre y cada query posterior caía al
+    // batch worker (backend null, ventana de 2 ms: p50 after-mutation 2× la
+    // base). Ante un fallo explícito de GPU (sin CUDA / upload fallido) la
+    // ruta rápida se desactiva y la query va al batch worker.
     #[cfg(feature = "cuda")]
-    if let Some(fast) = state
-        .gpu
-        .as_ref()
-        .filter(|f| f.key.is_current(data_version, state.corpus_n))
-    {
-        if !rescore_gaussian {
-            if let Some(mut results) = gpu_fast_path_results(fast, &embedding, k) {
+    if !rescore_gaussian {
+        let fast = match state.gpu.as_ref() {
+            // Hit: the resident index is exactly the dataset this request
+            // read — no lock on the store, no upload.
+            Some(gpu) => match gpu.current_index(data_version, n_active) {
+                Some(fast) => Some(fast),
+                None => {
+                    // Miss: rebuild off the runtime thread; concurrent stale
+                    // requests coalesce on the single rebuild.
+                    let (gpu, store) = (gpu.clone(), state.store.clone());
+                    tokio::task::spawn_blocking(move || {
+                        gpu.index_for_request(&store, data_version, n_active)
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("[splatsdb] /search: GPU rebuild task failed: {e}");
+                        None
+                    })
+                }
+            },
+            None => None,
+        };
+        if let Some(fast) = fast {
+            if let Some(mut results) = gpu_fast_path_results(&fast, &embedding, k) {
                 enrich_topics(&state, &mut results, Some(true));
                 return Ok(Json(SearchResponse {
                     results,
@@ -1121,11 +1288,7 @@ fn field_sweep(field: &FieldData, q: &[f32], kq: usize) -> serde_json::Value {
         .map(|c| (d_mu[c] - field.radii[c]).max(0.0))
         .collect();
     let mut order: Vec<usize> = (0..k).collect();
-    order.sort_by(|a, b| {
-        d_mu[*a]
-            .partial_cmp(&d_mu[*b])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    order.sort_by(|a, b| d_mu[*a].total_cmp(&d_mu[*b]));
 
     let mut top: Vec<(f32, u32)> = Vec::with_capacity(kq + 8);
     let mut kth = f32::INFINITY;
@@ -1149,7 +1312,7 @@ fn field_sweep(field: &FieldData, q: &[f32], kq: usize) -> serde_json::Value {
             let d2 = diff.dot(&diff);
             if top.len() < kq || d2 < kth {
                 top.push((d2, id));
-                top.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                top.sort_by(|a, b| a.0.total_cmp(&b.0));
                 if top.len() > kq {
                     top.truncate(kq);
                 }
@@ -1201,11 +1364,7 @@ fn field_two_phase(
         d.dot(&d).max(0.0).sqrt()
     });
     let mut order: Vec<usize> = (0..k).collect();
-    order.sort_by(|a, b| {
-        d_mu[*a]
-            .partial_cmp(&d_mu[*b])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    order.sort_by(|a, b| d_mu[*a].total_cmp(&d_mu[*b]));
     let winners = &order[..nprobe];
     let phase1_us = t1.elapsed().as_micros() as u64;
 
@@ -1225,7 +1384,7 @@ fn field_two_phase(
             (diff.dot(&diff), id)
         })
         .collect();
-    top.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    top.sort_by(|a, b| a.0.total_cmp(&b.0));
     top.truncate(kq);
     let phase2_us = t2.elapsed().as_micros() as u64;
 
@@ -1624,16 +1783,8 @@ fn select_recall_tiers(
         .filter(|h| !h.kind.starts_with("repo"))
         .collect();
     let mut code: Vec<&JoinedHit> = hits.iter().filter(|h| h.kind.starts_with("repo")).collect();
-    sess.sort_by(|a, b| {
-        a.dist
-            .partial_cmp(&b.dist)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    code.sort_by(|a, b| {
-        a.dist
-            .partial_cmp(&b.dist)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    sess.sort_by(|a, b| a.dist.total_cmp(&b.dist));
+    code.sort_by(|a, b| a.dist.total_cmp(&b.dist));
     let sess_json = sess.iter().filter(|h| is_json_leading(&h.text)).count();
     let code_json = code.iter().filter(|h| is_json_leading(&h.text)).count();
     // anti-JSON pre-gate BEFORE the gate itself (hook order: filter, then
@@ -2784,28 +2935,6 @@ fn load_serve_inputs(data_dir: &str, store: &mut SplatStore) -> anyhow::Result<O
     Ok(field_data)
 }
 
-/// Flat copy of the corpus the startup GPU fast path of `/search` serves:
-/// the store's mu (splats/μ — in flat stores the vectors themselves), the
-/// SAME rows and id space as the CPU reference and the batch worker.
-///
-/// F02d: with a `field/` corpus this returned `field.raw` (chunks), so
-/// `serve --gpu` answered chunk ids until the first `/store` and splat ids
-/// from then on, while CPU and `rescore=gaussian` always answered splat
-/// ids. Chunk ids stay the contract of `/field-search`. Returns
-/// `(row-major data, n, dim)`, `None` when empty.
-fn serve_corpus(store: &SplatStore) -> Option<(Vec<f32>, usize, usize)> {
-    let mu = store.get_mu()?;
-    if mu.nrows() == 0 || mu.ncols() == 0 {
-        return None;
-    }
-    let (n, d) = (mu.nrows(), mu.ncols());
-    let slice = mu
-        .as_slice()
-        .map(<[f32]>::to_vec)
-        .unwrap_or_else(|| mu.iter().copied().collect());
-    Some((slice, n, d))
-}
-
 pub async fn run_server(
     addr: &str,
     port: u16,
@@ -2835,7 +2964,7 @@ pub async fn run_server(
     let _data_dir_lock = DataDirLock::acquire(std::path::Path::new(data_dir))?;
     let field_data = load_serve_inputs(data_dir, &mut store)?;
     #[cfg(not(feature = "cuda"))]
-    let corpus_n = serve_corpus(&store).map(|c| c.1).unwrap_or(0);
+    let corpus_n = store.n_active();
 
     // ── Durabilidad: el shard "default" ya lo cargó load_serve_inputs. Se
     // abre el WAL, se re-aplica lo no compactado y queda listo para
@@ -2868,40 +2997,11 @@ pub async fn run_server(
     // handler sólo lo usa mientras siga vigente (A03-F05).
     #[cfg(feature = "cuda")]
     let (gpu_index, corpus_n) = if gpu_enabled {
-        match (
-            crate::gpu::cuda_kernel::GpuIndex::new(),
-            serve_corpus(&store),
-        ) {
-            (None, corpus) => {
-                eprintln!("[splatsdb] serve: GPU no disponible (--gpu ignorado); búsqueda en CPU");
-                (None, corpus.map(|c| c.1).unwrap_or(0))
-            }
-            (Some(_), None) => {
-                eprintln!("[splatsdb] serve: store vacío, GPU sin dataset");
-                (None, 0)
-            }
-            (Some(mut g), Some((slice, n, d))) => {
-                if g.upload_dataset(&slice, n, d) {
-                    let version = store.data_version();
-                    eprintln!(
-                        "[splatsdb] serve: GPU exact index listo ({n} vectores, dim {d}, \
-                         data_version {version})"
-                    );
-                    (
-                        Some(Arc::new(GpuFastPath {
-                            key: GpuIndexKey { version, n },
-                            index: g,
-                        })),
-                        n,
-                    )
-                } else {
-                    eprintln!("[splatsdb] serve: upload GPU falló; búsqueda en CPU");
-                    (None, n)
-                }
-            }
-        }
+        // The corpus the fast path serves is the store's mu (splats/μ — never
+        // the field/ chunks, F02d), uploaded straight from the store buffer.
+        GpuExactIndex::startup(&store)
     } else {
-        (None, serve_corpus(&store).map(|c| c.1).unwrap_or(0))
+        (None, store.n_active())
     };
 
     let store = Arc::new(Mutex::new(store));
@@ -4154,6 +4254,151 @@ mod tests {
         );
     }
 
+    /// F06a: after a `/store` the exact GPU index is rebuilt for the new
+    /// dataset version and `/search` is served by the GPU fast path again.
+    /// Before: the startup key went stale on the first mutation and every
+    /// later query took the batch worker (`backend: null`, ~2 ms window).
+    #[cfg(feature = "cuda")]
+    #[tokio::test]
+    async fn f06a_gpu_fast_path_rebuilds_once_per_dataset_version_after_a_store() {
+        if !crate::gpu::is_cuda_available() {
+            eprintln!("[f06a] CUDA not available at runtime: GPU rebuild test skipped");
+            return;
+        }
+        let dim = 32;
+        let n0 = 400;
+        let mut store = SplatStore::new(test_config());
+        let data: Vec<f32> = (0..n0 * dim)
+            .map(|i| ((i * 7919) % 1009) as f32 / 1009.0)
+            .collect();
+        store.add_splat(&Array2::from_shape_vec((n0, dim), data.clone()).unwrap());
+        let store = Arc::new(Mutex::new(store));
+        let (gpu, n) = GpuExactIndex::startup(&*store.lock().await);
+        let gpu = gpu.expect("CUDA index at startup");
+        assert_eq!(n, n0);
+        assert_eq!(gpu.rebuilds(), 0, "the startup upload is not a rebuild");
+        let (batch_tx, batch_rx) = mpsc::channel(BATCH_CHANNEL_CAP);
+        let batches_served = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(batch_worker(
+            batch_rx,
+            store.clone(),
+            batches_served.clone(),
+            true,
+        ));
+        let state = AppState {
+            store,
+            next_id: Arc::new(AtomicUsize::new(0)),
+            batch_tx,
+            batches_served,
+            #[cfg(feature = "cuda")]
+            gpu: Some(gpu.clone()),
+            field: None,
+            corpus_n: n,
+            data_dir: None,
+            durability: None,
+            auth: AuthConfig::Unauthenticated,
+        };
+        let app = build_router(state);
+        let old_row: Vec<f32> = data[7 * dim..8 * dim].to_vec();
+        let new_row: Vec<f32> = unit_vec(dim, 3).into_iter().map(|v| v * 60.0).collect();
+
+        let (code, body) = send(
+            app.clone(),
+            "POST",
+            "/search",
+            Some(json!({ "query": "warm", "embedding": old_row, "top_k": 5 })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["backend"], "gpu",
+            "warm query on the GPU fast path: {body}"
+        );
+
+        let (code, body) = send(
+            app.clone(),
+            "POST",
+            "/store",
+            Some(json!({ "text": "new", "embedding": new_row })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "/store: {body}");
+
+        // After the mutation: back on the GPU, new vector is its own top-1.
+        for i in 0..8 {
+            let (code, body) = send(
+                app.clone(),
+                "POST",
+                "/search",
+                Some(json!({ "query": "after", "embedding": new_row, "top_k": 5 })),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK, "{body}");
+            assert_eq!(
+                body["backend"], "gpu",
+                "after /store, query #{i} must be served by the GPU fast path: {body}"
+            );
+            assert_eq!(
+                body["results"][0]["index"].as_u64(),
+                Some(n0 as u64),
+                "{body}"
+            );
+            assert_eq!(body["results"][0]["score"].as_f64(), Some(0.0), "{body}");
+        }
+        // Old rows are still exact on the rebuilt index.
+        let (code, body) = send(
+            app.clone(),
+            "POST",
+            "/search",
+            Some(json!({ "query": "old", "embedding": old_row, "top_k": 5 })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert_eq!(body["backend"], "gpu", "{body}");
+        assert_eq!(body["results"][0]["index"].as_u64(), Some(7), "{body}");
+        assert_eq!(body["results"][0]["score"].as_f64(), Some(0.0), "{body}");
+        // 9 queries after ONE mutation -> exactly one rebuild.
+        assert_eq!(
+            gpu.rebuilds(),
+            1,
+            "one rebuild per dataset version, not per query"
+        );
+
+        // A second mutation -> one more rebuild; again none per query.
+        let mut again = unit_vec(dim, 9);
+        again[0] = 0.25;
+        let (code, body) = send(
+            app.clone(),
+            "POST",
+            "/store",
+            Some(json!({ "text": "again", "embedding": again.clone() })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "/store #2: {body}");
+        for _ in 0..5 {
+            let (code, body) = send(
+                app.clone(),
+                "POST",
+                "/search",
+                Some(json!({ "query": "after2", "embedding": again.clone(), "top_k": 5 })),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK, "{body}");
+            assert_eq!(body["backend"], "gpu", "{body}");
+            assert_eq!(
+                body["results"][0]["index"].as_u64(),
+                Some(n0 as u64 + 1),
+                "{body}"
+            );
+            assert_eq!(body["results"][0]["score"].as_f64(), Some(0.0), "{body}");
+        }
+        assert_eq!(
+            gpu.rebuilds(),
+            2,
+            "one rebuild per dataset version, not per query"
+        );
+    }
+
     /// Mutate then search, never restarting: every stored vector must be the
     /// top-1 for its own embedding right away (the batch path refreshes its
     /// snapshot by `data_version`; CPU builds take it for every request).
@@ -5181,7 +5426,7 @@ mod f02e1_energy_reload_tests {
     fn kernel_row(scores: &[f32], descending: bool, w: usize) -> Vec<(usize, f32)> {
         let mut all: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
         all.sort_by(|a, b| {
-            let s = a.1.partial_cmp(&b.1).unwrap();
+            let s = a.1.total_cmp(&b.1);
             let s = if descending { s.reverse() } else { s };
             s.then((a.0 % 256).cmp(&(b.0 % 256))).then(a.0.cmp(&b.0))
         });

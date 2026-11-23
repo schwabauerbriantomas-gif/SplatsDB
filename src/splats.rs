@@ -1503,6 +1503,18 @@ impl SplatStore {
         Some(self.mu.slice(ndarray::s![..self.n_active, ..]).to_owned())
     }
 
+    /// Contiguous VIEW of the active rows (n_active × dim) — no copy.
+    ///
+    /// `get_mu()` hands out an owned copy (n·dim·4 bytes); the serve GPU
+    /// uploads read through this view instead (F06a: those copies were most
+    /// of the +65 MB of the serve VmHWM). `None` when the store is empty.
+    pub fn mu_view(&self) -> Option<ndarray::ArrayView2<'_, f32>> {
+        if self.n_active == 0 {
+            return None;
+        }
+        Some(self.mu.slice(ndarray::s![..self.n_active, ..]))
+    }
+
     /// Get active alpha values.
     pub fn get_alpha(&self) -> Option<Array1<f32>> {
         if self.n_active == 0 {
