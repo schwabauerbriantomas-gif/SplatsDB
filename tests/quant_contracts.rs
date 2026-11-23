@@ -175,3 +175,64 @@ fn encoders_reject_non_finite_inputs() {
     assert!(PolarQuantizer::new(8, 3, 0).unwrap().encode(&x).is_ok());
     assert!(QjlQuantizer::new(8, 4, 0).unwrap().sketch(&x).is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// A02-F03 (schema): QjlSketch v1 carries ||x||; v0 payloads are rejected, never
+// reinterpreted.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn qjl_sketch_schema_v0_without_norm_is_rejected_not_reinterpreted() {
+    use splatsdb::quant::qjl::QJL_SKETCH_SCHEMA_VERSION;
+    use splatsdb::quant::{QjlSketch, TurboCode};
+    assert_eq!(QJL_SKETCH_SCHEMA_VERSION, 1);
+    // Wire payload of schema v0 (<= 2.11.0): {dim, projections, signs}.
+    let v0 = serde_json::json!({"dim": 8, "projections": 4, "signs": [1, -1, 1, -1]});
+    let err = serde_json::from_value::<QjlSketch>(v0.clone())
+        .expect_err("a v0 sketch must not deserialize")
+        .to_string();
+    assert!(
+        err.contains("schema v0") && err.contains("re-encode"),
+        "{err}"
+    );
+    // The same holds nested in a TurboCode.
+    let v0_code = serde_json::json!({
+        "polar_code": {"dim": 8, "bits": 3, "radii": [1.0, 1.0, 1.0, 1.0], "angle_indices": [0, 1, 2, 3]},
+        "residual_sketch": v0,
+    });
+    assert!(serde_json::from_value::<TurboCode>(v0_code).is_err());
+}
+
+#[test]
+fn qjl_sketch_schema_v1_roundtrip_and_byte_cost() {
+    use splatsdb::quant::{QjlQuantizer, QjlSketch, TurboCode, TurboQuantizer};
+    let quantizer = QjlQuantizer::new(8, 16, 7).unwrap();
+    let x: Vec<f32> = (1..=8).map(|i| i as f32 * 0.5).collect();
+    let sketch = quantizer.sketch(&x).unwrap();
+    let exact_norm = (x.iter().map(|v| v * v).sum::<f32>()).sqrt();
+    assert!((sketch.norm - exact_norm).abs() < 1e-6 * exact_norm);
+
+    let wire = serde_json::to_string(&sketch).unwrap();
+    assert_eq!(wire.matches("\"norm\"").count(), 1);
+    let back: QjlSketch = serde_json::from_str(&wire).unwrap();
+    assert_eq!(back, sketch);
+
+    // Byte cost of the schema change: +4 B per sketch, signs stay 1 B each.
+    assert_eq!(sketch.encoded_bytes(), 16 + std::mem::size_of::<f32>());
+
+    // A whole TurboCode round-trips through serde with the v1 sketch inside.
+    let turbo = TurboQuantizer::new(8, 4, 16, 7).unwrap();
+    let code = turbo.encode(&x).unwrap();
+    let code_wire = serde_json::to_string(&code).unwrap();
+    let code_back: TurboCode = serde_json::from_str(&code_wire).unwrap();
+    assert_eq!(code_back, code);
+
+    // Malformed v1 payloads are rejected too.
+    for bad in [
+        serde_json::json!({"dim": 8, "projections": 3, "signs": [1, -1], "norm": 1.0}),
+        serde_json::json!({"dim": 8, "projections": 2, "signs": [1, -1], "norm": -1.0}),
+        serde_json::json!({"dim": 8, "projections": 2, "signs": [1, -1], "norm": 1.0e39}),
+    ] {
+        assert!(serde_json::from_value::<QjlSketch>(bad).is_err());
+    }
+}

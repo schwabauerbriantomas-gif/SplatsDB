@@ -13,22 +13,80 @@
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, StandardNormal};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::f32::consts::PI;
 
 use super::error::{QuantError, Result};
 
-/// A QJL sketch: sign of each random projection (+1 or -1).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Wire schema version of [`QjlSketch`]. v1 adds `norm`; v0 (<= 2.11.0: `{dim,
+/// projections, signs}` only) is rejected on deserialization and never reinterpreted.
+pub const QJL_SKETCH_SCHEMA_VERSION: u32 = 1;
+
+/// A QJL sketch: the sign of each random projection (+1 or -1) plus the norm of the
+/// sketched vector `x`, which the unbiased estimator needs as a multiplicative factor.
+///
+/// Serde compatibility: v1 = v0 + `norm: f32`. A v0 payload fails to deserialize with an
+/// explicit error — its estimates were biased and `||x||` cannot be recovered from the
+/// signs, so there is no migration: re-encode the source vectors. Byte cost of v1 vs v0:
+/// +4 bytes per sketch; signs stay 1 byte each (unpacked layout).
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct QjlSketch {
     pub dim: usize,
     pub projections: usize,
     pub signs: Vec<i8>,
+    /// `||x||` of the sketched vector (schema v1).
+    pub norm: f32,
+}
+
+impl<'de> Deserialize<'de> for QjlSketch {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Repr {
+            dim: usize,
+            projections: usize,
+            signs: Vec<i8>,
+            // Absent in v0 payloads: sentinel, turned into an explicit error below.
+            #[serde(default = "missing_norm")]
+            norm: f32,
+        }
+        fn missing_norm() -> f32 {
+            f32::NAN
+        }
+
+        let repr = Repr::deserialize(deserializer)?;
+        let norm = repr.norm;
+        if norm.is_nan() {
+            return Err(serde::de::Error::custom(
+                "QJL sketch schema v0 (no `norm` field): its inner-product estimates were biased by sqrt(pi/2)/||x|| and the norm cannot be recovered from the signs; re-encode the source vectors",
+            ));
+        }
+        if repr.signs.len() != repr.projections {
+            return Err(serde::de::Error::custom(format!(
+                "malformed QJL sketch: {} signs for {} projections",
+                repr.signs.len(),
+                repr.projections
+            )));
+        }
+        if !norm.is_finite() || norm < 0.0 {
+            return Err(serde::de::Error::custom(
+                "malformed QJL sketch: norm must be finite and non-negative",
+            ));
+        }
+        Ok(QjlSketch {
+            dim: repr.dim,
+            projections: repr.projections,
+            signs: repr.signs,
+            norm,
+        })
+    }
 }
 
 impl QjlSketch {
     pub fn encoded_bytes(&self) -> usize {
-        self.projections
+        self.projections + std::mem::size_of::<f32>()
     }
 }
 
@@ -78,10 +136,22 @@ impl QjlQuantizer {
                 }
             })
             .collect();
+        let norm = vector
+            .iter()
+            .map(|x| (*x as f64) * (*x as f64))
+            .sum::<f64>()
+            .sqrt() as f32;
+        if !norm.is_finite() {
+            // Squares overflow f32 even though every component is finite.
+            return Err(QuantError::MalformedCode(
+                "vector norm is not finite (f32 overflow)".to_string(),
+            ));
+        }
         Ok(QjlSketch {
             dim: self.dim,
             projections: self.projections,
             signs,
+            norm,
         })
     }
 
