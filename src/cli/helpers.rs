@@ -1,9 +1,10 @@
 //! Shared helpers for CLI command handlers.
 
 use ndarray::{Array1, Array2};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use splatsdb::{
+    loaders::load_energy_landscape,
     storage::persistence::{SplatsDBPersistence, StorageBackend},
     SplatStore, SplatsDBConfig,
 };
@@ -65,6 +66,9 @@ pub fn load_shard_store(
 /// exists but cannot be loaded into the store — unreadable, or rejected by
 /// `add_splat` (dimension/capacity mismatch) — are an `Err`. They never
 /// degrade to an empty store that answers "0 results" with exit 0.
+///
+/// F02f: it also applies the energy state (alpha/kappa) `ingest` persisted
+/// for the shard — see [`load_cli_energy_state`].
 pub fn try_load_shard_store(
     data_dir: &str,
     config: &SplatsDBConfig,
@@ -92,6 +96,10 @@ pub fn try_load_shard_store(
                     config.max_splats
                 ));
             }
+            // The energy state `ingest` persisted — the same policy serve
+            // applies (F02f): without it every CLI command reported the init
+            // alpha/kappa for vectors that have a derived energy state.
+            load_cli_energy_state(&mut store, &vectors, data_dir, shard)?;
             // Try loading persisted HNSW first; only build from scratch if needed
             store.build_index_if_needed(data_dir);
             Ok((store, Some(persist)))
@@ -108,6 +116,63 @@ pub fn try_load_shard_store(
         }
         Err(e) => Err(format!("failed to load shard '{}': {}", shard, e)),
     }
+}
+
+/// Apply the energy state (alpha/kappa) `ingest` persisted for the 'default'
+/// shard to a CLI-loaded store — the policy `serve` applies since F02e1.
+///
+/// Before F02f the CLI only fed the shard to `add_splat`, so every command
+/// reported the init values (1.0 / 10.0) for splats `ingest` had persisted
+/// with a derived energy state, and `serve` and the CLI disagreed on the
+/// same data-dir after a restart.
+///
+/// * no `energy/landscape.bin` → the init values (as serve);
+/// * a landscape that does not describe this shard (another dataset, or rows
+///   it never saw) → ignored / applied as a prefix (as serve);
+/// * unreadable or corrupt → `Err`: fail closed like an unreadable shard,
+///   never a silent fallback to the init values.
+fn load_cli_energy_state(
+    store: &mut SplatStore,
+    vectors: &Array2<f32>,
+    data_dir: &str,
+    shard: &str,
+) -> Result<(), String> {
+    let path = Path::new(data_dir).join("energy").join("landscape.bin");
+    if !path.is_file() {
+        return Ok(());
+    }
+    let landscape = load_energy_landscape(path.to_str().unwrap_or_default()).map_err(|e| {
+        format!(
+            "energy state '{}' is unreadable ({}): refusing to answer with the init alpha/kappa \
+             — re-run `ingest`, or delete the file to fall back to the init values (nothing was \
+             modified)",
+            path.display(),
+            e
+        )
+    })?;
+    let m = landscape.matching_prefix(vectors);
+    if m == 0 {
+        eprintln!(
+            "[splatsdb] WARNING: {} does not describe shard '{}' ({}x{} vs {}x{}): it is IGNORED \
+             and alpha/kappa stay at the init values",
+            path.display(),
+            shard,
+            landscape.mu.nrows(),
+            landscape.mu.ncols(),
+            vectors.nrows(),
+            vectors.ncols()
+        );
+        return Ok(());
+    }
+    let n = vectors.nrows();
+    let loaded = store
+        .load_energy(&landscape.alpha[..m], &landscape.kappa[..m])
+        .map_err(|e| format!("energy state '{}' cannot be applied: {}", path.display(), e))?;
+    eprintln!(
+        "[splatsdb] energy state cargado (alpha/kappa de {}/{} splats desde {})",
+        loaded, n, path.display()
+    );
+    Ok(())
 }
 
 pub fn parse_query(s: &str) -> Result<Array1<f32>, String> {
@@ -390,5 +455,152 @@ mod tests {
         assert!(err.contains("cannot open data-dir"), "{err}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── F02f: the CLI loader applies the persisted energy state like serve ──
+
+    /// The F02e1 corpus: six cluster centres with a different spread each
+    /// (so `ingest` derives a different kappa per cluster), eight noisy
+    /// chunks around every centre, in 32 dimensions.
+    fn energy_corpus() -> Array2<f32> {
+        const K: usize = 6;
+        const CENTRES: [[f32; 3]; K] = [
+            [0.0, 0.0, 0.0],
+            [1.2, 0.0, 0.0],
+            [0.0, 1.5, 0.0],
+            [0.0, 0.0, 1.1],
+            [-1.3, 0.7, 0.0],
+            [0.6, -1.4, 0.0],
+        ];
+        const SPREADS: [f64; K] = [0.02, 0.5, 0.1, 0.15, 0.3, 0.05];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut normal = |sigma: f64| -> f64 {
+            let mut next = || {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                let x = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                ((x >> 11) as f64) / ((1u64 << 53) as f64)
+            };
+            let u = next().max(1e-12);
+            let v = next();
+            sigma * (-2.0 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * v).cos()
+        };
+        let mut rows = Vec::with_capacity(K * 8);
+        for (c, centre) in CENTRES.iter().enumerate() {
+            for _ in 0..8 {
+                let mut row = vec![0.0f32; 32];
+                for (j, m) in centre.iter().enumerate() {
+                    row[j] = m + normal(SPREADS[c]) as f32;
+                }
+                rows.extend(row);
+            }
+        }
+        Array2::from_shape_vec((K * 8, 32), rows).unwrap()
+    }
+
+    /// `load_or_create_store` (every CLI reader/writer) feeds
+    /// `try_load_shard_store`: it must load the alpha/kappa `ingest`
+    /// persisted — exactly as serve does since F02e1.
+    #[test]
+    fn try_load_shard_store_loads_the_persisted_energy_state_like_serve() {
+        use ndarray::s;
+        let config = make_config(32, 1000);
+        let (init_alpha, init_kappa) = (config.init_alpha as f32, config.init_kappa as f32);
+        let mut ingested = SplatStore::new(config.clone());
+        match ingested.ingest_with_transformer(&energy_corpus(), 6, 7) {
+            Ok(_) => {}
+            Err(e) => panic!("ingest_with_transformer: {e}"),
+        }
+        let (mu, alpha, kappa) = (
+            ingested.get_mu().unwrap(),
+            ingested.get_alpha().unwrap(),
+            ingested.get_kappa().unwrap(),
+        );
+        assert!(
+            alpha.iter().any(|a| *a != init_alpha) && kappa.iter().any(|k| *k != init_kappa),
+            "the corpus must derive an energy state that differs from the init values"
+        );
+        let dir = temp_dir("energy-cli");
+        {
+            let persist = make_persistence(dir.to_str().unwrap(), "sqlite", false).unwrap();
+            persist.save_vectors(&mu, "default").unwrap();
+            persist
+                .save_energy_state(&mu, &alpha.to_vec(), &kappa.to_vec())
+                .unwrap();
+        }
+
+        // 1) The CLI loader and the library contract (`load_splats`) agree.
+        let (cli, _) = try_load_shard_store(dir.to_str().unwrap(), &config, "default").unwrap();
+        assert_eq!(cli.get_alpha().unwrap(), alpha, "the CLI loader must load alpha");
+        assert_eq!(cli.get_kappa().unwrap(), kappa, "the CLI loader must load kappa");
+        let mut reference = SplatStore::new(config.clone());
+        reference
+            .load_splats(&mu, alpha.as_slice().unwrap(), kappa.as_slice().unwrap())
+            .unwrap();
+        let mut q = vec![0.0f32; 32];
+        q[..3].copy_from_slice(&[0.6, 0.0, 0.0]); // between centre 0 and centre 1
+        let q = Array1::from(q);
+        let ranking = |s: &SplatStore| -> Vec<(usize, u32)> {
+            s.find_neighbors_gaussian(&q.view(), 6)
+                .iter()
+                .map(|n| (n.index, n.score.to_bits()))
+                .collect()
+        };
+        assert_eq!(
+            ranking(&cli),
+            ranking(&reference),
+            "the CLI loader must rank like load_splats"
+        );
+        let mut lost = SplatStore::new(config.clone());
+        lost.load_splats(&mu, &[init_alpha; 6], &[init_kappa; 6])
+            .unwrap();
+        assert_ne!(
+            ranking(&lost),
+            ranking(&reference),
+            "the query must tell the persisted state from the init values"
+        );
+
+        // 2) No landscape: the init values, exactly as in serve.
+        let bare = temp_dir("energy-absent");
+        make_persistence(bare.to_str().unwrap(), "sqlite", false)
+            .unwrap()
+            .save_vectors(&mu, "default")
+            .unwrap();
+        let (store, _) = try_load_shard_store(bare.to_str().unwrap(), &config, "default").unwrap();
+        assert!(store.get_alpha().unwrap().iter().all(|a| *a == init_alpha));
+        assert!(store.get_kappa().unwrap().iter().all(|k| *k == init_kappa));
+
+        // 3) A corrupt landscape fails closed, like an unreadable shard.
+        std::fs::write(bare.join("energy").join("landscape.bin"), [0x78u8; 40]).unwrap();
+        let err = try_load_shard_store(bare.to_str().unwrap(), &config, "default")
+            .err()
+            .expect("a corrupt energy state must not degrade to init values");
+        assert!(err.contains("energy state"), "{err}");
+
+        // 4) A landscape that describes another dataset is ignored, not applied.
+        make_persistence(bare.to_str().unwrap(), "sqlite", false)
+            .unwrap()
+            .save_energy_state(&mu.mapv(|x| x + 5.0), &alpha.to_vec(), &kappa.to_vec())
+            .unwrap();
+        let (store, _) = try_load_shard_store(bare.to_str().unwrap(), &config, "default").unwrap();
+        assert!(store.get_alpha().unwrap().iter().all(|a| *a == init_alpha));
+
+        // 5) A row the landscape does not know keeps the init values.
+        let mut grown = Array2::zeros((7, 32));
+        grown.slice_mut(s![..6, ..]).assign(&mu);
+        grown.row_mut(6).assign(&Array1::from(vec![9.0f32; 32]));
+        make_persistence(dir.to_str().unwrap(), "sqlite", false)
+            .unwrap()
+            .save_vectors(&grown, "default")
+            .unwrap();
+        let (store, _) = try_load_shard_store(dir.to_str().unwrap(), &config, "default").unwrap();
+        assert_eq!(store.get_alpha().unwrap().slice(s![..6]), alpha.slice(s![..6]));
+        assert_eq!(store.get_kappa().unwrap().slice(s![..6]), kappa.slice(s![..6]));
+        assert_eq!(store.get_alpha().unwrap()[6], init_alpha);
+        assert_eq!(store.get_kappa().unwrap()[6], init_kappa);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&bare);
     }
 }
