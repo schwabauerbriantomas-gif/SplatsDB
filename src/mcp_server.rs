@@ -106,6 +106,9 @@ fn fetch_real_embedding(text: &str, target_dim: usize) -> Option<Vec<f32>> {
 struct McpState {
     store: SplatStore,
     doc_store: SqliteMetadataStore,
+    /// False when `doc_store` fell back to `:memory:` (A03-F13): writes
+    /// succeed but persist nothing, and the client must see that.
+    doc_store_persistent: bool,
     /// Maps vector index → doc_id for retrieval
     vector_to_doc: HashMap<usize, String>,
     /// Maps doc_id → text content (in-memory cache with eviction)
@@ -212,6 +215,20 @@ impl DocTextCache {
 }
 
 impl McpState {
+    /// Assemble the live state around an (optionally persistent) doc store.
+    fn new(store: SplatStore, doc_store: SqliteMetadataStore, doc_store_persistent: bool) -> Self {
+        Self {
+            store,
+            doc_store,
+            doc_store_persistent,
+            vector_to_doc: HashMap::new(),
+            doc_texts: DocTextCache::default(),
+            next_id: 0,
+            graph: crate::graph_splat::GaussianGraphStore::new(),
+            spatial_index: crate::spatial::SpatialIndex::new(),
+        }
+    }
+
     fn cache_doc_text(&mut self, id: String, text: String) {
         self.doc_texts.insert(id, text);
     }
@@ -739,7 +756,15 @@ fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String
         vector_idx,
         text.len()
     );
-    Ok(json!({ "id": id, "status": "stored", "persisted": persisted }))
+    // `persisted` must be false when the store itself is in memory (A03-F13):
+    // a successful upsert into `:memory:` survives nothing.
+    let persisted = persisted && s.doc_store_persistent;
+    Ok(json!({
+        "id": id,
+        "status": "stored",
+        "persisted": persisted,
+        "ephemeral": !s.doc_store_persistent
+    }))
 }
 
 fn handle_search(state: &Mutex<McpState>, params: &Value) -> Result<Value, String> {
@@ -859,6 +884,8 @@ fn handle_status(state: &Mutex<McpState>) -> Result<Value, String> {
         "max_splats": s.store.max_splats(),
         "dimension": stats.embedding_dim,
         "doc_count": doc_count,
+        "persisted": s.doc_store_persistent,
+        "ephemeral": !s.doc_store_persistent,
         "has_hnsw": s.store.has_hnsw(),
         "has_lsh": s.store.has_lsh(),
         "has_quantization": s.store.has_quantization(),
@@ -1828,7 +1855,7 @@ pub fn run_mcp_server() {
     let mut store = SplatStore::new(config);
 
     // Initialize SQLite doc store
-    let doc_store = init_doc_store();
+    let (doc_store, doc_store_persistent) = init_doc_store();
 
     // Warm start: reload documents from SQLite into vector store.
     // SPLATDB_SPATIAL_WARMSTART=0|off|false skips the spatial registration
@@ -1850,15 +1877,11 @@ pub fn run_mcp_server() {
         warm_start_t0,
     );
 
-    let state = Mutex::new(McpState {
-        store,
-        doc_store,
-        vector_to_doc,
-        doc_texts,
-        next_id,
-        graph: crate::graph_splat::GaussianGraphStore::new(),
-        spatial_index: crate::spatial::SpatialIndex::new(),
-    });
+    let mut live = McpState::new(store, doc_store, doc_store_persistent);
+    live.vector_to_doc = vector_to_doc;
+    live.doc_texts = doc_texts;
+    live.next_id = next_id;
+    let state = Mutex::new(live);
 
     register_warm_start_spatial(
         &state,
@@ -2033,7 +2056,7 @@ fn register_warm_start_spatial(
 ///
 /// Extracted from `run_mcp_server`; messages and behavior identical,
 /// including the FATAL exit when even `:memory:` fails.
-fn init_doc_store() -> SqliteMetadataStore {
+fn init_doc_store() -> (SqliteMetadataStore, bool /* persistent */) {
     let db_path = std::env::var("SPLATSDB_DOC_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
@@ -2043,17 +2066,19 @@ fn init_doc_store() -> SqliteMetadataStore {
     match SqliteMetadataStore::new(db_path.clone()) {
         Ok(ds) => {
             eprintln!("[splatsdb] SQLite doc store: {:?}", db_path);
-            ds
+            (ds, true)
         }
         Err(e) => {
             eprintln!(
-                "[splatsdb] WARNING: SQLite init failed ({}), docs won't persist",
+                "[splatsdb] WARNING: SQLite init failed ({}), docs won't persist — running on an in-memory store (ephemeral:true, persisted:false)",
                 e
             );
-            SqliteMetadataStore::new(std::path::PathBuf::from(":memory:")).unwrap_or_else(|e| {
-                eprintln!("[splatsdb] FATAL: in-memory SQLite failed: {}", e);
-                std::process::exit(1);
-            })
+            let ephemeral = SqliteMetadataStore::new(std::path::PathBuf::from(":memory:"))
+                .unwrap_or_else(|e| {
+                    eprintln!("[splatsdb] FATAL: in-memory SQLite failed: {}", e);
+                    std::process::exit(1);
+                });
+            (ephemeral, false)
         }
     }
 }

@@ -28,6 +28,8 @@ struct Server {
     stdin: ChildStdin,
     out: Receiver<String>,
     err: Receiver<String>,
+    /// stderr lines already drained (startup happens before the first wait).
+    err_log: Vec<String>,
 }
 
 fn spawn_server(doc_db: &std::path::Path, envs: &[(&str, &str)]) -> Server {
@@ -52,6 +54,7 @@ fn spawn_server(doc_db: &std::path::Path, envs: &[(&str, &str)]) -> Server {
         stdin,
         out,
         err,
+        err_log: Vec::new(),
     };
     assert!(
         srv.wait_stderr_containing("MCP server ready", STARTUP_TIMEOUT),
@@ -135,11 +138,17 @@ impl Server {
     }
 
     fn wait_stderr_containing(&mut self, needle: &str, timeout: Duration) -> bool {
+        // Lines drained earlier (e.g. startup warnings consumed while waiting
+        // for "MCP server ready") are kept in `err_log` and checked first.
+        if self.err_log.iter().any(|l| l.contains(needle)) {
+            return true;
+        }
         let deadline = Instant::now() + timeout;
         while let Ok(line) = self
             .err
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         {
+            self.err_log.push(line.clone());
             if line.contains(needle) {
                 return true;
             }

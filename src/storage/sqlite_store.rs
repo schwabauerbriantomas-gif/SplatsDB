@@ -25,11 +25,16 @@ use std::sync::Mutex;
 /// default fsync per commit when running on the rollback journal.
 pub struct SqliteMetadataStore {
     conn: Mutex<Connection>,
+    /// True for `:memory:`: nothing written here survives the process.
+    ephemeral: bool,
 }
 
 impl SqliteMetadataStore {
     pub fn new(db_path: PathBuf) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        std::fs::create_dir_all(db_path.parent().unwrap_or(&db_path))?;
+        // `:memory:` has no parent directory — and must not materialize one.
+        if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
         let conn = Connection::open(&db_path)?;
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         // WAL can silently fail (returns the old mode) on some filesystems
@@ -63,6 +68,7 @@ impl SqliteMetadataStore {
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
+            ephemeral: db_path.to_string_lossy() == ":memory:",
         })
     }
 
@@ -85,6 +91,12 @@ impl SqliteMetadataStore {
         let conn = self.conn.lock().map_err(|e| format!("mutex: {e}"))?;
         let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
         Ok(mode)
+    }
+
+    /// True when the store lives in process memory (`:memory:`): writes
+    /// succeed but survive nothing.
+    pub fn is_ephemeral(&self) -> bool {
+        self.ephemeral
     }
 }
 
