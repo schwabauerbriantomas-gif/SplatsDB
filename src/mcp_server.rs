@@ -1922,6 +1922,14 @@ fn dispatch_request(state: &Mutex<McpState>, req: &JsonRpcRequest) -> JsonRpcRes
             error: None,
         },
 
+        // MCP liveness probe answers an empty result object (was -32601).
+        "ping" => JsonRpcResponse {
+            jsonrpc: "2.0".into(),
+            id: req.id.clone(),
+            result: Some(json!({})),
+            error: None,
+        },
+
         "tools/list" => JsonRpcResponse {
             jsonrpc: "2.0".into(),
             id: req.id.clone(),
@@ -1957,7 +1965,19 @@ fn dispatch_request(state: &Mutex<McpState>, req: &JsonRpcRequest) -> JsonRpcRes
                 "splatsdb_verbatim_search" => handle_verbatim_search(state, &arguments),
                 "splatsdb_compress" => handle_compress(&arguments),
                 "splatsdb_decompress" => handle_decompress(&arguments),
-                _ => Err(format!("unknown tool: {}", tool_name)),
+                // An unknown tool is a PROTOCOL error (invalid params),
+                // not a tool execution error wrapped in `isError` (A03-F15).
+                _ => {
+                    return JsonRpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: req.id.clone(),
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32602,
+                            message: format!("Unknown tool: {}", tool_name),
+                        }),
+                    };
+                }
             };
 
             match result {
