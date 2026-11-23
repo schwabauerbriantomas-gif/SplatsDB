@@ -674,6 +674,25 @@ pub(crate) fn query_shape_error(len: usize, n_queries: usize, dim: usize) -> Opt
     }
 }
 
+/// `dataset` must be `n_rows` rows of `dim` f32, laid out flat — the rule
+/// `GpuIndex::upload_dataset` enforces before any host→device copy. The CPU
+/// fallbacks slice-index the rows, so a short buffer has to be refused before
+/// indexing (it panicked) and a long one is not silently accepted either
+/// (A02-F06). Returns a description of the violated invariant, or `None`
+/// when well-formed.
+pub(crate) fn dataset_shape_error(len: usize, n_rows: usize, dim: usize) -> Option<String> {
+    if dim == 0 {
+        return Some("dim is 0".to_string());
+    }
+    match n_rows.checked_mul(dim) {
+        Some(expected) if len == expected => None,
+        Some(expected) => Some(format!(
+            "dataset buffer holds {len} floats, expected {n_rows} x {dim} = {expected}"
+        )),
+        None => Some(format!("n_rows x dim overflows usize ({n_rows} x {dim})")),
+    }
+}
+
 /// First malformed query shape seen in this process, logged exactly once
 /// (same house style as the CUDA layer: signal, never spam).
 static QUERY_SHAPE_LOG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -692,6 +711,10 @@ fn cpu_l2_distances(query: &[f32], dataset: &[f32], n_rows: usize, dim: usize) -
         warn_query_shape_once("batch_l2_distances", &err);
         return Vec::new();
     }
+    if let Some(err) = dataset_shape_error(dataset.len(), n_rows, dim) {
+        warn_query_shape_once("batch_l2_distances", &err);
+        return Vec::new();
+    }
     let mut distances = Vec::with_capacity(n_rows);
     for i in 0..n_rows {
         let row = &dataset[i * dim..(i + 1) * dim];
@@ -707,6 +730,10 @@ fn cpu_l2_distances(query: &[f32], dataset: &[f32], n_rows: usize, dim: usize) -
 
 fn cpu_cosine_distances(query: &[f32], dataset: &[f32], n_rows: usize, dim: usize) -> Vec<f32> {
     if let Some(err) = query_shape_error(query.len(), 1, dim) {
+        warn_query_shape_once("batch_cosine_distances", &err);
+        return Vec::new();
+    }
+    if let Some(err) = dataset_shape_error(dataset.len(), n_rows, dim) {
         warn_query_shape_once("batch_cosine_distances", &err);
         return Vec::new();
     }
@@ -731,6 +758,10 @@ fn cpu_batch_search(
     metric: &str,
 ) -> Vec<(Vec<usize>, Vec<f32>)> {
     if let Some(err) = query_shape_error(queries.len(), n_queries, dim) {
+        warn_query_shape_once("batch_search", &err);
+        return Vec::new();
+    }
+    if let Some(err) = dataset_shape_error(dataset.len(), n_vectors, dim) {
         warn_query_shape_once("batch_search", &err);
         return Vec::new();
     }
@@ -920,6 +951,43 @@ mod tests {
     /// launching: a short query is an out-of-bounds device read, a long one a
     /// silent truncation. A valid call right afterwards must still return
     /// exact values — the context was never poisoned.
+    /// A02-F06 (dataset side, CPU fallback): `dataset` must hold exactly
+    /// `n_rows * dim` floats — the same rule `GpuIndex::upload_dataset`
+    /// enforces before any host→device copy. A short buffer panicked on the
+    /// row slice; a long one was silently accepted. An invalid call returns
+    /// an EMPTY Vec on every path (a well-formed call returns exactly
+    /// `n_rows` distances / `n_queries` result pairs); nothing panics.
+    #[test]
+    fn test_malformed_dataset_len_yields_no_results_without_panic() {
+        let short = vec![0.0f32, 1.0, 1.0, 1.0, 1.0]; // 3 rows x dim 2 needs 6
+        let long = vec![0.0f32, 1.0, 1.0, 1.0, 1.0, 1.0, 9.9]; // trailing garbage
+        for ds in [&short, &long] {
+            assert!(cpu_l2_distances(&[0.0, 0.0], ds, 3, 2).is_empty());
+            assert!(
+                cpu_cosine_distances(&[0.0, 0.0], ds, 3, 2).is_empty(),
+                "short/long dataset must yield no cosine distances"
+            );
+            assert!(cpu_batch_search(&[0.0, 0.0], 1, ds, 3, 2, 2, "l2").is_empty());
+            assert!(cpu_batch_search(&[0.0, 0.0], 1, ds, 3, 2, 2, "cosine").is_empty());
+            // Public wrappers keep the same contract (CPU build and CUDA build).
+            assert!(batch_l2_distances(&[0.0, 0.0], ds, 3, 2).is_empty());
+            assert!(batch_cosine_distances(&[0.0, 0.0], ds, 3, 2).is_empty());
+            assert!(batch_search(&[0.0, 0.0], 1, ds, 3, 2, 2, "l2").is_empty());
+        }
+        // n_rows x dim overflows usize
+        let one = vec![0.0f32];
+        assert!(cpu_l2_distances(&[0.0, 0.0], &one, usize::MAX, 2).is_empty());
+        assert!(cpu_batch_search(&[0.0, 0.0], 1, &one, usize::MAX, 2, 2, "l2").is_empty());
+        // Well-formed: exact count, values untouched.
+        let ok = vec![0.0f32, 0.0, 3.0, 4.0, 0.0, 2.0];
+        assert_eq!(
+            cpu_l2_distances(&[0.0, 0.0], &ok, 3, 2),
+            vec![0.0, 25.0, 4.0]
+        );
+        assert_eq!(batch_l2_distances(&[0.0, 0.0], &ok, 3, 2).len(), 3);
+        assert_eq!(batch_search(&[0.0, 0.0], 1, &ok, 3, 2, 2, "l2").len(), 1);
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn test_cuda_malformed_query_shape_declined_before_launch() {
