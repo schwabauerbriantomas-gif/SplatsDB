@@ -4,7 +4,13 @@
 //! a NaN/±Inf, or a row that fails to encode returns `Err` and leaves ids, codes and
 //! `len()` untouched; non-finite input never becomes a code.
 //!
+//! A02-F03: the estimator contract (property tests + evidence probes) lives in
+//! `quant_contracts/properties.rs`.
+//!
 //! Run: `cargo test --no-default-features --test quant_contracts`
+
+#[path = "quant_contracts/properties.rs"]
+mod properties;
 
 use ndarray::Array2;
 use rand::Rng;

@@ -3,8 +3,12 @@
 //! 1. PolarQuant stage (bits-1): Compress vector via polar encoding.
 //! 2. QJL stage (1 bit per projection): Sketch the residual for unbiased correction.
 //!
-//! Combined estimator: <x, y> ~ IP_polar + IP_qjl(residual)
-//! This is provably unbiased (TurboQuant paper, ICLR 2026).
+//! Combined estimator: <x, y> ~ IP_polar(x_hat) + IP_qjl(residual), with x_hat the
+//! polar reconstruction (deterministic) and residual = x - x_hat. Averaged over the
+//! Gaussian projection matrix the QJL term equals <residual, y> for any residual norm,
+//! so the sum is an unbiased estimate of <x, y> (property test in tests/quant_contracts:
+//! mean over 1000 projection seeds within 2%). This holds since the QJL scale fix;
+//! before it, the residual term was biased by sqrt(pi/2)/||residual||.
 //!
 //! License: MIT (adapted from github.com/RecursiveIntell/turbo-quant)
 
@@ -118,7 +122,8 @@ impl TurboQuantizer {
     }
 
     /// Estimate <original_vector, query> from a TurboCode and raw query.
-    /// Provably unbiased.
+    /// Unbiased in expectation over the projection matrix (see module docs); not a
+    /// per-code guarantee.
     pub fn inner_product_estimate(&self, code: &TurboCode, query: &[f32]) -> Result<f32> {
         if query.len() != self.dim {
             return Err(QuantError::DimensionMismatch {

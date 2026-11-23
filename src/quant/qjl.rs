@@ -1,9 +1,18 @@
 //! Quantized Johnson-Lindenstrauss (QJL) transform for unbiased inner product estimation.
 //!
-//! Projects a d-dimensional vector onto m random hyperplanes and records only
-//! the sign of each projection. This costs exactly 1 bit per projection dimension.
+//! Projects a d-dimensional vector x onto m random hyperplanes g_i ~ N(0, I) and records
+//! the sign of each projection. The current layout stores one i8 per sign plus the f32
+//! norm of x (unpacked; bit-packing is out of scope).
 //!
-//! Unbiased estimator: <x, y> ~ (pi / 2m) * sum_i sign(g_i . x) * (g_i . y)
+//! Unbiased estimator (expectation over g, for ANY ||x||):
+//!
+//!   E[sign(g.x)(g.y)] = sqrt(2/pi) * <x,y> / ||x||
+//!   =>  <x, y> ~ sqrt(pi/2) * ||x|| / m * sum_i sign(g_i.x) * (g_i.y)
+//!
+//! Until schema v1 the scale was pi/(2m) without the ||x|| factor, i.e. the estimate
+//! equaled sqrt(pi/2)/||x|| times the true inner product (unbiased only at
+//! ||x|| = sqrt(pi/2)). Verified numerically in tests/quant_contracts (mean over 2000
+//! deterministic pairs per norm group, tolerance 2%).
 //!
 //! Reference: "Quantized Johnson-Lindenstrauss is Optimal for Inner Products"
 //! Zandieh et al., AAAI 2025.
@@ -168,9 +177,17 @@ impl QjlQuantizer {
                 got: query.len(),
             });
         }
+        if sketch.signs.len() != self.projections {
+            return Err(QuantError::MalformedCode(format!(
+                "QJL sketch has {} signs, this quantizer has {} projections",
+                sketch.signs.len(),
+                self.projections
+            )));
+        }
         let g = self.projection_matrix();
         let m = self.projections as f32;
-        let scale = PI / (2.0 * m);
+        // E[sign(g.x)(g.q)] = sqrt(2/pi) * <x,q>/||x||  =>  scale = sqrt(pi/2) * ||x|| / m
+        let scale = (PI / 2.0).sqrt() * sketch.norm / m;
         let estimate: f32 = g
             .iter()
             .zip(sketch.signs.iter())
@@ -213,19 +230,27 @@ mod tests {
     }
 
     #[test]
-    fn inner_product_unbiased() {
-        // Use more projections for reliable unbiased estimation
-        let q = QjlQuantizer::new(16, 4096, 0).unwrap();
+    fn inner_product_estimate_scales_with_the_norm_of_x() {
+        // Doubling x leaves every sign unchanged, so an unbiased estimator must double.
+        // (The full statistical property lives in tests/quant_contracts/properties.rs.)
+        let q = QjlQuantizer::new(16, 64, 0).unwrap();
         let x = random_vector(16, 10);
         let y = random_vector(16, 20);
-        let exact: f32 = x.iter().zip(y.iter()).map(|(a, b)| a * b).sum();
-        let sketch = q.sketch(&x).unwrap();
-        let estimated = q.inner_product_estimate(&sketch, &y).unwrap();
-        let error = (estimated - exact).abs();
-        let tolerance = 0.30 * exact.abs() + 3.0;
-        assert!(
-            error < tolerance,
-            "error={error:.3}, exact={exact:.3}, estimated={estimated:.3}"
-        );
+        let x2: Vec<f32> = x.iter().map(|v| 2.0 * v).collect();
+        let e1 = q
+            .inner_product_estimate(&q.sketch(&x).unwrap(), &y)
+            .unwrap();
+        let e2 = q
+            .inner_product_estimate(&q.sketch(&x2).unwrap(), &y)
+            .unwrap();
+        assert!((e2 - 2.0 * e1).abs() <= 1e-5 * e2.abs(), "e1={e1}, e2={e2}");
+    }
+
+    #[test]
+    fn sketch_with_wrong_projection_count_is_rejected() {
+        let q = QjlQuantizer::new(8, 4, 0).unwrap();
+        let other = QjlQuantizer::new(8, 8, 0).unwrap();
+        let sketch = other.sketch(&vec![1.0f32; 8]).unwrap();
+        assert!(q.inner_product_estimate(&sketch, &[1.0f32; 8]).is_err());
     }
 }
