@@ -10,7 +10,7 @@ use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
@@ -47,9 +47,35 @@ fn embedding_service_url() -> String {
         .unwrap_or_else(|_| EMBEDDING_SERVICE_URL_DEFAULT.to_string())
 }
 
+/// SIGINT and SIGTERM (A03-F15). The handler only sets the flag; the read
+/// blocked on stdin is what carries it out — see `install_shutdown_handlers`
+/// and `read_line_capped`.
 #[cfg(unix)]
 extern "C" fn handle_sigint(_: i32) {
     SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+/// First thing `run_mcp_server` does (A03-F15): from here on SIGINT and
+/// SIGTERM request a shutdown instead of killing the process — SIGTERM had
+/// no handler at all and terminated the server mid-request.
+///
+/// `sigaction` WITHOUT `SA_RESTART`, unlike the former `signal()` (BSD
+/// semantics: restart): the read blocked on an idle stdin now returns EINTR
+/// instead of silently going back to sleep, so the flag is seen while the
+/// server is idle — not only when the next complete line arrives.
+#[cfg(unix)]
+fn install_shutdown_handlers() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        // The handler slot of the union (`sighandler_t`).
+        sa.sa_sigaction = handle_sigint as *const () as usize;
+        // Deliberately no SA_RESTART.
+        sa.sa_flags = 0;
+        libc::sigemptyset(&mut sa.sa_mask);
+        for sig in [libc::SIGINT, libc::SIGTERM] {
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
 }
 
 /// Embedding from the service only: None when the service is unavailable or
@@ -2359,6 +2385,11 @@ fn graph_dir_for(
 }
 
 pub fn run_mcp_server() {
+    // A03-F15: before anything slow (warm start), so a signal during the
+    // start-up is a shutdown request and not a kill.
+    #[cfg(unix)]
+    install_shutdown_handlers();
+
     eprintln!(
         "[splatsdb] MCP server v{} starting (stdio transport)...",
         env!("CARGO_PKG_VERSION")
@@ -2409,14 +2440,6 @@ pub fn run_mcp_server() {
     let mut stdout = io::stdout();
     let mut reader = stdin.lock();
 
-    // Set up signal handler for graceful shutdown
-    #[cfg(unix)]
-    {
-        unsafe {
-            libc::signal(libc::SIGINT, handle_sigint as *const () as usize);
-        }
-    }
-
     eprintln!("[splatsdb] MCP server ready. Waiting for JSON-RPC on stdin...");
     eprintln!(
         "[splatsdb] Env vars: SPLATSDB_EMBED_URL={}, SPLATSDB_DOC_PATH={}, SPLATSDB_ALLOW_SIMCOS={}",
@@ -2444,6 +2467,9 @@ pub fn run_mcp_server() {
 
         let line = match read_request_line(&mut reader, &mut raw_line, &mut pending) {
             LineRead::Eof => break,
+            // A03-F15: SIGINT/SIGTERM interrupted the read — the loop head
+            // looks at the flag and leaves.
+            LineRead::Interrupted => continue,
             LineRead::Skip => {
                 // The oversized line was drained inside read_request_line.
                 // Reply anyway: the client's request (undetectable → id:null)
@@ -2527,7 +2553,15 @@ pub fn run_mcp_server() {
         }
     }
 
-    eprintln!("[splatsdb] MCP server shutting down (stdin closed.");
+    let _ = stdout.flush();
+    eprintln!(
+        "[splatsdb] MCP server shutting down ({}).",
+        if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+            "shutdown signal"
+        } else {
+            "stdin closed"
+        }
+    );
 }
 
 /// (doc_id, wing, room, hall) pairs collected during warm start for spatial
@@ -2802,6 +2836,8 @@ fn warm_start_reload(
 enum LineRead {
     /// A complete (possibly empty after trimming) request line.
     Line(String),
+    /// Interrupted while a shutdown is pending — the line is left as it is.
+    Interrupted,
     /// Oversized line rejected and drained — skip to the next read.
     Skip,
     /// EOF or stdin error — leave the main loop.
@@ -2814,6 +2850,51 @@ enum LineRead {
 /// MAX+1 bytes; the remainder of an oversized line is drained in 8KB chunks
 /// and skipped, never buffered whole.
 ///
+/// `read_until(b'\n')` under a hard cap on the line length (A03-F15).
+///
+/// std's `read_until` swallows `ErrorKind::Interrupted` — it retries the
+/// read — so a signal arriving while the server was blocked on an idle stdin
+/// was never seen. With the shutdown handlers installed WITHOUT SA_RESTART
+/// the read returns EINTR and THIS is where it gets out: `Ok(None)` means
+/// "interrupted while a shutdown is pending". Any other interruption simply
+/// goes on reading and keeps the partial line (the stream stays in sync).
+/// `cap` bounds `raw_line.len()` exactly like the former `Take` bounded the
+/// bytes it read.
+fn read_line_capped(
+    reader: &mut impl std::io::BufRead,
+    raw_line: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<Option<usize>> {
+    let mut read = 0;
+    loop {
+        let room = cap.saturating_sub(raw_line.len());
+        if room == 0 {
+            return Ok(Some(read));
+        }
+        let available = match reader.fill_buf() {
+            Ok(buf) => buf,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
+                if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let taken = available.len().min(room);
+        let (used, done) = match available[..taken].iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (taken, false),
+        };
+        raw_line.extend_from_slice(&available[..used]);
+        reader.consume(used);
+        read += used;
+        if done || used == 0 {
+            return Ok(Some(read));
+        }
+    }
+}
+
 /// Extracted from `run_mcp_server`; behavior identical, including the
 /// `pending` seeding: bytes that followed an oversized line's '\n' inside a
 /// drained chunk are the START of the next (valid) request and must NOT be
@@ -2825,8 +2906,7 @@ fn read_request_line(
 ) -> LineRead {
     raw_line.clear();
     let read = if pending.is_empty() {
-        let mut capped = reader.take(MAX_JSONRPC_LINE_LEN as u64 + 1);
-        capped.read_until(b'\n', raw_line)
+        read_line_capped(reader, raw_line, MAX_JSONRPC_LINE_LEN + 1)
     } else if let Some(pos) = pending.iter().position(|&b| b == b'\n') {
         // Pending holds ≥1 COMPLETE line (pipelined requests that followed the
         // oversized one): return the first now and keep the rest queued.
@@ -2847,11 +2927,15 @@ fn read_request_line(
         raw_line.extend_from_slice(pending);
         pending.clear();
         let seeded = raw_line.len();
-        let mut capped = reader.take(MAX_JSONRPC_LINE_LEN as u64 + 1);
-        match capped.read_until(b'\n', raw_line) {
-            Ok(n) => Ok(seeded + n),
-            Err(e) => Err(e),
-        }
+        // Same bound as the former `Take`: at most MAX+1 fresh bytes.
+        read_line_capped(reader, raw_line, seeded + MAX_JSONRPC_LINE_LEN + 1)
+            .map(|read| read.map(|n| n + seeded))
+    };
+    let read = match read {
+        // A03-F15: the shutdown signal interrupted the read.
+        Ok(None) => return LineRead::Interrupted,
+        Ok(Some(read)) => Ok(read),
+        Err(e) => Err(e),
     };
     match read {
         Ok(0) => LineRead::Eof, // EOF — stdin closed
