@@ -95,6 +95,25 @@ fn build_quant_store(
     crate::quantization::QuantizedStore::new(dim, qcfg).ok()
 }
 
+/// Build the optional LSH index from the preset config.
+///
+/// Extracted from `SplatStore::new`; also used to reset the index to its
+/// empty state when the rows it was built over are invalidated.
+fn build_lsh(config: &SplatsDBConfig, dim: usize) -> Option<crate::lsh_index::CrossPolytopeLSH> {
+    if !config.enable_lsh {
+        return None;
+    }
+    let lsh_cfg = crate::lsh_index::LSHConfig {
+        dim,
+        n_tables: 16,
+        n_bits: 8,
+        n_probes: 3,
+        n_candidates: 100,
+        seed: 42,
+    };
+    Some(crate::lsh_index::CrossPolytopeLSH::new(lsh_cfg))
+}
+
 impl SplatStore {
     /// Gaussian score of a splat for a query at squared distance `d2`.
     ///
@@ -138,19 +157,7 @@ impl SplatStore {
             None
         };
 
-        let lsh = if config.enable_lsh {
-            let lsh_cfg = crate::lsh_index::LSHConfig {
-                dim,
-                n_tables: 16,
-                n_bits: 8,
-                n_probes: 3,
-                n_candidates: 100,
-                seed: 42,
-            };
-            Some(crate::lsh_index::CrossPolytopeLSH::new(lsh_cfg))
-        } else {
-            None
-        };
+        let lsh = build_lsh(&config, dim);
 
         Self {
             config,
@@ -365,6 +372,29 @@ impl SplatStore {
     }
 
     // ── Incremental HNSW insertion ──────────────────────────────────
+
+    /// Reset every positional index to its empty state.
+    ///
+    /// Called after rows moved or were replaced in place (`compact`,
+    /// `load_splats`). The candidate backend, the HRM2 engine, the quantized
+    /// store and the LSH tables all address rows by store position, so they
+    /// are meaningless afterwards. Until the next `build_index` /
+    /// `hnsw_sync_incremental`, every search falls back to the exact linear
+    /// path and `hnsw_needs_sync()` reports true.
+    ///
+    /// The backend graph is really rebuilt as empty: lowering
+    /// `hnsw_indexed_count` alone would leave a stale graph searchable and
+    /// make the next incremental insert land on shifted positions.
+    fn invalidate_positional_indexes(&mut self) {
+        let dim = self.config.latent_dim;
+        if let Some(ref mut backend) = self.candidates {
+            backend.build(&Array2::zeros((0, dim)));
+        }
+        self.hnsw_indexed_count = 0;
+        self.engine.invalidate();
+        self.quant_store = build_quant_store(&self.config, dim);
+        self.lsh = build_lsh(&self.config, dim);
+    }
 
     /// Check if the candidate backend has unindexed vectors (new vectors since
     /// last build/insert).
@@ -976,6 +1006,9 @@ impl SplatStore {
         self.next_id = n as u64;
         // Full overwrite → bump the VRAM-cache key.
         self.data_version += 1;
+        // Every row may have changed under the same positions: the indexes
+        // built over the previous content are stale.
+        self.invalidate_positional_indexes();
         Ok(())
     }
 
@@ -1056,6 +1089,10 @@ impl SplatStore {
         self.n_active = write_idx;
         // Row content/order changed → bump the VRAM-cache key.
         self.data_version += 1;
+        if write_idx < n {
+            // Rows shifted down: the positional indexes now point at other rows.
+            self.invalidate_positional_indexes();
+        }
     }
 
     /// Get store statistics.

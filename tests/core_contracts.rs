@@ -307,3 +307,125 @@ fn f02_insert_with_hnsw_single_does_not_skip_the_backlog() {
     let query = Array1::from_vec(vec);
     assert_self_query_hits(&store, &query.view(), 50, "insert_with_hnsw new vector");
 }
+
+// ── A01-F04: `compact()` / `load_splats()` invalidate every positional index ─
+//
+// Both mutators move or replace rows in place. The HNSW graph, the HRM2
+// engine, the quantized store and the LSH tables index rows by position, so
+// they are meaningless afterwards — and `hnsw_needs_sync()` used to keep
+// answering false.
+
+#[test]
+fn f04_compact_invalidates_positional_indexes() {
+    let dim = 16;
+    let n = 20;
+    let data = random_vectors(n, dim, 3);
+    let mut alpha = ones(n);
+    // compact() drops alpha < 1e-6 → every later row shifts down by one.
+    alpha[0] = 0.0;
+    let mut store = SplatStore::new(config_all_subsystems(dim, 1000));
+    store.load_splats(&data, &alpha, &ones(n)).unwrap();
+    store.build_index();
+    assert!(!store.hnsw_needs_sync());
+
+    store.compact();
+    assert_eq!(store.n_active(), 19);
+    assert!(
+        !store.hnsw_is_built(),
+        "the pre-compact graph must not be searched"
+    );
+    assert!(
+        store.hnsw_needs_sync(),
+        "compact() must leave the backend out of sync until it is rebuilt"
+    );
+
+    // Old idx 5 now lives at idx 4.
+    let query = data.row(5).to_owned();
+    let results = store.find_neighbors_fused(&query.view(), 1);
+    assert_eq!(
+        results[0].index, 4,
+        "fused search after compact must see shifted rows"
+    );
+    assert!(results[0].distance < 1e-4);
+
+    // A later incremental sync repairs the alignment in positional order.
+    assert_eq!(store.hnsw_sync_incremental(), 19);
+    assert!(!store.hnsw_needs_sync());
+    let results = store.find_neighbors_fused(&query.view(), 1);
+    assert_eq!(results[0].index, 4);
+    assert!(results[0].distance < 1e-4);
+}
+
+#[test]
+fn f04_compact_without_removals_keeps_the_indexes() {
+    let dim = 16;
+    let n = 20;
+    let data = random_vectors(n, dim, 3);
+    let mut store = SplatStore::new(config_all_subsystems(dim, 1000));
+    store.load_splats(&data, &ones(n), &ones(n)).unwrap();
+    store.build_index();
+
+    store.compact();
+    assert_eq!(store.n_active(), n);
+    // Nothing moved: invalidating would only cost a needless rebuild.
+    assert!(store.hnsw_is_built());
+    assert!(!store.hnsw_needs_sync());
+    let query = data.row(9).to_owned();
+    let results = store.find_neighbors_fused(&query.view(), 1);
+    assert_eq!(results[0].index, 9);
+    assert!(results[0].distance < 1e-4);
+}
+
+#[test]
+fn f04_load_splats_invalidates_hnsw_quant_and_lsh() {
+    let dim = 16;
+    let n = 20;
+    let a = random_vectors(n, dim, 3);
+    let mut store = SplatStore::new(config_all_subsystems(dim, 1000));
+    store.load_splats(&a, &ones(n), &ones(n)).unwrap();
+    store.build_index();
+    assert!(!store.hnsw_needs_sync());
+
+    // A different dataset with the SAME row count: a length check alone
+    // cannot tell it apart from the indexed one.
+    let b = &a + 100.0;
+    store.load_splats(&b, &ones(n), &ones(n)).unwrap();
+    assert!(!store.hnsw_is_built(), "stale graph must not be searched");
+    assert!(
+        store.hnsw_needs_sync(),
+        "load_splats() must mark the backend stale"
+    );
+
+    let query = b.row(7).to_owned();
+    let results = store.find_neighbors_fused(&query.view(), 1);
+    assert_eq!(results[0].index, 7);
+    assert!(results[0].distance < 1e-4);
+
+    store.hnsw_sync_incremental();
+    assert!(!store.hnsw_needs_sync());
+    let results = store.find_neighbors_fused(&query.view(), 1);
+    assert_eq!(results[0].index, 7);
+    assert!(results[0].distance < 1e-4);
+}
+
+#[test]
+fn f04_load_splats_invalidates_the_hrm2_engine() {
+    let dim = 16;
+    let n = 150;
+    let a = random_vectors(n, dim, 3);
+    let mut store = SplatStore::new(config(dim, 1000));
+    store.load_splats(&a, &ones(n), &ones(n)).unwrap();
+    store.build_index();
+
+    let b = &a + 100.0;
+    store.load_splats(&b, &ones(n), &ones(n)).unwrap();
+    // n >= 100: without invalidation this answers from the previous
+    // dataset's clusters.
+    let query = b.row(7).to_owned();
+    let results = store.find_neighbors_fast(&query.view(), 1);
+    assert_eq!(
+        results[0].index, 7,
+        "find_neighbors_fast must not answer from the previous dataset's index"
+    );
+    assert!(results[0].distance < 1e-4);
+}

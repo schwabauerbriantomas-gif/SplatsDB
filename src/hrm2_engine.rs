@@ -374,6 +374,24 @@ impl HRM2Engine {
         self.is_indexed
     }
 
+    /// Drop the index state: embeddings, coarse/fine models, assignments and
+    /// cluster tables. The raw splats are kept (unlike [`clear`](Self::clear)).
+    ///
+    /// Afterwards `is_indexed()` is false and `query` fails closed with
+    /// "Index not built" until `index()` runs again. `SplatStore` calls this
+    /// when the rows an index was built over are invalidated.
+    pub fn invalidate(&mut self) {
+        self.embeddings = None;
+        self.coarse_model = None;
+        self.coarse_assignments = None;
+        self.fine_models.clear();
+        self.fine_assignments.clear();
+        self.cluster_indices.clear();
+        self.cluster_embeddings.clear();
+        self.cluster_masks.clear();
+        self.is_indexed = false;
+    }
+
     /// Reset the engine, removing all data and index state.
     pub fn clear(&mut self) {
         self.splats.clear();
