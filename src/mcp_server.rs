@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use crate::config::SplatsDBConfig;
 use crate::splats::SplatStore;
 use crate::storage::metadata_store::{DocumentRecord, MetadataStore};
-use crate::storage::sqlite_store::SqliteMetadataStore;
+use crate::storage::sqlite_store::{EmbeddingProvenance, SqliteMetadataStore};
 
 // ============================================================================
 // Embedding client — real model via HTTP, SimCos fallback
@@ -92,6 +92,66 @@ impl EmbeddingSource {
             Self::Provided => "provided",
         }
     }
+}
+
+/// How the provenance of an indexed vector is reported per search result:
+/// `real`/`simcos`/`provided` when the vector was produced in this session,
+/// `stored_real`/`stored_simcos`/`stored_provided` when the warm start
+/// loaded it from SQLite (A03-F10, persistence half). The label travels
+/// with the vector: a SimCos vector is never reported as real.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VectorProvenance {
+    Live(EmbeddingSource),
+    Stored(EmbeddingProvenance),
+}
+
+impl VectorProvenance {
+    fn label(self) -> String {
+        match self {
+            Self::Live(src) => src.label().to_string(),
+            Self::Stored(src) => format!("stored_{}", src.label()),
+        }
+    }
+}
+
+/// Provenance label persisted next to a vector in SQLite.
+fn provenance_of(src: EmbeddingSource) -> EmbeddingProvenance {
+    match src {
+        EmbeddingSource::Real => EmbeddingProvenance::Real,
+        EmbeddingSource::SimCos => EmbeddingProvenance::SimCos,
+        EmbeddingSource::Provided => EmbeddingProvenance::Provided,
+    }
+}
+
+/// Accounting of one warm start (logged and exported by `splatsdb_status`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WarmStartStats {
+    /// Live documents found in SQLite.
+    documents: usize,
+    /// Vectors loaded straight from SQLite — no embedding was computed.
+    vectors_loaded: usize,
+    stored_real: usize,
+    stored_simcos: usize,
+    stored_provided: usize,
+    /// Documents WITHOUT a stored vector (legacy rows) that were embedded
+    /// and indexed in this warm start.
+    reembedded: usize,
+    /// Documents without a stored vector that could not be embedded.
+    unindexed: usize,
+    /// Rows whose stored vector was refused (left untouched on disk).
+    quarantined: usize,
+}
+
+/// Everything `run_mcp_server` builds its state from after a warm start.
+struct WarmStartOutcome {
+    vector_to_doc: HashMap<usize, String>,
+    doc_texts: DocTextCache,
+    next_id: usize,
+    spatial: WarmStartSpatial,
+    stats: WarmStartStats,
+    /// Docs whose indexed vector came from SQLite, with the provenance they
+    /// were originally stored with.
+    sources: HashMap<String, EmbeddingProvenance>,
 }
 
 const EMBEDDING_UNAVAILABLE: &str = "embedding unavailable: embed service unreachable or returned an unusable vector (dimension mismatch / non-finite values) and the SimCos fallback is not authorized (start the embed server, send a pre-computed 'embedding', or opt in explicitly with SPLATSDB_ALLOW_SIMCOS=1)";
@@ -191,6 +251,14 @@ struct McpState {
     /// Spatial memory: maps (wing, room, hall) → vector indices for pre-filter search.
     /// Updated when docs are stored/loaded with spatial metadata.
     spatial_index: crate::spatial::SpatialIndex,
+    /// Provenance of every live doc's indexed vector (A03-F10, persistence
+    /// half): how the vector that sits in the ANN was produced, and whether
+    /// the warm start loaded it from SQLite (`Stored`) or this session made
+    /// it (`Live`). Reported per search result; a SimCos vector is never
+    /// promoted to `real`.
+    doc_sources: HashMap<String, VectorProvenance>,
+    /// Accounting of the warm start that built this state (`splatsdb_status`).
+    warm_start: WarmStartStats,
 }
 
 /// LRU cache of doc_id → text with O(1) insert / O(1) remove via lazy
@@ -233,7 +301,6 @@ impl DocTextCache {
     fn len(&self) -> usize {
         self.map.len()
     }
-
     /// Insert/replace a text, evicting oldest-inserted entries over the cap.
     ///
     /// Replacement (id already cached) refreshes the text in place without
@@ -300,6 +367,8 @@ impl McpState {
             next_id: 0,
             graph: crate::graph_splat::GaussianGraphStore::new(),
             spatial_index: crate::spatial::SpatialIndex::new(),
+            doc_sources: HashMap::new(),
+            warm_start: WarmStartStats::default(),
         }
     }
 
@@ -320,6 +389,7 @@ impl McpState {
         };
         self.vector_to_doc.remove(&idx);
         self.tombstones.insert(idx);
+        self.doc_sources.remove(id);
         true
     }
 
@@ -371,6 +441,55 @@ impl McpState {
             }
             _ => (cached.unwrap_or_default(), json!(null)),
         }
+    }
+
+    /// Explicit provenance of a result's indexed vector.
+    fn vector_label(&self, id: &str) -> String {
+        self.doc_sources
+            .get(id)
+            .map_or_else(|| "unknown".to_string(), |p| p.label())
+    }
+
+    /// Persistence / provenance block of `splatsdb_status`.
+    fn vector_persistence_json(&self) -> Value {
+        json!({
+            "schema_ready": self.doc_store.embedding_schema_ready(),
+            "stored_vectors": self.doc_store.stored_vector_count().unwrap_or(0),
+            "warm_start": {
+                "documents": self.warm_start.documents,
+                "vectors_loaded": self.warm_start.vectors_loaded,
+                "stored_real": self.warm_start.stored_real,
+                "stored_simcos": self.warm_start.stored_simcos,
+                "stored_provided": self.warm_start.stored_provided,
+                "reembedded": self.warm_start.reembedded,
+                "unindexed": self.warm_start.unindexed,
+                "quarantined": self.warm_start.quarantined,
+            }
+        })
+    }
+
+    /// Live state built from a warm start (production path and tests).
+    fn from_warm_start(
+        store: SplatStore,
+        doc_store: SqliteMetadataStore,
+        doc_store_persistent: bool,
+        outcome: &mut WarmStartOutcome,
+    ) -> Self {
+        let mut state = Self::new(store, doc_store, doc_store_persistent);
+        state.vector_to_doc = std::mem::take(&mut outcome.vector_to_doc);
+        state.doc_to_vec = state
+            .vector_to_doc
+            .iter()
+            .map(|(idx, id)| (id.clone(), *idx))
+            .collect();
+        state.doc_texts = std::mem::take(&mut outcome.doc_texts);
+        state.next_id = outcome.next_id;
+        state.warm_start = outcome.stats;
+        state.doc_sources = std::mem::take(&mut outcome.sources)
+            .into_iter()
+            .map(|(id, src)| (id, VectorProvenance::Stored(src)))
+            .collect();
+        state
     }
 
     fn cache_doc_text(&mut self, id: String, text: String) {
@@ -826,7 +945,7 @@ fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String
         return Err("Embedding contains non-finite values (NaN/inf)".into());
     }
 
-    let arr = Array2::from_shape_vec((1, dim), embedding)
+    let arr = Array2::from_shape_vec((1, dim), embedding.clone())
         .map_err(|e| format!("bad embedding shape: {}", e))?;
 
     // Re-acquire lock only for state mutation
@@ -857,6 +976,8 @@ fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String
     // Store text and mapping
     s.map_vector(vector_idx, &id);
     s.cache_doc_text(id.clone(), text.to_string());
+    s.doc_sources
+        .insert(id.clone(), VectorProvenance::Live(embedding_src));
 
     // Persist to SQLite
     let now = std::time::SystemTime::now()
@@ -884,13 +1005,19 @@ fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String
     // Persistence failure must be visible to the client (17-nov EGM audit):
     // a swallowed upsert error made "stored" a lie after a restart wiped the
     // doc from warm start.
-    let persisted = match s.doc_store.upsert(&record) {
-        Ok(()) => true,
-        Err(e) => {
-            eprintln!("[mcp] warning: SQLite upsert failed: {}", e);
-            false
-        }
-    };
+    // Document, metadata, vector and its provenance in ONE SQLite
+    // statement (F05b): a failed write leaves neither behind.
+    let persisted =
+        match s
+            .doc_store
+            .upsert_with_embedding(&record, &embedding, provenance_of(embedding_src))
+        {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("[mcp] warning: SQLite upsert failed: {}", e);
+                false
+            }
+        };
 
     // Register spatial metadata if present
     let wing = params["wing"].as_str();
@@ -1003,6 +1130,7 @@ fn handle_search(state: &Mutex<McpState>, params: &Value) -> Result<Value, Strin
                 "score": n.distance,
                 "text": text,
                 "metadata": metadata,
+                "embedding_source": s.vector_label(&doc_id),
             })
         })
         .collect();
@@ -1037,6 +1165,7 @@ fn handle_status(state: &Mutex<McpState>) -> Result<Value, String> {
         "persisted": s.doc_store_persistent,
         "ephemeral": !s.doc_store_persistent,
         "embedding_fallback": if SIMCOS_ALLOWED.load(Ordering::Relaxed) { "simcos" } else { "none" },
+        "vector_persistence": s.vector_persistence_json(),
         "has_hnsw": s.store.has_hnsw(),
         "has_lsh": s.store.has_lsh(),
         "has_quantization": s.store.has_quantization(),
@@ -1066,7 +1195,7 @@ fn handle_doc_add(state: &Mutex<McpState>, params: &Value) -> Result<Value, Stri
     }; // lock dropped here
 
     let (embedding, embedding_src) = get_embedding_labeled(text, dim)?;
-    let arr = Array2::from_shape_vec((1, dim), embedding)
+    let arr = Array2::from_shape_vec((1, dim), embedding.clone())
         .map_err(|e| format!("embedding error: {}", e))?;
 
     // Re-acquire lock for state mutation
@@ -1084,6 +1213,8 @@ fn handle_doc_add(state: &Mutex<McpState>, params: &Value) -> Result<Value, Stri
     // Update mappings
     s.map_vector(vector_idx, id);
     s.cache_doc_text(id.to_string(), text.to_string());
+    s.doc_sources
+        .insert(id.to_string(), VectorProvenance::Live(embedding_src));
 
     // Persist to SQLite
     let now = std::time::SystemTime::now()
@@ -1116,7 +1247,10 @@ fn handle_doc_add(state: &Mutex<McpState>, params: &Value) -> Result<Value, Stri
         updated_at: now,
     };
 
-    if let Err(e) = s.doc_store.upsert(&record) {
+    if let Err(e) =
+        s.doc_store
+            .upsert_with_embedding(&record, &embedding, provenance_of(embedding_src))
+    {
         // Internal detail stays server-side; the client gets a generic error.
         eprintln!("[mcp] doc_add SQLite error for id={id}: {e}");
         // No persisted row → the new vector must not stay searchable as an
@@ -1563,6 +1697,7 @@ fn handle_spatial_search(state: &Mutex<McpState>, params: &Value) -> Result<Valu
             "score": n.distance,
             "text": text,
             "metadata": metadata,
+            "embedding_source": s.vector_label(&doc_id),
         }));
         if out.len() >= top_k {
             break;
@@ -2042,35 +2177,25 @@ pub fn run_mcp_server() {
     // phase (and its metadata extraction) — useful for large stores where
     // spatial search is not used. Default: enabled.
     let spatial_warmstart_enabled = spatial_warmstart_enabled_from_env();
-    let mut vector_to_doc: HashMap<usize, String> = HashMap::new();
-    let mut doc_texts = DocTextCache::default();
-    let mut next_id: usize = 0;
     let warm_start_t0 = std::time::Instant::now();
 
-    let warm_start_spatial = warm_start_reload(
+    let mut outcome = warm_start_reload(
         &doc_store,
         &mut store,
-        &mut vector_to_doc,
-        &mut doc_texts,
-        &mut next_id,
         spatial_warmstart_enabled,
         warm_start_t0,
     );
 
-    let mut live = McpState::new(store, doc_store, doc_store_persistent);
-    live.vector_to_doc = vector_to_doc;
-    live.doc_to_vec = live
-        .vector_to_doc
-        .iter()
-        .map(|(idx, id)| (id.clone(), *idx))
-        .collect();
-    live.doc_texts = doc_texts;
-    live.next_id = next_id;
-    let state = Mutex::new(live);
+    let state = Mutex::new(McpState::from_warm_start(
+        store,
+        doc_store,
+        doc_store_persistent,
+        &mut outcome,
+    ));
 
     register_warm_start_spatial(
         &state,
-        &warm_start_spatial,
+        &outcome.spatial,
         spatial_warmstart_enabled,
         warm_start_t0,
     );
@@ -2279,104 +2404,133 @@ fn init_doc_store() -> (SqliteMetadataStore, bool /* persistent */) {
 
 /// Warm start: reload persisted documents from SQLite into the vector store.
 ///
-/// Extracted from `run_mcp_server`; behavior identical: caps at
-/// `MAX_WARM_START_DOCS`, honours the shutdown flag mid-loop, skips empty
-/// texts, extracts spatial metadata only when `spatial_warmstart_enabled`,
-/// re-embeds every document, advances `next_id` past any `mem_N` id, syncs
-/// HNSW once at the end, and reports progress/final timing on stderr.
+/// F05b (A03-F10, persistence half): a document that has a VALID stored
+/// vector is indexed from that vector — no embed service, no re-embedding —
+/// and keeps the provenance it was stored with (`stored_real` /
+/// `stored_simcos` / `stored_provided`; SimCos is never promoted).
 ///
-/// Returns the (doc_id, wing, room, hall) tuples collected for the later
-/// spatial registration pass.
-#[allow(clippy::too_many_arguments)]
+/// - No stored vector (legacy rows of the pre-vector schema): embedded only
+///   when the real service answers, or SimCos under explicit opt-in (the
+///   A03-F10 strictness is unchanged); the vector is then backfilled so the
+///   next restart needs no service. Without either the document stays
+///   readable but unindexed — counted and reported, never deleted.
+/// - Stored vector that fails validation (length ≠ dim·4, non-finite,
+///   another dimension, missing/unknown label): QUARANTINED — not indexed,
+///   not resized, not overwritten, reported with a per-document diagnostic.
+///
+/// Caps at `MAX_WARM_START_DOCS`, honours the shutdown flag mid-loop, skips
+/// empty texts, extracts spatial metadata only when
+/// `spatial_warmstart_enabled`, advances `next_id` past any `mem_N` id, syncs
+/// HNSW once at the end and reports the accounting on stderr.
 fn warm_start_reload(
     doc_store: &SqliteMetadataStore,
     store: &mut SplatStore,
-    vector_to_doc: &mut HashMap<usize, String>,
-    doc_texts: &mut DocTextCache,
-    next_id: &mut usize,
     spatial_warmstart_enabled: bool,
     warm_start_t0: std::time::Instant,
-) -> WarmStartSpatial {
-    let mut warm_start_spatial: WarmStartSpatial = Vec::new();
-    let mut skipped_no_embedding = 0usize;
+) -> WarmStartOutcome {
+    let mut outcome = WarmStartOutcome {
+        vector_to_doc: HashMap::new(),
+        doc_texts: DocTextCache::default(),
+        next_id: 0,
+        spatial: Vec::new(),
+        stats: WarmStartStats::default(),
+        sources: HashMap::new(),
+    };
+    let stats = &mut outcome.stats;
+    let mut quarantined: Vec<String> = Vec::new();
     let dim = store.get_statistics().embedding_dim;
-    match doc_store.list_ids(false) {
-        Ok(ids) => {
-            let total = ids.len();
+    let total = doc_store.count(false).unwrap_or(0);
+    stats.documents = total;
+    match doc_store.list_with_embeddings(MAX_WARM_START_DOCS, dim) {
+        Ok(docs) => {
             if total > MAX_WARM_START_DOCS {
                 eprintln!(
                     "[splatsdb] Warm start: {} docs found, capping at {} for performance",
                     total, MAX_WARM_START_DOCS
                 );
             }
-            for (i, doc_id) in ids.iter().enumerate().take(MAX_WARM_START_DOCS) {
+            for (i, stored) in docs.iter().enumerate() {
                 if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
                     eprintln!("[splatsdb] Warm start interrupted by shutdown signal");
                     break;
                 }
-                if let Ok(Some(record)) = doc_store.get(doc_id) {
-                    let text = record.document.clone().unwrap_or_default();
-                    if text.is_empty() {
+                let doc_id = stored.record.id.as_str();
+                let text = stored.record.document.clone().unwrap_or_default();
+                if text.is_empty() {
+                    continue;
+                }
+
+                // Extract spatial metadata from the JSON metadata field
+                // (skipped entirely when spatial warm-start is disabled)
+                let meta = stored.record.metadata.as_ref();
+                let (meta_wing, meta_room, meta_hall) = if spatial_warmstart_enabled {
+                    let key = |k: &str| {
+                        meta.and_then(|m| m.get(k))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    };
+                    (key("wing"), key("room"), key("hall"))
+                } else {
+                    (None, None, None)
+                };
+
+                // Where the indexed vector comes from (see the doc comment).
+                let (embedding, source) = match (&stored.embedding, &stored.embedding_error) {
+                    (Some(kept), _) => {
+                        stats.vectors_loaded += 1;
+                        match kept.source {
+                            EmbeddingProvenance::Real => stats.stored_real += 1,
+                            EmbeddingProvenance::SimCos => stats.stored_simcos += 1,
+                            EmbeddingProvenance::Provided => stats.stored_provided += 1,
+                        }
+                        (kept.vector.clone(), kept.source)
+                    }
+                    (None, Some(why)) => {
+                        stats.quarantined += 1;
+                        quarantined.push(format!("{doc_id}: {why}"));
                         continue;
                     }
-
-                    // Extract spatial metadata from the JSON metadata field
-                    // (skipped entirely when spatial warm-start is disabled)
-                    let (meta_wing, meta_room, meta_hall) = if spatial_warmstart_enabled {
-                        (
-                            record.metadata.as_ref().and_then(|m| {
-                                m.get("wing")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string())
-                            }),
-                            record.metadata.as_ref().and_then(|m| {
-                                m.get("room")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string())
-                            }),
-                            record.metadata.as_ref().and_then(|m| {
-                                m.get("hall")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string())
-                            }),
-                        )
-                    } else {
-                        (None, None, None)
-                    };
-
-                    // Re-compute embedding and add to vector store
-                    // Never a silent fallback (A03-F10): without the service
-                    // and without explicit SimCos opt-in the doc is NOT
-                    // indexed (counted and reported below) instead of being
-                    // re-embedded with a text hash that makes it
-                    // unrecognizable to search.
-                    let (embedding, _) = match get_embedding_labeled(&text, dim) {
-                        Ok(res) => res,
+                    (None, None) => match get_embedding_labeled(&text, dim) {
+                        Ok((vector, src)) => {
+                            // Backfill the legacy row so the next restart
+                            // needs no service. A write that cannot happen is
+                            // reported, not hidden.
+                            if let Err(e) =
+                                doc_store.set_embedding(doc_id, &vector, provenance_of(src))
+                            {
+                                eprintln!(
+                                    "[splatsdb] WARNING: Warm start: could not persist the embedding of legacy doc {doc_id}: {e}"
+                                );
+                            }
+                            stats.reembedded += 1;
+                            (vector, provenance_of(src))
+                        }
                         Err(_) => {
-                            skipped_no_embedding += 1;
+                            stats.unindexed += 1;
                             continue;
                         }
-                    };
-                    if let Ok(arr) = Array2::from_shape_vec((1, dim), embedding) {
-                        let vector_idx = store.n_active();
-                        if store.add_splat(&arr) {
-                            vector_to_doc.insert(vector_idx, doc_id.clone());
-                            doc_texts.insert(doc_id.clone(), text);
-                            *next_id = (*next_id).max(
-                                doc_id
-                                    .strip_prefix("mem_")
-                                    .and_then(|s| s.parse::<usize>().ok())
-                                    .unwrap_or(0),
-                            );
-                            // Save spatial metadata for later registration
-                            if meta_wing.is_some() || meta_room.is_some() || meta_hall.is_some() {
-                                warm_start_spatial.push((
-                                    doc_id.clone(),
-                                    meta_wing.clone(),
-                                    meta_room.clone(),
-                                    meta_hall.clone(),
-                                ));
-                            }
+                    },
+                };
+                if let Ok(arr) = Array2::from_shape_vec((1, dim), embedding) {
+                    let vector_idx = store.n_active();
+                    if store.add_splat(&arr) {
+                        outcome.vector_to_doc.insert(vector_idx, doc_id.to_string());
+                        outcome.doc_texts.insert(doc_id.to_string(), text);
+                        outcome.sources.insert(doc_id.to_string(), source);
+                        outcome.next_id = outcome.next_id.max(
+                            doc_id
+                                .strip_prefix("mem_")
+                                .and_then(|s| s.parse::<usize>().ok())
+                                .unwrap_or(0),
+                        );
+                        // Save spatial metadata for later registration
+                        if meta_wing.is_some() || meta_room.is_some() || meta_hall.is_some() {
+                            outcome.spatial.push((
+                                doc_id.to_string(),
+                                meta_wing.clone(),
+                                meta_room.clone(),
+                                meta_hall.clone(),
+                            ));
                         }
                     }
                 }
@@ -2388,25 +2542,51 @@ fn warm_start_reload(
                     );
                 }
             }
-            if !ids.is_empty() {
+            if !docs.is_empty() {
                 store.hnsw_sync_incremental();
+            }
+            if total > 0 {
+                let indexed = outcome.doc_texts.len();
                 eprintln!(
-                    "[splatsdb] Warm start: reloaded {}/{} documents from SQLite in {:.0} ms",
-                    doc_texts.len().min(MAX_WARM_START_DOCS),
-                    total,
-                    warm_start_t0.elapsed().as_secs_f64() * 1000.0
+                    "[splatsdb] Warm start: reloaded {indexed}/{total} documents from SQLite in {:.0} ms (stored vectors loaded: {} [real={} simcos={} provided={}], re-embedded: {}, not indexed: {}, quarantined: {})",
+                    warm_start_t0.elapsed().as_secs_f64() * 1000.0,
+                    stats.vectors_loaded,
+                    stats.stored_real,
+                    stats.stored_simcos,
+                    stats.stored_provided,
+                    stats.reembedded,
+                    stats.unindexed,
+                    stats.quarantined
                 );
             }
         }
-        Err(e) => eprintln!("[splatsdb] Warm start: could not list docs: {}", e),
+        Err(e) => eprintln!("[splatsdb] Warm start: could not list docs: {e}"),
     }
-    if skipped_no_embedding > 0 {
+    if stats.unindexed > 0 {
         eprintln!(
-            "[splatsdb] WARNING: Warm start: {} documents were NOT indexed (no usable embedding: embed service down and the SimCos fallback is not authorized). They stay in SQLite but are invisible to search until a restart with the embed service up, or with SPLATSDB_ALLOW_SIMCOS=1.",
-            skipped_no_embedding
+            "[splatsdb] WARNING: Warm start: {} documents were NOT indexed (no stored vector — legacy rows — and no usable embedding now: embed service down and the SimCos fallback is not authorized). They stay in SQLite but are invisible to search until a restart with the embed service up, with SPLATSDB_ALLOW_SIMCOS=1, or until they are re-stored.",
+            stats.unindexed
         );
     }
-    warm_start_spatial
+    if stats.quarantined > 0 {
+        eprintln!(
+            "[splatsdb] WARNING: Warm start: {} stored vectors QUARANTINED (refused, not indexed; the blobs were left untouched on disk — re-store the document to replace it): {}",
+            stats.quarantined,
+            quarantined
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+    if stats.stored_simcos > 0 {
+        eprintln!(
+            "[splatsdb] WARNING: Warm start: {} stored vectors are SimCos text-hash (labelled stored_simcos, never promoted): ranking for those documents is not semantic — re-store them once the embed service is up",
+            stats.stored_simcos
+        );
+    }
+    outcome
 }
 
 /// Outcome of one bounded line read from the JSON-RPC stdin stream.
@@ -2809,8 +2989,7 @@ mod tests {
         SIMCOS_ALLOWED.store(false, Ordering::Relaxed);
 
         let err = get_embedding_labeled("hello world", 16)
-            .err()
-            .expect("no service + no opt-in must fail closed");
+            .expect_err("no service + no opt-in must fail closed");
         assert!(err.contains("embedding unavailable"), "{err}");
         assert!(err.contains("SPLATSDB_ALLOW_SIMCOS"), "{err}");
 
@@ -2852,6 +3031,137 @@ mod tests {
             .iter()
             .map(|r| r["id"].as_str().unwrap_or("").to_string())
             .collect()
+    }
+
+    /// F05b (A03-F10, persistence half): the warm start indexes stored
+    /// vectors directly — each with the label it was stored with — instead
+    /// of embedding again; a blob of another dimension is quarantined.
+    #[test]
+    fn p05_warm_start_loads_stored_vectors_with_their_labels() {
+        let dir = std::env::temp_dir().join(format!(
+            "splatsdb-mcp-p05-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let doc_store = SqliteMetadataStore::new(dir.join("docs.db")).expect("doc store");
+        let record = |id: &str, text: &str| DocumentRecord {
+            id: id.into(),
+            shard_idx: 0,
+            vector_idx: 0,
+            metadata: Some(json!({ "text": text, "wing": format!("{id}_wing") })),
+            document: Some(text.into()),
+            deleted: false,
+            created_at: 1.0,
+            updated_at: 1.0,
+        };
+        doc_store
+            .upsert_with_embedding(
+                &record("r", "real text"),
+                &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                EmbeddingProvenance::Real,
+            )
+            .unwrap();
+        doc_store
+            .upsert_with_embedding(
+                &record("s", "simcos text"),
+                &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                EmbeddingProvenance::SimCos,
+            )
+            .unwrap();
+        doc_store
+            .upsert_with_embedding(
+                &record("p", "provided text"),
+                &[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                EmbeddingProvenance::Provided,
+            )
+            .unwrap();
+        // Another dimension than the store → quarantined.
+        doc_store
+            .upsert_with_embedding(
+                &record("bad", "bad dim text"),
+                &[0.0; 4],
+                EmbeddingProvenance::Real,
+            )
+            .unwrap();
+        // A legacy row without any vector (pre-F05b writer).
+        let mut legacy = record("legacy", "legacy text");
+        legacy.metadata = Some(json!({ "text": "legacy text" }));
+        doc_store.upsert(&legacy).unwrap();
+
+        let mut config = SplatsDBConfig::mcp(None);
+        config.max_splats = 256;
+        config.latent_dim = 8;
+        let mut store = SplatStore::new(config);
+        let mut outcome =
+            warm_start_reload(&doc_store, &mut store, true, std::time::Instant::now());
+
+        let stats = outcome.stats;
+        assert_eq!(stats.vectors_loaded, 3);
+        assert_eq!(
+            (
+                stats.stored_real,
+                stats.stored_simcos,
+                stats.stored_provided
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            stats.quarantined, 1,
+            "a 4-dim blob in an 8-dim store is quarantined"
+        );
+        // The legacy row is either embedded or reported unindexed — whatever
+        // the process-global service/SimCos flags say while the other lib
+        // tests run — but it is never loaded from a vector it does not have.
+        assert_eq!(stats.reembedded + stats.unindexed, 1);
+
+        let state = Mutex::new(McpState::from_warm_start(
+            store,
+            doc_store,
+            true,
+            &mut outcome,
+        ));
+        let res = handle_search(
+            &state,
+            &json!({ "query": "q", "embedding": f05a_emb(1.0), "top_k": 10 }),
+        )
+        .unwrap();
+        let mut labels: Vec<(String, String)> = res["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["id"].as_str().unwrap().to_string(),
+                    r["embedding_source"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        labels.sort();
+        for (id, label) in [
+            ("p", "stored_provided"),
+            ("r", "stored_real"),
+            ("s", "stored_simcos"),
+        ] {
+            let wanted = (id.to_string(), label.to_string());
+            assert!(labels.contains(&wanted), "{labels:?}");
+        }
+        assert!(labels
+            .iter()
+            .all(|(_, l)| l.starts_with("stored_") || l == "simcos" || l == "real"));
+        assert_eq!(res["embedding"], json!("provided"));
+        let status = handle_status(&state).unwrap();
+        assert_eq!(
+            status["vector_persistence"]["warm_start"]["vectors_loaded"],
+            json!(3)
+        );
+        assert_eq!(
+            status["vector_persistence"]["warm_start"]["quarantined"],
+            json!(1)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A03-F11 (handlers): doc_del tombstones the vector and top-k is
