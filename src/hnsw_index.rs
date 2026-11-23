@@ -22,6 +22,13 @@ const HNSW_MAGIC: u64 = 0x484E5357; // "HNSW"
 /// comes from the file header rather than being derived as 2*m.
 const MAX_HNSW_M: usize = 4096;
 const MAX_HNSW_M_MAX0: usize = 8192;
+/// Ceiling on levels per node, hence on the top layer index a graph can
+/// hold (< MAX_HNSW_NODE_LEVELS). search()/insert() walk layers
+/// `(1..=max_level)` unconditionally and pay one distance evaluation per
+/// layer even when no node owns it, so a header `max_level` the graph
+/// does not back is dead work — u64::MAX used to load and hang every
+/// later query.
+const MAX_HNSW_NODE_LEVELS: usize = 64;
 
 /// Wrapper for (distance, index) that implements Ord for min-heap.
 #[derive(Clone, Copy, Debug)]
@@ -272,6 +279,15 @@ impl HNSWIndex {
                 dim, MAX_HNSW_DIM
             ));
         }
+        // dim == 0 is only what save() writes for an EMPTY index. With
+        // vectors present it loaded with `vectors` empty against n_vectors
+        // `nodes`: is_built() lied and the next insert indexed
+        // vectors[b_idx] out of bounds (panic).
+        if n_vectors > 0 && dim == 0 {
+            return Err(format!(
+                "dimension is 0 but the file holds {n_vectors} vectors"
+            ));
+        }
         // m/m_max0 come from the file header: unbounded values would drive
         // giant Vec::with_capacity allocations (DoS via a ~100-byte hostile
         // index). Bounds are the module-level consts shared with new().
@@ -283,6 +299,22 @@ impl HNSWIndex {
         if m_max0 > MAX_HNSW_M_MAX0 {
             return Err(format!(
                 "m_max0 too large (max {MAX_HNSW_M_MAX0}): {m_max0}"
+            ));
+        }
+        // new() derives m_max0 = 2*m and insert() assigns up to m
+        // neighbors on layer 0, where only m_max0 fit: a header below m
+        // cannot describe a graph this code produces.
+        if m_max0 < m_stored {
+            return Err(format!(
+                "m_max0 {m_max0} below m {m_stored} (expected m_max0 >= m)"
+            ));
+        }
+        // Header cap for max_level: no node holds more than
+        // MAX_HNSW_NODE_LEVELS levels, so no such layer index can exist.
+        if max_level >= MAX_HNSW_NODE_LEVELS {
+            return Err(format!(
+                "max_level {max_level} too large (max {}",
+                MAX_HNSW_NODE_LEVELS - 1
             ));
         }
         let _total_elements = n_vectors
@@ -325,7 +357,7 @@ impl HNSWIndex {
             let n_levels_raw = read_u64(&mut f)?;
             let n_levels =
                 usize::try_from(n_levels_raw).map_err(|_| "n_levels too large for platform")?;
-            if n_levels > 64 {
+            if n_levels > MAX_HNSW_NODE_LEVELS {
                 return Err(format!(
                     "too many levels ({}) for node {}",
                     n_levels, node_idx
@@ -364,6 +396,22 @@ impl HNSWIndex {
                 _level: neighbors.len().saturating_sub(1),
                 neighbors,
             });
+        }
+
+        // The graph must back the header: max_level is the entry point's
+        // top layer (insert() keeps `max_level + 1 == entry_point levels`;
+        // an empty index has max_level 0). Anything else means header and
+        // node section disagree — tampered or corrupt.
+        let entry_levels = if n_vectors > 0 {
+            nodes[entry_point].neighbors.len()
+        } else {
+            1
+        };
+        if max_level + 1 != entry_levels {
+            return Err(format!(
+                "max_level {max_level} does not match entry_point {entry_point} \
+                 ({entry_levels} levels, n_vectors={n_vectors})"
+            ));
         }
 
         // Raw vectors
@@ -830,5 +878,135 @@ mod tests {
             "farthest edge (d=20.0) should be pruned, got {:?}",
             n0
         );
+    }
+
+    // ── A01-F03: hostile / corrupt hnsw_index.bin ───────────────────────────
+    // Header as written by save(): magic, n_vectors, dim, m, m_max0,
+    // ef_construction, ef_search, entry_point, max_level — u64 LE each.
+    const HDR_DIM: usize = 16;
+    const HDR_M_MAX0: usize = 32;
+    const HDR_MAX_LEVEL: usize = 64;
+
+    /// Scratch path unique per process and test (tests run in parallel).
+    fn temp_file(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("hnsw_hostile_{}_{name}.bin", std::process::id()))
+    }
+
+    /// The exact bytes `save()` writes for `idx`.
+    fn saved_bytes(idx: &HNSWIndex, name: &str) -> Vec<u8> {
+        let path = temp_file(name);
+        idx.save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        bytes
+    }
+
+    /// `bytes` with one u64 header field overwritten (a tampered header).
+    fn with_header_u64(bytes: &[u8], offset: usize, value: u64) -> Vec<u8> {
+        let mut tampered = bytes.to_vec();
+        tampered[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        tampered
+    }
+
+    /// `load()` exactly as `SplatStore::try_load_hnsw` calls it.
+    fn load_bytes(name: &str, bytes: &[u8]) -> Result<HNSWIndex, String> {
+        let path = temp_file(name);
+        std::fs::write(&path, bytes).unwrap();
+        let loaded = HNSWIndex::load(&path, 8, 100, 50, "l2", 42);
+        std::fs::remove_file(&path).ok();
+        loaded
+    }
+
+    /// `load()` must fail on these bytes; returns the error message.
+    fn load_err(name: &str, bytes: &[u8]) -> String {
+        match load_bytes(name, bytes) {
+            Err(e) => e,
+            Ok(_) => panic!("{name}: load() accepted a hostile file"),
+        }
+    }
+
+    /// Seeded index whose entry point sits above layer 0, so `max_level`
+    /// can be tampered in both directions.
+    fn index_with_upper_layer() -> HNSWIndex {
+        let mut idx = HNSWIndex::new(4, 8, 100, 50, "l2", 42);
+        idx.build(small_random_vectors(2_000, 4, 555));
+        assert!(
+            idx.max_level >= 1,
+            "fixture needs a node above layer 0, got max_level {}",
+            idx.max_level
+        );
+        idx
+    }
+
+    /// search()/insert() walk layers (1..=max_level) unconditionally — one
+    /// distance evaluation per layer even when no node owns it. A header
+    /// `max_level` that the graph does not back must therefore be refused at
+    /// load: before the fix max_level = u64::MAX loaded fine and hung every
+    /// later query. The untampered file must keep loading byte-identically.
+    #[test]
+    fn test_load_rejects_unbacked_max_level() {
+        let idx = index_with_upper_layer();
+        let good = saved_bytes(&idx, "max_level_good");
+        let real = u64::from_le_bytes(good[HDR_MAX_LEVEL..HDR_MAX_LEVEL + 8].try_into().unwrap());
+        assert!(real >= 1);
+
+        let loaded =
+            load_bytes("max_level_untampered", &good).expect("untampered file must keep loading");
+        assert_eq!(saved_bytes(&loaded, "max_level_resaved"), good);
+
+        // Beyond the format limit: refused from the header alone.
+        for bad in [u64::MAX, 1 << 40, 64] {
+            let tampered = with_header_u64(&good, HDR_MAX_LEVEL, bad);
+            let err = load_err("max_level_above_cap", &tampered);
+            assert!(err.contains("max_level"), "unexpected error: {err}");
+        }
+        // Within the limit, but not the entry point's top layer — above it
+        // (the dead-layer hang) and below it (header/graph disagreement).
+        for bad in [63, real + 1, real - 1] {
+            let tampered = with_header_u64(&good, HDR_MAX_LEVEL, bad);
+            let err = load_err("max_level_unbacked", &tampered);
+            assert!(err.contains("max_level"), "unexpected error: {err}");
+        }
+    }
+
+    /// dim == 0 is only what save() writes for an EMPTY index. With vectors
+    /// present it used to load with an empty `vectors` against n_vectors
+    /// `nodes`: is_built() lied and the next insert indexed vectors[b_idx]
+    /// out of bounds (panic).
+    #[test]
+    fn test_load_rejects_zero_dim_with_vectors() {
+        let mut idx = HNSWIndex::new(4, 8, 100, 50, "l2", 42);
+        idx.build(small_random_vectors(30, 4, 555));
+        let good = saved_bytes(&idx, "dim0_good");
+        let tampered = with_header_u64(&good, HDR_DIM, 0);
+        let err = load_err("dim0_with_vectors", &tampered);
+        assert!(err.contains("dim"), "unexpected error: {err}");
+
+        // Boundary: dim = 0 WITHOUT vectors (an empty index) still loads.
+        let empty = saved_bytes(&HNSWIndex::new(0, 8, 100, 50, "l2", 42), "dim0_empty");
+        let loaded = load_bytes("dim0_empty_index", &empty).unwrap();
+        assert!(loaded.is_empty());
+        assert_eq!(loaded.dim(), 0);
+    }
+
+    /// new() always derives m_max0 = 2*m; insert() assigns up to m
+    /// neighbors on layer 0, where only m_max0 fit. A header below m cannot
+    /// describe a graph this code produces and used to be accepted.
+    /// m_max0 == m is the smallest consistent value and must still load.
+    #[test]
+    fn test_load_rejects_m_max0_below_m() {
+        // 10 vectors: every layer-0 list holds at most 9 entries, so the
+        // per-node neighbor bound never masks the header rule under test.
+        let mut idx = HNSWIndex::new(4, 8, 100, 50, "l2", 42);
+        idx.build(small_random_vectors(10, 4, 555));
+        let good = saved_bytes(&idx, "m_max0_good");
+        for bad in [0u64, 7] {
+            let tampered = with_header_u64(&good, HDR_M_MAX0, bad);
+            let err = load_err("m_max0_below_m", &tampered);
+            assert!(err.contains("m_max0"), "unexpected error: {err}");
+        }
+        let smallest = with_header_u64(&good, HDR_M_MAX0, 8);
+        let loaded = load_bytes("m_max0_eq_m", &smallest).unwrap();
+        assert_eq!(loaded.n_items(), 10);
     }
 }
