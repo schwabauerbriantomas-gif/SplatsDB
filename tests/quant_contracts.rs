@@ -13,11 +13,15 @@
 //! A02-F02: the projection cache and the per-query context (bit-identity, memory counted
 //! once, A/B bench) live in `quant_contracts/ab_bench.rs`; `quant_contracts/d18_probe.rs`
 //! is the cross-commit evidence probe (default order: recall vs exact-L2 GT + hash).
+//! `quant_contracts/ab_release.rs` is the release A/B probe (N=10000) used by F04c: it
+//! only uses the API that exists since 9f319b2, so the same source measures two commits.
 //!
 //! Run: `cargo test --no-default-features --test quant_contracts`
 
 #[path = "quant_contracts/ab_bench.rs"]
 mod ab_bench;
+#[path = "quant_contracts/ab_release.rs"]
+mod ab_release;
 #[path = "quant_contracts/d18_probe.rs"]
 mod d18_probe;
 #[path = "quant_contracts/properties.rs"]
