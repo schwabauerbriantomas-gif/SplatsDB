@@ -548,3 +548,65 @@ fn c3_append_with_a_dimension_that_does_not_match_the_shard_exits_nonzero() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// c4: `index` whose vectors the store does not take (`add_splat == false`)
+/// must exit non-zero and never print "indexed" — for capacity AND for a
+/// dimension mismatch (A03-F17; F02b fixed the code path, this covers it).
+#[test]
+fn c4_index_exits_nonzero_when_the_vectors_do_not_fit_the_store() {
+    // capacity: 8 vectors into --max-splats 4
+    let dir = scratch("c4-capacity");
+    let input = dir.join("vectors.bin");
+    write_matrix(&input, 8, DIM, 0.0);
+    let (status, out, err) = cli(
+        &dir,
+        DIM,
+        &[
+            "--max-splats",
+            "4",
+            "index",
+            "--input",
+            input.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "index reported success on a store that never took the vectors; stdout={out}\nstderr={err}"
+    );
+    assert!(
+        err.contains("do not fit a store with --dim 32 / --max-splats 4"),
+        "{err}"
+    );
+    assert!(
+        !out.contains("indexed"),
+        "stdout must not claim an index: {out}"
+    );
+
+    // dimension mismatch: a 32-D file indexed with --dim 16
+    let dir = scratch("c4-dim");
+    let input = dir.join("vectors.bin");
+    write_matrix(&input, 4, DIM, 0.0);
+    let (status, out, err) = cli(&dir, 16, &["index", "--input", input.to_str().unwrap()]);
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "index reported success on a dimension mismatch; stdout={out}\nstderr={err}"
+    );
+    assert!(err.contains("--dim 16"), "{err}");
+    assert!(
+        !out.contains("indexed"),
+        "stdout must not claim an index: {out}"
+    );
+
+    // the happy path still indexes
+    let dir = scratch("c4-ok");
+    let input = dir.join("vectors.bin");
+    write_matrix(&input, 4, DIM, 0.0);
+    let (status, out, err) = cli(&dir, DIM, &["index", "--input", input.to_str().unwrap()]);
+    assert!(status.success(), "index failed on a valid input: {err}");
+    assert!(
+        out.contains(r#""status":"indexed""#) && out.contains(r#""n_active":4"#),
+        "{out}"
+    );
+}
