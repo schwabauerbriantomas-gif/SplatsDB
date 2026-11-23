@@ -127,6 +127,13 @@ impl PolarQuantizer {
             let a = rotated[2 * i];
             let b = rotated[2 * i + 1];
             let (r, idx) = encode_pair(a, b, self.bits);
+            // A finite input can still overflow: with a rotated component above ~1.85e19,
+            // `a*a + b*b` is Inf. An Inf radius would score +/-Inf or NaN, so it is an
+            // Err before anything is stored -- the first such pair, explicitly (F04e;
+            // until c2c6206 this radius was stored, and the whole batch with it).
+            if !r.is_finite() {
+                return Err(QuantError::NonFiniteRadius { pair: i });
+            }
             radii.push(r);
             angle_indices.push(idx);
         }

@@ -20,6 +20,11 @@ pub enum QuantError {
     NonFiniteValue {
         index: usize,
     },
+    /// A finite input whose rotated radius at `pair` is not finite (`a*a + b*b`
+    /// overflowed f32). It can never become a valid code either (F04e).
+    NonFiniteRadius {
+        pair: usize,
+    },
 }
 
 impl std::fmt::Display for QuantError {
@@ -36,6 +41,9 @@ impl std::fmt::Display for QuantError {
             Self::MalformedCode(r) => write!(f, "malformed code: {}", r),
             Self::NonFiniteValue { index } => {
                 write!(f, "non-finite value (NaN/Inf) at index {index}")
+            }
+            Self::NonFiniteRadius { pair } => {
+                write!(f, "non-finite radius at pair {pair} (f32 overflow)")
             }
         }
     }
