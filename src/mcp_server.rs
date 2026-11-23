@@ -340,6 +340,39 @@ impl McpState {
         top_k.saturating_add(dead).min(n_active)
     }
 
+    /// Text of a doc for a search result: the text cache first, else the
+    /// persisted `document` column. The cache is capped (FIFO, 10K) while
+    /// warm start loads up to 50K docs — a live doc evicted from the cache
+    /// must never come back as `"text": ""` (A03-F14).
+    fn doc_text(&self, id: &str) -> String {
+        if let Some(t) = self.doc_texts.get(id).filter(|t| !t.is_empty()) {
+            return t.clone();
+        }
+        self.doc_store
+            .get(id)
+            .ok()
+            .flatten()
+            .and_then(|r| r.document)
+            .filter(|t| !t.is_empty())
+            .unwrap_or_default()
+    }
+
+    /// (text, metadata) of a doc for a search result, from ONE SQLite read
+    /// (cached statement) — no extra roundtrip for the text fallback.
+    fn result_text_and_metadata(&self, id: &str) -> (String, Value) {
+        let cached = self.doc_texts.get(id).filter(|t| !t.is_empty()).cloned();
+        match self.doc_store.get(id) {
+            Ok(Some(record)) => {
+                let text = cached
+                    .or(record.document)
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_default();
+                (text, record.metadata.unwrap_or(json!(null)))
+            }
+            _ => (cached.unwrap_or_default(), json!(null)),
+        }
+    }
+
     fn cache_doc_text(&mut self, id: String, text: String) {
         self.doc_texts.insert(id, text);
     }
@@ -963,13 +996,7 @@ fn handle_search(state: &Mutex<McpState>, params: &Value) -> Result<Value, Strin
             // is_live() guarantees a mapping: anonymous `vec_N` hits can no
             // longer be produced.
             let doc_id = s.vector_to_doc.get(&n.index).cloned().unwrap_or_default();
-            let text = s.doc_texts.get(&doc_id).cloned().unwrap_or_default();
-
-            // Try to get metadata from SQLite
-            let metadata: Value = match s.doc_store.get(&doc_id) {
-                Ok(Some(record)) => record.metadata.clone().unwrap_or(json!(null)),
-                _ => json!(null),
-            };
+            let (text, metadata) = s.result_text_and_metadata(&doc_id);
 
             json!({
                 "id": doc_id,
@@ -1530,11 +1557,7 @@ fn handle_spatial_search(state: &Mutex<McpState>, params: &Value) -> Result<Valu
             continue;
         }
         let doc_id = s.vector_to_doc.get(&n.index).cloned().unwrap_or_default();
-        let text = s.doc_texts.get(&doc_id).cloned().unwrap_or_default();
-        let metadata: Value = match s.doc_store.get(&doc_id) {
-            Ok(Some(record)) => record.metadata.clone().unwrap_or(json!(null)),
-            _ => json!(null),
-        };
+        let (text, metadata) = s.result_text_and_metadata(&doc_id);
         out.push(json!({
             "id": doc_id,
             "index": n.index,
@@ -1733,7 +1756,7 @@ fn handle_verbatim_search(state: &Mutex<McpState>, params: &Value) -> Result<Val
         .take(top_k)
         .map(|n| {
             let doc_id = s.vector_to_doc.get(&n.index).cloned().unwrap_or_default();
-            let text = s.doc_texts.get(&doc_id).cloned().unwrap_or_default();
+            let text = s.doc_text(&doc_id);
 
             // Confidence classification
             let (confidence, emoji, explanation) = if n.distance < 0.3 {
@@ -2890,6 +2913,63 @@ mod tests {
         // Deleting an unknown doc is still a clean "not found".
         let err = handle_doc_del(&state, &json!({ "id": "nope" })).unwrap_err();
         assert!(err.contains("not found"), "{err}");
+    }
+
+    /// A03-F14: with the text cache capped at ONE entry, the doc evicted by
+    /// the next store still returns its text from `record.document` in every
+    /// search handler (it used to come back as `"text": ""`).
+    #[test]
+    fn f14_search_text_falls_back_to_record_when_cache_evicted() {
+        let state = f05a_state();
+        state.lock().unwrap().doc_texts.cap = 1;
+        for i in 1..=2u32 {
+            let id = format!("e{i}");
+            handle_store(
+                &state,
+                &json!({ "text": format!("persisted text of {id}"), "id": id, "embedding": f05a_emb(i as f64) }),
+            )
+            .expect("store");
+        }
+        {
+            let s = state.lock().unwrap();
+            assert!(
+                s.doc_texts.get("e1").is_none(),
+                "precondition: e1 evicted from the cache"
+            );
+            assert_eq!(
+                s.doc_store.get("e1").unwrap().unwrap().document.as_deref(),
+                Some("persisted text of e1")
+            );
+            assert_eq!(s.doc_text("e1"), "persisted text of e1");
+        }
+        // Same signature for the three search handlers (coerced to one fn type).
+        for h in [
+            handle_search as fn(&Mutex<McpState>, &Value) -> Result<Value, String>,
+            handle_spatial_search,
+            handle_verbatim_search,
+        ] {
+            let res = h(
+                &state,
+                &json!({ "query": "q", "embedding": f05a_emb(1.0), "top_k": 2 }),
+            )
+            .expect("search");
+            let texts: Vec<String> = res["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["text"].as_str().unwrap_or("").to_string())
+                .collect();
+            assert_eq!(
+                texts,
+                vec![
+                    "persisted text of e1".to_string(),
+                    "persisted text of e2".to_string()
+                ],
+                "{res}"
+            );
+        }
+        // A doc with no row at all (cannot happen through the handlers) still degrades to "".
+        assert_eq!(state.lock().unwrap().doc_text("ghost"), "");
     }
 
     // -- end of F05a inline tests --

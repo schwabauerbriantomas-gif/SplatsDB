@@ -128,7 +128,7 @@ impl MetadataStore for SqliteMetadataStore {
         doc_id: &str,
     ) -> Result<Option<DocumentRecord>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.conn.lock().map_err(|e| format!("mutex: {e}"))?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, shard_idx, vector_idx, metadata, document, deleted, created_at, updated_at
              FROM documents WHERE id=?1 AND deleted=0",
         )?;
@@ -168,7 +168,7 @@ impl MetadataStore for SqliteMetadataStore {
         } else {
             "SELECT id FROM documents WHERE deleted=0"
         };
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare_cached(sql)?;
         let ids: Vec<String> = stmt
             .query_map([], |row| row.get(0))?
             .filter_map(|r| r.ok())
@@ -217,7 +217,7 @@ impl MetadataStore for SqliteMetadataStore {
         vector_idx: i64,
     ) -> Result<Option<DocumentRecord>, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.conn.lock().map_err(|e| format!("mutex: {e}"))?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, shard_idx, vector_idx, metadata, document, deleted, created_at, updated_at
              FROM documents
              WHERE vector_idx = ?1 AND deleted = 0
