@@ -27,6 +27,11 @@ pub struct TurboCode {
 }
 
 impl TurboCode {
+    /// Heap bytes actually held by this code (polar vectors + QJL signs).
+    pub fn heap_bytes(&self) -> usize {
+        self.polar_code.heap_bytes() + self.residual_sketch.heap_bytes()
+    }
+
     pub fn encoded_bytes(&self) -> usize {
         self.polar_code.encoded_bytes() + self.residual_sketch.encoded_bytes()
     }

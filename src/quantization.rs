@@ -287,18 +287,35 @@ impl QuantizedStore {
         false
     }
 
-    /// Memory held by the store in bytes: the real code payload
-    /// ([`Self::encoded_bytes`]) plus the declared overhead of `size_of::<code>()`
-    /// (struct headers incl. the `Vec` headers, `dim` / `bits` / `projections`) and 8 B
-    /// per id. Excludes allocator slack (`Vec` capacity beyond `len`) and the fixed
-    /// quantizer configuration.
+    /// Memory held by the store in bytes: the heap payload of the codes
+    /// (`heap_bytes()`: radius, angle and sign vectors) plus `size_of::<code>()` per
+    /// code (struct incl. the `Vec` headers and, for TurboQuant, the inline `f32`
+    /// norm, which is therefore not counted a second time) and 8 B per id. Excludes
+    /// allocator slack (`Vec` capacity beyond `len`) and the fixed quantizer
+    /// configuration.
     pub fn memory_usage(&self) -> usize {
-        let inline = if self.turbo.is_some() {
-            std::mem::size_of::<TurboCode>()
+        // Heap payload of the codes + the inline part of each code (the struct with
+        // its Vec headers and, for TurboQuant, the f32 norm) + 8 B per id. The norm
+        // lives inline in `TurboCode`, so it must not be counted again through
+        // `encoded_bytes()`.
+        let (inline, heap) = if self.turbo.is_some() {
+            (
+                std::mem::size_of::<TurboCode>(),
+                self.codes_turbo
+                    .iter()
+                    .map(|code| code.heap_bytes())
+                    .sum::<usize>(),
+            )
         } else {
-            std::mem::size_of::<PolarCode>()
+            (
+                std::mem::size_of::<PolarCode>(),
+                self.codes_polar
+                    .iter()
+                    .map(|code| code.heap_bytes())
+                    .sum::<usize>(),
+            )
         };
-        self.encoded_bytes() + self.len() * (inline + std::mem::size_of::<u64>())
+        heap + self.len() * (inline + std::mem::size_of::<u64>())
     }
 
     /// Raw f32 bytes divided by real encoded bytes. For an empty store the per-code ratio
@@ -465,7 +482,7 @@ mod tests {
         let raw = n * dim * 4;
         assert_eq!(
             mem,
-            store.encoded_bytes()
+            store.encoded_bytes() - n * std::mem::size_of::<f32>()
                 + n * (std::mem::size_of::<TurboCode>() + std::mem::size_of::<u64>())
         );
         assert!(
@@ -500,6 +517,12 @@ mod tests {
             .sum();
         assert_eq!(payload, store.encoded_bytes());
         assert_eq!(store.encoded_bytes(), n * store.code_layout_bytes());
+        // The norm is inline in TurboCode: counted exactly once (through the
+        // struct, not again as payload).
+        assert_eq!(
+            store.memory_usage() + n * std::mem::size_of::<f32>(),
+            payload + n * (std::mem::size_of::<TurboCode>() + std::mem::size_of::<u64>())
+        );
         assert!(store.memory_usage() <= reserved);
     }
 }

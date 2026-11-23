@@ -103,6 +103,15 @@ impl QjlSketch {
     pub fn encoded_bytes(&self) -> usize {
         Self::layout_bytes(self.projections)
     }
+
+    /// Heap bytes actually held by this sketch: the sign vector only.
+    ///
+    /// `norm` is an inline field of the struct, counted once through
+    /// `size_of::<TurboCode>()` and not here; `encoded_bytes()` =
+    /// `heap_bytes()` + the 4 B of the norm.
+    pub fn heap_bytes(&self) -> usize {
+        self.signs.len() * std::mem::size_of::<i8>()
+    }
 }
 
 /// Projects vectors to QJL sketches and estimates inner products.

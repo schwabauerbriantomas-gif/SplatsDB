@@ -294,9 +294,12 @@ fn memory_metrics_report_the_real_unpacked_layout_for_bits_2_4_8() {
             } else {
                 std::mem::size_of::<PolarCode>()
             };
+            // The f32 norm is inline in TurboCode (already inside `inline`), so it is
+            // subtracted from the logical payload: memory_usage() = heap + struct + id.
+            let inline_norm = if turbo { std::mem::size_of::<f32>() } else { 0 };
             assert_eq!(
                 store.memory_usage(),
-                real + n * (inline + std::mem::size_of::<u64>())
+                real - n * inline_norm + n * (inline + std::mem::size_of::<u64>())
             );
             report.push(format!(
                 "bits={bits} {algorithm:?}: raw={raw} B, encoded={real} B ({per_code} B/code), ratio={ratio:.4} (nominal {nominal}), memory_usage={} B",
@@ -318,8 +321,10 @@ fn memory_usage_on_a_10k_code_store_matches_the_declared_overhead() {
     let per_code = store.code_layout_bytes();
     assert_eq!(per_code, DIM / 2 * 6 + DIM / 8 + 4);
     assert_eq!(store.encoded_bytes(), N * per_code);
-    let declared =
-        store.encoded_bytes() + N * (std::mem::size_of::<TurboCode>() + std::mem::size_of::<u64>());
+    // The f32 norm lives inline in TurboCode (counted through size_of::<TurboCode>()),
+    // so memory_usage() = encoded_bytes() - 4 B/code + struct + 8 B/id: no double count.
+    let declared = store.encoded_bytes() - N * std::mem::size_of::<f32>()
+        + N * (std::mem::size_of::<TurboCode>() + std::mem::size_of::<u64>());
     assert_eq!(store.memory_usage(), declared);
     let raw = N * DIM * 4;
     println!(
@@ -327,7 +332,7 @@ fn memory_usage_on_a_10k_code_store_matches_the_declared_overhead() {
         store.encoded_bytes(),
         raw as f32 / store.encoded_bytes() as f32
     );
-    // 2004 B payload + 112 B struct + 8 B id = 2124 B per vector vs 2560 B raw.
+    // 2004 B payload - 4 B inline norm + 112 B struct + 8 B id = 2120 B per vector vs 2560 B raw.
     assert!(store.memory_usage() < raw);
     assert!(store.memory_usage() > raw / 2);
 }

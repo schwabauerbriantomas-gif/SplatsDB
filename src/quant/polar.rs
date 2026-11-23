@@ -46,6 +46,12 @@ impl PolarCode {
     pub fn encoded_bytes(&self) -> usize {
         Self::layout_bytes(self.dim)
     }
+
+    /// Heap bytes actually held by this code (radius and angle vectors).
+    pub fn heap_bytes(&self) -> usize {
+        self.radii.len() * std::mem::size_of::<f32>()
+            + self.angle_indices.len() * std::mem::size_of::<u16>()
+    }
 }
 
 /// Encodes/decodes vectors using PolarQuant.
