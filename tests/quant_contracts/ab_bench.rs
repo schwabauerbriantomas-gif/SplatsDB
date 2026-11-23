@@ -35,9 +35,11 @@ const WARMUP_PASSES: usize = 2;
 const TIMED_PASSES: usize = 9;
 const ENCODE_BUILDS: usize = 3;
 
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-static TOTAL: AtomicUsize = AtomicUsize::new(0);
+/// Live / peak / total bytes seen by the process-wide counting allocator.
+/// Shared with the F04c release probe (`ab_release.rs`): one allocator per binary.
+pub(super) static LIVE: AtomicUsize = AtomicUsize::new(0);
+pub(super) static PEAK: AtomicUsize = AtomicUsize::new(0);
+pub(super) static TOTAL: AtomicUsize = AtomicUsize::new(0);
 
 struct Counting;
 
@@ -80,7 +82,7 @@ fn gaussian_matrix(rows: usize, cols: usize, seed: u64) -> Array2<f32> {
 }
 
 /// Nearest-rank quantile of a sorted slice.
-fn quantile(sorted: &[f64], q: f64) -> f64 {
+pub(super) fn quantile(sorted: &[f64], q: f64) -> f64 {
     if sorted.is_empty() {
         return f64::NAN;
     }
@@ -88,14 +90,14 @@ fn quantile(sorted: &[f64], q: f64) -> f64 {
     sorted[rank - 1]
 }
 
-fn median(values: &[f64]) -> f64 {
+pub(super) fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     quantile(&sorted, 0.5)
 }
 
 /// `VmRSS` and `VmHWM` of this process in kB (Linux procfs).
-fn rss_kb() -> (u64, u64) {
+pub(super) fn rss_kb() -> (u64, u64) {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     let mut rss = 0;
     let mut hwm = 0;
