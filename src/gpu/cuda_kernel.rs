@@ -34,6 +34,7 @@ static COSINE_KERNEL_FALLBACK_LOG: OnceLock<String> = OnceLock::new();
 static TOPK_KERNEL_FALLBACK_LOG: OnceLock<String> = OnceLock::new();
 static TOPK_INFO_LOG: OnceLock<String> = OnceLock::new();
 static TOPK_LAUNCH_LOG: OnceLock<String> = OnceLock::new();
+static QUERY_SHAPE_FALLBACK_LOG: OnceLock<String> = OnceLock::new();
 static GAUSSIAN_INFO_LOG: OnceLock<String> = OnceLock::new();
 static GAUSSIAN_LAUNCH_LOG: OnceLock<String> = OnceLock::new();
 
@@ -188,6 +189,9 @@ impl GpuIndex {
     pub fn l2_distances(&self, query: &[f32]) -> Option<Vec<f32>> {
         let n = self.n_vectors;
         let dim = self.dim;
+        if self.has_malformed_shape("l2_distances", query.len(), 1) {
+            return None;
+        }
         let data_gpu = self.data_gpu.as_ref()?;
 
         // Try PTX kernel path first
@@ -271,6 +275,9 @@ impl GpuIndex {
     pub fn batch_l2_distances(&self, queries: &[f32], n_queries: usize) -> Option<Vec<Vec<f32>>> {
         let n = self.n_vectors;
         let dim = self.dim;
+        if self.has_malformed_shape("batch_l2_distances", queries.len(), n_queries) {
+            return None;
+        }
         let data_gpu = self.data_gpu.as_ref()?;
 
         // Try batch kernel
@@ -358,6 +365,9 @@ impl GpuIndex {
     pub fn cosine_distances(&self, query: &[f32]) -> Option<Vec<f32>> {
         let n = self.n_vectors;
         let dim = self.dim;
+        if self.has_malformed_shape("cosine_distances", query.len(), 1) {
+            return None;
+        }
         let data_gpu = self.data_gpu.as_ref()?;
 
         // Try PTX kernel
@@ -436,6 +446,23 @@ impl GpuIndex {
         self.data_gpu.is_some()
     }
 
+    /// Shape gate shared by every method that sends queries to the device.
+    /// True (cause logged once) unless `len == n_queries * self.dim`, so
+    /// the caller returns None BEFORE any host→device upload or launch —
+    /// see `gpu::query_shape_error` for why the kernels cannot self-check.
+    fn has_malformed_shape(&self, caller: &str, len: usize, n_queries: usize) -> bool {
+        match super::query_shape_error(len, n_queries, self.dim) {
+            Some(err) => {
+                warn_gpu_once(
+                    &QUERY_SHAPE_FALLBACK_LOG,
+                    format!("[splatsdb] {caller}: {err} — declined before upload"),
+                );
+                true
+            }
+            None => false,
+        }
+    }
+
     /// GPU-only top-k search using combined distance+topk PTX kernel.
     /// Returns (indices, distances) for each query. No full distance matrix download.
     pub fn topk_search(
@@ -447,6 +474,9 @@ impl GpuIndex {
     ) -> Option<Vec<(Vec<usize>, Vec<f32>)>> {
         let n = self.n_vectors;
         let dim = self.dim;
+        if self.has_malformed_shape("topk_search", queries.len(), n_queries) {
+            return None;
+        }
         let data_gpu = self.data_gpu.as_ref()?;
 
         // Try PTX top-k kernel
