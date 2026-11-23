@@ -2,7 +2,9 @@
 //!
 //! A02-F07: `QuantizedStore::add_batch` is atomic — a batch with a wrong column count,
 //! a NaN/±Inf, or a row that fails to encode returns `Err` and leaves ids, codes and
-//! `len()` untouched; non-finite input never becomes a code.
+//! `len()` untouched; non-finite input never becomes a code. Correction (F04e): until
+//! c2c6206 that held for the input only -- PolarQuant stored an Inf RADIUS for a finite
+//! row with a rotated component above ~1.85e19; it is an `Err` now, like the input.
 //!
 //! A02-F03: the estimator contract (property tests + evidence probes) lives in
 //! `quant_contracts/properties.rs`.
@@ -17,6 +19,10 @@
 //! only uses the API that exists since 9f319b2, so the same source measures two commits.
 //! `quant_contracts/trig_lut.rs` (F04d) holds the exact cos/sin table to the pre-table
 //! score with a reference written from the formulas only (bit-exact parity).
+//! `quant_contracts/hostile.rs` (F04e) is the fail-closed contract: a finite input whose
+//! radius overflows, hostile codes, sketches and quantizers (built by hand or read from
+//! a payload), QJL signs and sizes, the memory metrics, a search without holes and the
+//! recall of each mode against its own ground truth.
 //!
 //! Run: `cargo test --no-default-features --test quant_contracts`
 
@@ -26,6 +32,8 @@ mod ab_bench;
 mod ab_release;
 #[path = "quant_contracts/d18_probe.rs"]
 mod d18_probe;
+#[path = "quant_contracts/hostile.rs"]
+mod hostile;
 #[path = "quant_contracts/properties.rs"]
 mod properties;
 #[path = "quant_contracts/ranking.rs"]
