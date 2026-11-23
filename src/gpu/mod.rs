@@ -988,6 +988,55 @@ mod tests {
         assert_eq!(batch_search(&[0.0, 0.0], 1, &ok, 3, 2, 2, "l2").len(), 1);
     }
 
+    /// A02-F01 on the device: the distance module is loaded/JIT-compiled at
+    /// most once per process however many `GpuIndex` values are built —
+    /// before the latch every construction re-loaded it (the run of this
+    /// suite at d225012 printed one "PTX module loaded" line per index). The
+    /// latch answer is stable and an index built under it still computes.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_cuda_distance_module_loaded_once_per_process() {
+        if !is_cuda_available() || !super::cuda_kernel::ptx_usable() {
+            eprintln!("[latch test] CUDA/PTX unavailable on this machine -> skip");
+            return;
+        }
+        let before = super::cuda_kernel::module_load_attempts();
+        let first = super::cuda_kernel::dist_module().expect("ptx_usable but no module");
+        let mut idx =
+            super::cuda_kernel::GpuIndex::new().expect("PTX usable but GpuIndex::new declined");
+        let again = super::cuda_kernel::GpuIndex::new().expect("second GpuIndex::new declined");
+        assert!(
+            super::cuda_kernel::ptx_usable(),
+            "latch answer changed within one process"
+        );
+        let after = super::cuda_kernel::module_load_attempts();
+        // Either this test triggered the single load of the process or an
+        // earlier test did: never more than one.
+        assert_eq!(
+            after,
+            before + u64::from(before == 0),
+            "distance module loaded more than once per process ({before} -> {after})"
+        );
+        assert!(
+            after <= 1,
+            "distance module loaded {after} times in one process"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &super::cuda_kernel::dist_module().unwrap()),
+            "dist_module() is not the process-wide handle"
+        );
+        drop(again);
+        // The index built under the latch still runs a PTX kernel.
+        let data = [0.0f32, 0.0, 3.0, 4.0];
+        assert!(idx.upload_dataset(&data, 2, 2));
+        let d = idx.l2_distances(&[0.0, 0.0]).expect("PTX kernel declined");
+        assert_eq!(d.len(), 2);
+        assert!(
+            d[0].is_finite() && d[1].is_finite() && d[0] <= d[1],
+            "{d:?}"
+        );
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn test_cuda_malformed_query_shape_declined_before_launch() {

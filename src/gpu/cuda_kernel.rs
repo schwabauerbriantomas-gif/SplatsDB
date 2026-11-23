@@ -38,14 +38,101 @@ static QUERY_SHAPE_FALLBACK_LOG: OnceLock<String> = OnceLock::new();
 static GAUSSIAN_INFO_LOG: OnceLock<String> = OnceLock::new();
 static GAUSSIAN_LAUNCH_LOG: OnceLock<String> = OnceLock::new();
 
+/// Process-wide CUDA context, created once per process (cudarc 0.19 panics —
+/// not Err — when the driver library itself is missing: same dlopen boundary
+/// as `is_cuda_available()`; `serve --gpu` on a driver-less host must degrade
+/// to CPU, not die at boot). `None` is latched: no later call retries.
+static CUDA_CONTEXT: OnceLock<Option<Arc<CudaContext>>> = OnceLock::new();
+
+fn cuda_context() -> Option<Arc<CudaContext>> {
+    CUDA_CONTEXT
+        .get_or_init(|| {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| CudaContext::new(0))) {
+                Ok(Ok(ctx)) => Some(ctx),
+                Ok(Err(e)) => {
+                    crate::gpu::log_cuda_unavailable_once(format!(
+                        "CudaContext::new(0) failed: {e:?}"
+                    ));
+                    None
+                }
+                Err(_) => {
+                    crate::gpu::log_cuda_unavailable_once(
+                        "CudaContext::new(0) panicked (no libcuda / broken driver)".into(),
+                    );
+                    None
+                }
+            }
+        })
+        .clone()
+}
+
+/// The distance PTX this build compiled, when it exists on disk.
+fn ptx_source() -> Option<&'static str> {
+    let ptx_path = option_env!("M2M_PTX_PATH")?;
+    if ptx_path.is_empty() || !std::path::Path::new(ptx_path).exists() {
+        return None;
+    }
+    Some(ptx_path)
+}
+
+/// Distance-module latch (A02-F01, same pattern as `EXT_MODULE`): the module
+/// is loaded/JIT-compiled at most ONCE per process and the answer — usable or
+/// not — is final. `GpuIndex::new` returns `None` without it, so a host with
+/// a GPU but no usable PTX no longer creates a context, uploads the dataset
+/// and retries the JIT on every query before the CPU fallback runs.
+static DIST_MODULE: OnceLock<Option<Arc<CudaModule>>> = OnceLock::new();
+
+/// How many times the process asked the driver to load/JIT the distance
+/// module (receipt for the latch: 1 on a PTX host, 0 without PTX).
+static MODULE_LOAD_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn module_load_attempts() -> u64 {
+    MODULE_LOAD_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The process-wide distance module, or `None` when PTX is unusable.
+pub(crate) fn dist_module() -> Option<Arc<CudaModule>> {
+    DIST_MODULE
+        .get_or_init(|| {
+            static FAIL_LOG: OnceLock<String> = OnceLock::new();
+            let fail = |msg: String| -> Option<Arc<CudaModule>> {
+                if FAIL_LOG.set(msg.clone()).is_ok() {
+                    eprintln!("{msg}");
+                }
+                None
+            };
+            let Some(ptx_path) = ptx_source() else {
+                return fail(
+                    "[splatsdb] No PTX kernels (built without nvcc or the .ptx is missing) — GPU distance/top-k paths stay off, CPU fallback"
+                        .to_string(),
+                );
+            };
+            let ctx = cuda_context()?;
+            MODULE_LOAD_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match ctx.load_module(Ptx::from_file(ptx_path)) {
+                Ok(m) => {
+                    eprintln!("[splatsdb] PTX module loaded (cached): {}", ptx_path);
+                    Some(m)
+                }
+                Err(e) => fail(format!("[splatsdb] PTX module load failed: {:?}", e)),
+            }
+        })
+        .clone()
+}
+
+/// True when the distance PTX module is usable on this host (A02-F01 latch).
+pub(crate) fn ptx_usable() -> bool {
+    dist_module().is_some()
+}
+
 /// Persistent GPU state — keeps dataset in VRAM between calls.
 pub struct GpuIndex {
     stream: Arc<CudaStream>,
     data_gpu: Option<CudaSlice<f32>>,
     n_vectors: usize,
     dim: usize,
-    /// PTX module loaded ONCE at construction — module JIT used to run on every
-    /// call (cuda_kernel.rs:135,228,319,430 pattern), dominating launch cost.
+    /// Distance PTX module — the process-wide handle from `dist_module()` (JIT once per
+    /// process; a `None` is never stored, see `GpuIndex::new`).
     kernel_module: Option<Arc<CudaModule>>,
     /// Per-splat amplitudes [N] (see upload_alpha_kappa).
     alpha_gpu: Option<CudaSlice<f32>>,
@@ -60,31 +147,17 @@ impl GpuIndex {
         // Log once per process, not once per index creation (this fires per
         // request in server paths).
         static CTX_CREATED: OnceLock<()> = OnceLock::new();
-        // cudarc 0.19 panics (not Err) when the driver library itself is
-        // missing — same dlopen boundary as is_cuda_available(). `serve
-        // --gpu` on a driver-less host must degrade to CPU, not die at boot.
-        let ctx = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            CudaContext::new(0)
-        })) {
-            Ok(Ok(ctx)) => ctx,
-            Ok(Err(e)) => {
-                crate::gpu::log_cuda_unavailable_once(format!("CudaContext::new(0) failed: {e:?}"));
-                return None;
-            }
-            Err(_) => {
-                crate::gpu::log_cuda_unavailable_once(
-                    "CudaContext::new(0) panicked (no libcuda / broken driver)".into(),
-                );
-                return None;
-            }
-        };
+        // A02-F01 latch: without a usable distance module every query method
+        // of this index declines anyway, so return BEFORE a context, a stream
+        // or any upload exists. Callers keep their CPU fallback and their
+        // results; only the dead work (context + dataset upload + JIT retry)
+        // disappears.
+        let kernel_module = Some(dist_module()?);
+        let ctx = cuda_context()?;
         if CTX_CREATED.set(()).is_ok() {
             eprintln!("[splatsdb] CUDA context created successfully");
         }
         let stream = ctx.default_stream();
-
-        // Load the PTX module once and keep it alive for the index lifetime.
-        let kernel_module = Self::load_ptx_module(&ctx);
 
         Some(GpuIndex {
             stream,
@@ -95,30 +168,6 @@ impl GpuIndex {
             alpha_gpu: None,
             kappa_gpu: None,
         })
-    }
-
-    /// Load the distance.cu PTX module. None if M2M_PTX_PATH is unset/empty,
-    /// the file is missing, or cuModuleLoad fails.
-    fn load_ptx_module(ctx: &Arc<CudaContext>) -> Option<Arc<CudaModule>> {
-        let ptx_path = option_env!("M2M_PTX_PATH")?;
-        if ptx_path.is_empty() {
-            eprintln!("[splatsdb] No PTX kernels (built without nvcc or CUDA toolkit)");
-            return None;
-        }
-        if !std::path::Path::new(ptx_path).exists() {
-            eprintln!("[splatsdb] PTX path set but file not found: {}", ptx_path);
-            return None;
-        }
-        match ctx.load_module(Ptx::from_file(ptx_path)) {
-            Ok(m) => {
-                eprintln!("[splatsdb] PTX module loaded (cached): {}", ptx_path);
-                Some(m)
-            }
-            Err(e) => {
-                eprintln!("[splatsdb] PTX module load failed: {:?}", e);
-                None
-            }
-        }
     }
 
     /// Fetch a kernel function from the cached PTX module.
