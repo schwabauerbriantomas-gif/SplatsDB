@@ -14,6 +14,11 @@ use std::path::PathBuf;
 pub struct JsonMetadataStore {
     path: PathBuf,
     data: RwLock<HashMap<String, DocumentRecord>>,
+    /// Serializes whole `persist()` calls (snapshot + write). `upsert`
+    /// releases the write lock before persisting, so two threads could
+    /// persist at once: the snapshot written last must be the newest one,
+    /// and they must not share a temp file (A03-F08).
+    persist_lock: parking_lot::Mutex<()>,
 }
 
 impl JsonMetadataStore {
@@ -70,14 +75,21 @@ impl JsonMetadataStore {
         Ok(Self {
             path,
             data: RwLock::new(data),
+            persist_lock: parking_lot::Mutex::new(()),
         })
     }
 
     fn persist(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let data = self.data.read();
-        let json = serde_json::to_string_pretty(&*data)?;
-        // Atomic (temp + fsync + rename): a crash mid-persist leaves the
-        // previous metadata file intact instead of a half-written one.
+        // Whole-persist critical section: the snapshot is taken under the
+        // lock, so the snapshot written last is always the newest one.
+        let _persist = self.persist_lock.lock();
+        let json = {
+            let data = self.data.read();
+            serde_json::to_string_pretty(&*data)?
+        };
+        // Atomic (unique temp + fsync + rename + directory fsync): a crash
+        // mid-persist leaves the previous metadata file intact instead of a
+        // half-written one.
         super::persistence::atomic_write(&self.path, json.as_bytes())?;
         Ok(())
     }
@@ -242,6 +254,51 @@ mod tests {
         assert_eq!(reloaded.count(false).unwrap(), 2);
         assert!(reloaded.get("d1").unwrap().is_some());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A03-F08 — concurrent upserts: `persist()` used to run after the write
+    /// lock was released, so two threads shared `<file>.tmp.<pid>` and
+    /// clobbered each other (corrupt JSON → quarantined → empty store).
+    ///
+    /// 80 fsync-bound persists (~6 s on a WSL2 disk) keep this in unit-test
+    /// range; on the old code every thread already collided within its first
+    /// two upserts.
+    #[test]
+    fn concurrent_upserts_persist_every_record() {
+        let dir = temp_dir("concurrent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.json");
+        let store = std::sync::Arc::new(JsonMetadataStore::new(path.clone()).unwrap());
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 10;
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let store = store.clone();
+                s.spawn(move || {
+                    for i in 0..PER_THREAD {
+                        store
+                            .upsert(&sample_record(&format!("t{t}-i{i}")))
+                            .unwrap_or_else(|e| panic!("upsert t{t}-i{i}: {e}"));
+                    }
+                });
+            }
+        });
+
+        let reloaded = JsonMetadataStore::new(path.clone()).unwrap();
+        assert_eq!(reloaded.count(false).unwrap(), THREADS * PER_THREAD);
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.contains(".corrupt-")),
+            "metadata was quarantined: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains(".tmp.")),
+            "temp files left behind: {names:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
