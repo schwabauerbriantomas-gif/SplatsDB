@@ -288,11 +288,7 @@ pub fn build_recap(req: &RecapRequest) -> RecapResponse {
         })
         .collect();
     // Deterministic order: section priority, then score desc, then input idx.
-    scored.sort_by(|a, b| {
-        a.1.cmp(&b.1)
-            .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
-            .then(a.0.cmp(&b.0))
-    });
+    scored.sort_by(|a, b| a.1.cmp(&b.1).then(b.2.total_cmp(&a.2)).then(a.0.cmp(&b.0)));
 
     // ── budgeted selection ──
     // Fixed overhead: OBJECTIVE line + section headers ("DEAD ENDS (do not

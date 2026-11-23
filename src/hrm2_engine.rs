@@ -263,11 +263,7 @@ impl HRM2Engine {
         let coarse_dists = coarse.transform(&q_2d);
         let coarse_dists = coarse_dists.row(0);
         let mut coarse_order: Vec<usize> = (0..coarse_dists.len()).collect();
-        coarse_order.sort_by(|a, b| {
-            coarse_dists[*a]
-                .partial_cmp(&coarse_dists[*b])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        coarse_order.sort_by(|a, b| coarse_dists[*a].total_cmp(&coarse_dists[*b]));
 
         let probe_count = self.n_probe.min(coarse_order.len());
         let closest: Vec<usize> = coarse_order.iter().take(probe_count).copied().collect();
@@ -300,11 +296,7 @@ impl HRM2Engine {
                     let fine_dists = fine.transform(&q_fine);
                     let fine_dists = fine_dists.row(0);
                     let best_fine = (0..fine_dists.len())
-                        .min_by(|a, b| {
-                            fine_dists[*a]
-                                .partial_cmp(&fine_dists[*b])
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        })
+                        .min_by(|a, b| fine_dists[*a].total_cmp(&fine_dists[*b]))
                         .expect("fine_dists must not be empty");
 
                     let indices = self
@@ -346,7 +338,8 @@ impl HRM2Engine {
         }
 
         // Sort and take top-k
-        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        // F06a: total order (NaN-safe); equal distances keep ascending id.
+        candidates.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
         candidates.truncate(k);
 
         // Update stats

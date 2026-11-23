@@ -47,7 +47,8 @@ impl PartialOrd for DistIdx {
 }
 impl Ord for DistIdx {
     fn cmp(&self, other: &Self) -> Ordering {
-        other.0.partial_cmp(&self.0).unwrap_or(Ordering::Equal)
+        // F06a: total order (NaN-safe) — `Ord` backs the heaps.
+        other.0.total_cmp(&self.0)
     }
 }
 
@@ -67,7 +68,7 @@ impl PartialOrd for MaxDistIdx {
 }
 impl Ord for MaxDistIdx {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.0.partial_cmp(&other.0).unwrap_or(Ordering::Equal)
+        self.0.total_cmp(&other.0)
     }
 }
 
@@ -622,7 +623,7 @@ impl HNSWIndex {
         }
 
         let mut r: Vec<(f32, usize)> = results.into_iter().map(|MaxDistIdx(d, i)| (d, i)).collect();
-        r.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        r.sort_by(|a, b| a.0.total_cmp(&b.0));
         r
     }
 
@@ -690,8 +691,7 @@ impl HNSWIndex {
                         .iter()
                         .map(|&ni| (self.distance(n_vec, &self.vectors[ni]), ni))
                         .collect();
-                    scored
-                        .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                    scored.sort_by(|a, b| a.0.total_cmp(&b.0));
                     self.nodes[neighbor_idx].neighbors[lev] =
                         scored.into_iter().take(m_max).map(|(_, i)| i).collect();
                 }
@@ -1502,7 +1502,7 @@ mod tests {
             }
         }
         let mut r: Vec<(f32, usize)> = results.into_iter().map(|MaxDistIdx(d, i)| (d, i)).collect();
-        r.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        r.sort_by(|a, b| a.0.total_cmp(&b.0));
         let results: Vec<(f32, usize)> = r
             .into_iter()
             .filter(|(_, i)| !idx.removed.contains(i))

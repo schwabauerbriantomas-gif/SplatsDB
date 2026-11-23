@@ -119,7 +119,7 @@ pub fn persist_field(
 
     let empty = counts.iter().filter(|&&c| c == 0).count();
     let mut sorted_r = rmax.clone();
-    sorted_r.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted_r.sort_by(|a, b| a.total_cmp(&b));
     let med = if sorted_r.is_empty() {
         0.0
     } else {
@@ -263,11 +263,7 @@ pub fn field_search_two_phase(
             diff.dot(&diff).max(0.0).sqrt()
         });
         let mut order: Vec<usize> = (0..k).collect();
-        order.sort_by(|a, b| {
-            d_mu[*a]
-                .partial_cmp(&d_mu[*b])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        order.sort_by(|a, b| d_mu[*a].total_cmp(&d_mu[*b]));
         winners = order.into_iter().take(nprobe).collect();
     }
     let phase1_us = t1.elapsed().as_micros() as u64;
@@ -291,7 +287,7 @@ pub fn field_search_two_phase(
             (diff.dot(&diff), id)
         })
         .collect();
-    top.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    top.sort_by(|a, b| a.0.total_cmp(&b.0));
     top.truncate(kq);
     let phase2_us = t2.elapsed().as_micros() as u64;
 
@@ -369,11 +365,7 @@ pub fn field_search(data_dir: &str, q: &[f32], kq: usize) -> Result<serde_json::
     let lb: Array1<f32> = Array1::from_iter((0..k).map(|c| (d_mu[c] - radii[c]).max(0.0)));
 
     let mut order: Vec<usize> = (0..k).collect();
-    order.sort_by(|a, b| {
-        d_mu[*a]
-            .partial_cmp(&d_mu[*b])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    order.sort_by(|a, b| d_mu[*a].total_cmp(&d_mu[*b]));
 
     let mut top: Vec<(f32, u32)> = Vec::with_capacity(kq + 8);
     let mut kth = f32::INFINITY;
@@ -398,7 +390,7 @@ pub fn field_search(data_dir: &str, q: &[f32], kq: usize) -> Result<serde_json::
             let d2 = diff.dot(&diff);
             if top.len() < kq || d2 < kth {
                 top.push((d2, id));
-                top.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                top.sort_by(|a, b| a.0.total_cmp(&b.0));
                 if top.len() > kq {
                     top.truncate(kq);
                 }

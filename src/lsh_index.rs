@@ -132,7 +132,7 @@ impl CrossPolytopeLSH {
             })
             .collect();
 
-        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
         scored.truncate(k);
 
         (
@@ -171,11 +171,7 @@ impl CrossPolytopeLSH {
                 let (max_idx, max_val) = rotated
                     .iter()
                     .enumerate()
-                    .max_by(|a, b| {
-                        a.1.abs()
-                            .partial_cmp(&b.1.abs())
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
+                    .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
                     .expect("rotated vector should not be empty");
                 let sign_bit = if *max_val >= 0.0 { 0i64 } else { 1i64 };
                 max_idx as i64 * 2 + sign_bit
@@ -201,7 +197,7 @@ impl CrossPolytopeLSH {
                     .enumerate()
                     .map(|(i, &v)| (i, v.abs()))
                     .collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
                 indexed.truncate(m);
 
                 indexed
@@ -249,7 +245,7 @@ impl CrossPolytopeLSH {
             }
         }
 
-        probe_candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        probe_candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
         probe_candidates.truncate(self.config.n_probes);
         probe_candidates.into_iter().map(|(_, h)| h).collect()
     }
@@ -405,7 +401,7 @@ mod tests {
                         (dist, j)
                     })
                     .collect();
-                scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                scored.sort_by(|a, b| a.0.total_cmp(&b.0));
                 scored.into_iter().take(5).map(|(_, i)| i).collect()
             })
             .collect();

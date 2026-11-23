@@ -562,7 +562,7 @@ impl GpuIndex {
             .iter()
             .map(|distances| {
                 let mut indices: Vec<usize> = (0..distances.len()).collect();
-                indices.sort_by(|a, b| distances[*a].partial_cmp(&distances[*b]).unwrap());
+                indices.sort_by(|a, b| distances[*a].total_cmp(&distances[*b]));
                 indices.truncate(k);
                 let dists: Vec<f32> = indices.iter().map(|&i| distances[i]).collect();
                 (indices, dists)

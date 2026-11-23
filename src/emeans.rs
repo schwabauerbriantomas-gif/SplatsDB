@@ -129,7 +129,7 @@ fn revive_unused(
             ((usage[j] as f64).ln() - (-u.ln()).ln(), j)
         })
         .collect();
-    keys.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    keys.sort_by(|a, b| b.0.total_cmp(&a.0));
     let sources: Vec<usize> = keys.into_iter().take(nsplit).map(|(_, j)| j).collect();
     let targets: Vec<usize> = unused.into_iter().take(nsplit).collect();
     for (si, &src) in sources.iter().enumerate() {

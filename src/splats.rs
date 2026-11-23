@@ -47,7 +47,7 @@ pub(crate) enum Contract {
 /// score) — and, among exactly equal scores, by ascending splat id.
 pub(crate) fn sort_score_then_id(pairs: &mut [(usize, f32)], descending: bool) {
     pairs.sort_by(|a, b| {
-        let by_score = a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal);
+        let by_score = a.1.total_cmp(&b.1);
         let by_score = if descending {
             by_score.reverse()
         } else {
@@ -55,6 +55,19 @@ pub(crate) fn sort_score_then_id(pairs: &mut [(usize, f32)], descending: bool) {
         };
         by_score.then(a.0.cmp(&b.0))
     });
+}
+
+/// Total order on `(value, id)` pairs (F06a): `total_cmp` orders NaN and inf
+/// as well (NaN after +inf), so a non-finite distance that reaches a
+/// comparator by some other path can no longer make `sort_by` /
+/// `select_nth_unstable_by` panic with "does not correctly implement a total
+/// order" — `partial_cmp(..).unwrap_or(Equal).then(id)` was NOT transitive
+/// with NaN. Exactly equal values order by ascending id (ties contract).
+impl SplatStore {
+    #[inline]
+    pub(crate) fn cmp_value_then_id(a: &(f32, usize), b: &(f32, usize)) -> std::cmp::Ordering {
+        a.0.total_cmp(&b.0).then(a.1.cmp(&b.1))
+    }
 }
 
 /// Contractual top-k from kernel-ordered windows (F02e1).
@@ -298,6 +311,14 @@ impl SplatStore {
             return false;
         }
         if x.ncols() != self.config.latent_dim {
+            return false;
+        }
+        // F06a: a non-finite value (NaN/inf) is rejected BEFORE anything
+        // changes — no row, no backlog, no `data_version` bump (the whole
+        // batch is atomic). Such a row used to be accepted and then made
+        // `build_index` panic ("comparison function does not correctly
+        // implement a total order").
+        if !x.iter().all(|v| v.is_finite()) {
             return false;
         }
         for i in 0..n_new {
@@ -742,11 +763,7 @@ impl SplatStore {
         // the k-th distance and their order are contractual (before, the id
         // was ignored and `select_nth_unstable_by` left the tied rows in an
         // arbitrary permutation that the stable sort then kept).
-        let by_distance = |a: &(f32, usize), b: &(f32, usize)| {
-            a.0.partial_cmp(&b.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.1.cmp(&b.1))
-        };
+        let by_distance = |a: &(f32, usize), b: &(f32, usize)| Self::cmp_value_then_id(a, b);
         let mut indexed: Vec<(f32, usize)> =
             dists_sq.iter().enumerate().map(|(i, &d)| (d, i)).collect();
         if k < indexed.len() {
@@ -1011,11 +1028,8 @@ impl SplatStore {
         // The candidate pipeline can return fewer than k results (backend
         // under-delivery), so clamp before slicing.
         let k = k.min(scored.len());
-        let by_score = |a: &(f32, usize, f32), b: &(f32, usize, f32)| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.1.cmp(&b.1))
-        };
+        let by_score =
+            |a: &(f32, usize, f32), b: &(f32, usize, f32)| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1));
         if k < scored.len() {
             scored.select_nth_unstable_by(k, by_score);
         }
@@ -1178,6 +1192,15 @@ impl SplatStore {
         }
         if alpha_data.len() < n || kappa_data.len() < n {
             return Err("alpha/kappa arrays too short".into());
+        }
+        // F06a: a non-finite mu/alpha/kappa is an Err before any state changes.
+        if !mu_data.iter().all(|v| v.is_finite())
+            || alpha_data[..n]
+                .iter()
+                .chain(&kappa_data[..n])
+                .any(|v| !v.is_finite())
+        {
+            return Err("non-finite value in mu/alpha/kappa".into());
         }
         for i in 0..n {
             self.mu.row_mut(i).assign(&mu_data.row(i));
@@ -1392,11 +1415,9 @@ impl SplatStore {
         // clamp before slicing or [..k] panics.
         let k = k.min(scored.len());
         if k < scored.len() {
-            scored.select_nth_unstable_by(k, |a, b| {
-                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            scored.select_nth_unstable_by(k, Self::cmp_value_then_id);
         }
-        scored[..k].sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored[..k].sort_by(Self::cmp_value_then_id);
 
         scored[..k]
             .iter()
@@ -2625,6 +2646,54 @@ mod f02e1_contract_tests {
     }
 
     // ── F02f: a failed HNSW persistence is reported, never a success ──────
+
+    /// F06a: even if a non-finite value reaches `mu` by a path other than the
+    /// public mutators (which reject it), every comparator stays a total
+    /// order: `build_index` does not panic and every route still answers k.
+    #[test]
+    fn f06a_comparators_stay_total_when_a_non_finite_value_arrives_by_another_path() {
+        let dim = 32;
+        let mut store = SplatStore::new(crate::config::SplatsDBConfig {
+            max_splats: 1000,
+            latent_dim: dim,
+            enable_hnsw: true,
+            hnsw_m: 16,
+            hnsw_ef_construction: 100,
+            hnsw_ef_search: 50,
+            ..Default::default()
+        });
+        // Deterministic values without the helpers of `tests` (other module).
+        let data = Array2::from_shape_fn((300, dim), |(r, c)| {
+            let i = (r * dim + c) as u64;
+            ((i.wrapping_mul(2654435761) % 1000003) as f32) / 1000003.0
+        });
+        store.add_splat(&data);
+        // Bypass every public mutator: poison rows in place.
+        store.mu.row_mut(7)[5] = f32::NAN;
+        store.mu.row_mut(200)[0] = f32::NAN;
+        store.build_index();
+        let q = Array2::from_shape_fn((1, dim), |(_, c)| {
+            let i = 7u64.wrapping_add(c as u64 * 3);
+            ((i.wrapping_mul(2654435761) % 1000003) as f32) / 1000003.0
+        })
+        .row(0)
+        .to_owned();
+        for k in [1usize, 10, 50, 300] {
+            let lin = store.find_neighbors(&q.view(), k);
+            assert_eq!(lin.len(), k, "linear k={k}");
+            let fused = store.find_neighbors_fused(&q.view(), k);
+            assert_eq!(fused.len(), k, "fused k={k}");
+            let fast = store.find_neighbors_fast(&q.view(), k);
+            assert_eq!(fast.len(), k, "fast k={k}");
+            let gauss = store.find_neighbors_gaussian(&q.view(), k);
+            assert_eq!(gauss.len(), k, "gaussian k={k}");
+        }
+        // NaN sorts after every finite distance, and between NaN rows by id.
+        let lin = store.find_neighbors(&q.view(), 300);
+        assert_eq!((lin[298].index, lin[299].index), (7, 200));
+        let fused = store.find_neighbors_fused(&q.view(), 300);
+        assert_eq!((fused[298].index, fused[299].index), (7, 200));
+    }
 
     #[test]
     fn f02f_try_build_index_with_save_reports_a_failed_hnsw_persist() {

@@ -170,9 +170,7 @@ impl KMeans {
                                     let d = diff.dot(&diff);
                                     (c, d)
                                 })
-                                .min_by(|a, b| {
-                                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-                                })
+                                .min_by(|a, b| a.1.total_cmp(&b.1))
                                 .expect("clusters must not be empty");
                             (i, best_k, best_dist)
                         })
@@ -278,7 +276,7 @@ impl KMeans {
                         diff.dot(&diff)
                     })
                     .enumerate()
-                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
                     .map(|(idx, _)| idx)
                     .expect("centroids must not be empty")
             })
