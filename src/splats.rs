@@ -95,6 +95,25 @@ fn build_quant_store(
     crate::quantization::QuantizedStore::new(dim, qcfg).ok()
 }
 
+/// Build the optional LSH index from the preset config.
+///
+/// Extracted from `SplatStore::new`; also used to reset the index to its
+/// empty state when the rows it was built over are invalidated.
+fn build_lsh(config: &SplatsDBConfig, dim: usize) -> Option<crate::lsh_index::CrossPolytopeLSH> {
+    if !config.enable_lsh {
+        return None;
+    }
+    let lsh_cfg = crate::lsh_index::LSHConfig {
+        dim,
+        n_tables: 16,
+        n_bits: 8,
+        n_probes: 3,
+        n_candidates: 100,
+        seed: 42,
+    };
+    Some(crate::lsh_index::CrossPolytopeLSH::new(lsh_cfg))
+}
+
 impl SplatStore {
     /// Gaussian score of a splat for a query at squared distance `d2`.
     ///
@@ -138,19 +157,7 @@ impl SplatStore {
             None
         };
 
-        let lsh = if config.enable_lsh {
-            let lsh_cfg = crate::lsh_index::LSHConfig {
-                dim,
-                n_tables: 16,
-                n_bits: 8,
-                n_probes: 3,
-                n_candidates: 100,
-                seed: 42,
-            };
-            Some(crate::lsh_index::CrossPolytopeLSH::new(lsh_cfg))
-        } else {
-            None
-        };
+        let lsh = build_lsh(&config, dim);
 
         Self {
             config,
@@ -366,6 +373,29 @@ impl SplatStore {
 
     // ── Incremental HNSW insertion ──────────────────────────────────
 
+    /// Reset every positional index to its empty state.
+    ///
+    /// Called after rows moved or were replaced in place (`compact`,
+    /// `load_splats`). The candidate backend, the HRM2 engine, the quantized
+    /// store and the LSH tables all address rows by store position, so they
+    /// are meaningless afterwards. Until the next `build_index` /
+    /// `hnsw_sync_incremental`, every search falls back to the exact linear
+    /// path and `hnsw_needs_sync()` reports true.
+    ///
+    /// The backend graph is really rebuilt as empty: lowering
+    /// `hnsw_indexed_count` alone would leave a stale graph searchable and
+    /// make the next incremental insert land on shifted positions.
+    fn invalidate_positional_indexes(&mut self) {
+        let dim = self.config.latent_dim;
+        if let Some(ref mut backend) = self.candidates {
+            backend.build(&Array2::zeros((0, dim)));
+        }
+        self.hnsw_indexed_count = 0;
+        self.engine.invalidate();
+        self.quant_store = build_quant_store(&self.config, dim);
+        self.lsh = build_lsh(&self.config, dim);
+    }
+
     /// Check if the candidate backend has unindexed vectors (new vectors since
     /// last build/insert).
     pub fn hnsw_needs_sync(&self) -> bool {
@@ -480,29 +510,20 @@ impl SplatStore {
     /// 3. Optionally saves the updated HNSW to disk
     ///
     /// Returns the index of the new vector, or None if capacity exceeded.
+    ///
+    /// Backlog-safe: rows added since the last build/sync are inserted too,
+    /// in positional order — this routes through `hnsw_sync_incremental`.
     pub fn insert_with_hnsw(&mut self, vec: &[f32], data_dir: Option<&str>) -> Option<usize> {
         let idx = self.insert(vec)?;
-        if let Some(ref mut backend) = self.candidates {
-            if backend.capabilities().incremental {
-                if let Err(e) = backend.add_batch(std::slice::from_ref(&vec.to_vec())) {
-                    eprintln!("[splatsdb] Warning: backend insert failed: {}", e);
-                    // Do NOT mark it indexed: the next sync retries it.
-                } else {
-                    self.hnsw_indexed_count = self.n_active;
-                }
-            } else {
-                let embeddings = self.mu.slice(ndarray::s![..self.n_active, ..]).to_owned();
-                backend.build(&embeddings);
-                self.hnsw_indexed_count = self.n_active;
-            }
-            if let Some(dir) = data_dir {
-                if let Err(e) = self.save_hnsw(dir) {
-                    eprintln!(
-                        "[splatsdb] Warning: failed to save HNSW after insert: {}",
-                        e
-                    );
-                }
-            }
+        // Backend positions are store indices. Appending this vector alone
+        // would place it at the backend's current length — ahead of rows that
+        // are still waiting in the backlog — and the previous code then marked
+        // everything indexed. The shared sync inserts the whole range
+        // [hnsw_indexed_count, n_active) in positional order instead.
+        if let Some(dir) = data_dir {
+            self.hnsw_sync_and_save(dir);
+        } else {
+            self.hnsw_sync_incremental();
         }
         Some(idx)
     }
@@ -511,34 +532,18 @@ impl SplatStore {
     ///
     /// More efficient than calling `insert_with_hnsw` in a loop because
     /// it only saves to disk once after all insertions.
+    ///
+    /// Backlog-safe: rows added since the last build/sync are inserted too,
+    /// in positional order — this routes through `hnsw_sync_incremental`.
     pub fn add_batch_with_hnsw(&mut self, vectors: &Array2<f32>, data_dir: Option<&str>) -> bool {
-        let n_before = self.n_active;
         if !self.add_splat(vectors) {
             return false;
         }
-
-        if let Some(ref mut backend) = self.candidates {
-            if backend.capabilities().incremental {
-                let new_vecs: Vec<Vec<f32>> = (n_before..self.n_active)
-                    .map(|i| self.mu.row(i).to_vec())
-                    .collect();
-                if let Err(e) = backend.add_batch(&new_vecs) {
-                    eprintln!("[splatsdb] Warning: backend add_batch failed: {}", e);
-                    // Leave hnsw_indexed_count behind: the next incremental
-                    // sync retries these vectors instead of forgetting them.
-                } else {
-                    self.hnsw_indexed_count = self.n_active;
-                }
-            } else {
-                let embeddings = self.mu.slice(ndarray::s![..self.n_active, ..]).to_owned();
-                backend.build(&embeddings);
-                self.hnsw_indexed_count = self.n_active;
-            }
-            if let Some(dir) = data_dir {
-                if let Err(e) = self.save_hnsw(dir) {
-                    eprintln!("[splatsdb] Warning: failed to save HNSW after batch: {}", e);
-                }
-            }
+        // Same alignment rule as `insert_with_hnsw` (see the note there).
+        if let Some(dir) = data_dir {
+            self.hnsw_sync_and_save(dir);
+        } else {
+            self.hnsw_sync_incremental();
         }
         true
     }
@@ -878,6 +883,13 @@ impl SplatStore {
     /// - Dataset has fewer than 100 active vectors (not worth the overhead)
     /// - HRM2 engine is not indexed
     /// - HRM2 query returns an error
+    ///
+    /// Distance contract (identical on every branch): `distance` is the exact
+    /// raw L2 `||q - mu||` recomputed against the store's `mu` for each
+    /// returned candidate, and `score` derives from it. The engine ranks in
+    /// its own metric space (cosine: L2-normalized rows), so its distances
+    /// are candidate hints only. The candidate SET stays approximate (probed
+    /// clusters); results are ordered by the exported distance.
     pub fn find_neighbors_fast(
         &mut self,
         query: &ArrayView1<f32>,
@@ -898,15 +910,39 @@ impl SplatStore {
         match self.engine.query(query, k, 2) {
             Ok(candidates) if !candidates.is_empty() => {
                 let index_data = self.mu.slice(ndarray::s![..n, ..]);
-                candidates
+                // The engine ranks in its own space (metric "cosine": L2-
+                // normalized rows, distances in [0, 2]) and only searches the
+                // probed clusters. Its distances are candidate hints: the
+                // exported `distance` is the exact raw L2 ||q - mu_i|| against
+                // the store's `mu` — the same value the linear path reports
+                // for the same index — and `score` derives from it.
+                let mut ranked: Vec<(usize, f32)> = candidates
                     .into_iter()
-                    .map(|(idx, dist)| NeighborResult {
+                    .map(|(idx, _hint)| {
+                        let dist_sq = index_data
+                            .row(idx)
+                            .iter()
+                            .zip(query.iter())
+                            .map(|(a, b)| {
+                                let d = a - b;
+                                d * d
+                            })
+                            .sum::<f32>();
+                        (idx, dist_sq)
+                    })
+                    .collect();
+                // Stable sort: ties keep the engine's order, so the generator
+                // order survives whenever it agrees with the raw distance.
+                ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                ranked
+                    .into_iter()
+                    .map(|(idx, dist_sq)| NeighborResult {
                         mu: index_data.row(idx).to_vec(),
                         alpha: self.alpha[idx],
                         kappa: self.kappa[idx],
                         index: idx,
-                        distance: dist,
-                        score: Self::gaussian_score(self.alpha[idx], self.kappa[idx], dist * dist),
+                        distance: dist_sq.sqrt(),
+                        score: Self::gaussian_score(self.alpha[idx], self.kappa[idx], dist_sq),
                     })
                     .collect()
             }
@@ -970,6 +1006,9 @@ impl SplatStore {
         self.next_id = n as u64;
         // Full overwrite → bump the VRAM-cache key.
         self.data_version += 1;
+        // Every row may have changed under the same positions: the indexes
+        // built over the previous content are stale.
+        self.invalidate_positional_indexes();
         Ok(())
     }
 
@@ -1050,6 +1089,10 @@ impl SplatStore {
         self.n_active = write_idx;
         // Row content/order changed → bump the VRAM-cache key.
         self.data_version += 1;
+        if write_idx < n {
+            // Rows shifted down: the positional indexes now point at other rows.
+            self.invalidate_positional_indexes();
+        }
     }
 
     /// Get store statistics.

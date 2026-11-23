@@ -149,6 +149,14 @@ impl HRM2Engine {
             return 0.0;
         };
 
+        // Empty dataset: nothing to cluster. KMeans leaves `labels` unset
+        // (Lloyd) or `fit_emeans` divides by a zero batch (Emeans), so the
+        // `.expect()` below would panic. Fail closed instead: no index.
+        if n_samples == 0 {
+            self.invalidate();
+            return 0.0;
+        }
+
         let embeddings = self
             .embeddings
             .as_ref()
@@ -372,6 +380,24 @@ impl HRM2Engine {
     /// Check if the index has been built.
     pub fn is_indexed(&self) -> bool {
         self.is_indexed
+    }
+
+    /// Drop the index state: embeddings, coarse/fine models, assignments and
+    /// cluster tables. The raw splats are kept (unlike [`clear`](Self::clear)).
+    ///
+    /// Afterwards `is_indexed()` is false and `query` fails closed with
+    /// "Index not built" until `index()` runs again. `SplatStore` calls this
+    /// when the rows an index was built over are invalidated or empty.
+    pub fn invalidate(&mut self) {
+        self.embeddings = None;
+        self.coarse_model = None;
+        self.coarse_assignments = None;
+        self.fine_models.clear();
+        self.fine_assignments.clear();
+        self.cluster_indices.clear();
+        self.cluster_embeddings.clear();
+        self.cluster_masks.clear();
+        self.is_indexed = false;
     }
 
     /// Reset the engine, removing all data and index state.
