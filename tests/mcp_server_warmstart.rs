@@ -44,7 +44,9 @@ fn spawn_server(doc_db: &std::path::Path, skip_spatial: bool) -> Server {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("SPLATSDB_DOC_PATH", doc_db);
+        .env("SPLATSDB_DOC_PATH", doc_db)
+        // Explicit opt-in: the SimCos fallback is no longer silent (A03-F10).
+        .env("SPLATSDB_ALLOW_SIMCOS", "1");
     if skip_spatial {
         cmd.env("SPLATDB_SPATIAL_WARMSTART", "0");
     }

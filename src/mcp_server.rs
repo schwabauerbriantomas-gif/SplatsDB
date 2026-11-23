@@ -26,6 +26,11 @@ use crate::storage::sqlite_store::SqliteMetadataStore;
 const EMBEDDING_SERVICE_URL_DEFAULT: &str = "http://127.0.0.1:8788/embed";
 static EMBED_SERVICE_AVAILABLE: AtomicBool = AtomicBool::new(true);
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Explicit opt-in for the SimCos text-hash fallback (`SPLATSDB_ALLOW_SIMCOS=1`),
+/// read once at startup. OFF by default: without it every text-embedding
+/// entry point fails closed when the real service is unavailable.
+static SIMCOS_ALLOWED: AtomicBool = AtomicBool::new(false);
+static SIMCOS_WARNED: AtomicBool = AtomicBool::new(false);
 const MAX_DOC_TEXT_CACHE: usize = 10_000;
 const MAX_WARM_START_DOCS: usize = 50_000;
 
@@ -58,8 +63,64 @@ fn get_embedding_strict(text: &str, dim: usize) -> Option<Vec<f32>> {
     }
 }
 
-fn get_embedding(text: &str, dim: usize) -> Vec<f32> {
-    get_embedding_strict(text, dim).unwrap_or_else(|| simcos_embedding(text, dim))
+/// Explicit opt-in parser for the SimCos fallback (`SPLATSDB_ALLOW_SIMCOS`).
+/// Pure (no env access) so it is directly testable.
+fn simcos_opt_in(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Where an embedding came from. Always reported to the client, which never
+/// has to guess whether ranking is semantic or a text hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EmbeddingSource {
+    /// The real embedding service answered.
+    Real,
+    /// SimCos text-hash fallback — only ever under explicit opt-in.
+    SimCos,
+    /// Supplied by the client in the request.
+    Provided,
+}
+
+impl EmbeddingSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Real => "real",
+            Self::SimCos => "simcos",
+            Self::Provided => "provided",
+        }
+    }
+}
+
+const EMBEDDING_UNAVAILABLE: &str = "embedding unavailable: embed service unreachable or returned an unusable vector (dimension mismatch / non-finite values) and the SimCos fallback is not authorized (start the embed server, send a pre-computed 'embedding', or opt in explicitly with SPLATSDB_ALLOW_SIMCOS=1)";
+
+/// Embedding for `text`, never silent (A03-F10): the real service first;
+/// SimCos only when explicitly authorized via `SPLATSDB_ALLOW_SIMCOS`, and
+/// then labelled as such. Anything else is a controlled error.
+fn get_embedding_labeled(text: &str, dim: usize) -> Result<(Vec<f32>, EmbeddingSource), String> {
+    if let Some(vec) = get_embedding_strict(text, dim) {
+        return Ok((vec, EmbeddingSource::Real));
+    }
+    if SIMCOS_ALLOWED.load(Ordering::Relaxed) {
+        if !SIMCOS_WARNED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[mcp] WARNING: embed service unavailable; using the AUTHORIZED SimCos fallback (SPLATSDB_ALLOW_SIMCOS): ranking is text-hash, not semantic — every response is labelled embedding=simcos"
+            );
+        }
+        return Ok((simcos_embedding(text, dim), EmbeddingSource::SimCos));
+    }
+    Err(EMBEDDING_UNAVAILABLE.to_string())
+}
+
+/// Optional client-provided embedding (`embedding` array argument).
+fn parse_embedding_param(params: &Value) -> Option<Vec<f32>> {
+    params["embedding"].as_array().map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_f64().map(|f| f as f32))
+            .collect::<Vec<_>>()
+    })
 }
 
 fn fetch_real_embedding(text: &str, target_dim: usize) -> Option<Vec<f32>> {
@@ -79,10 +140,15 @@ fn fetch_real_embedding(text: &str, target_dim: usize) -> Option<Vec<f32>> {
         .iter()
         .filter_map(|v: &Value| v.as_f64().map(|f| f as f32))
         .collect();
-    if vec.len() < target_dim {
-        vec.resize(target_dim, 0.0f32);
-    } else {
-        vec.truncate(target_dim);
+    // A service answering with another dimension is a configuration error:
+    // zero-padding or truncating would index a different vector space as if
+    // it were valid (A03-F13, same contract as HTTP /recall).
+    if vec.len() != target_dim {
+        eprintln!(
+            "[mcp] embedding service returned {} dims, expected {target_dim}; rejecting",
+            vec.len()
+        );
+        return None;
     }
     let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 1e-8 {
@@ -91,9 +157,9 @@ fn fetch_real_embedding(text: &str, target_dim: usize) -> Option<Vec<f32>> {
         }
     }
     // A hostile/broken embedding service returning NaN/inf must not poison
-    // the index: reject and fall back to the SimCos embedding.
+    // the index: reject the vector (any SimCos fallback is opt-in + labelled).
     if !all_finite(&vec) {
-        eprintln!("[mcp] embedding service returned non-finite values; falling back to simcos");
+        eprintln!("[mcp] embedding service returned non-finite values; rejecting");
         return None;
     }
     Some(vec)
@@ -438,6 +504,7 @@ fn tool_definitions() -> Vec<Value> {
                         "type": "string",
                         "description": "Search query text"
                     },
+                    "embedding": { "type": "array", "items": { "type": "number" }, "description": "Optional pre-computed query embedding" },
                     "wing": {
                         "type": "string",
                         "description": "Filter by wing (project/persona/domain). E.g. 'project-x', 'personal'"
@@ -473,6 +540,7 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "embedding": { "type": "array", "items": { "type": "number" }, "description": "Optional pre-computed query embedding" },
                     "query": { "type": "string", "description": "Search query text" },
                     "top_k": { "type": "number", "description": "Number of results (default: 10)" }
                 },
@@ -661,8 +729,12 @@ fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String
         s.store.get_statistics().embedding_dim
     }; // lock dropped here
 
-    // Use provided embedding, or get real embedding (MiniLM or SimCos fallback)
-    let embedding = embedding_opt.unwrap_or_else(|| get_embedding(text, dim));
+    // Provided embedding, or a real one — or SimCos under explicit opt-in.
+    // Never a silent fallback: an unauthorized fallback is a controlled error.
+    let (embedding, embedding_src) = match embedding_opt {
+        Some(e) => (e, EmbeddingSource::Provided),
+        None => get_embedding_labeled(text, dim)?,
+    };
 
     if embedding.len() != dim {
         return Err(format!(
@@ -763,7 +835,8 @@ fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String
         "id": id,
         "status": "stored",
         "persisted": persisted,
-        "ephemeral": !s.doc_store_persistent
+        "ephemeral": !s.doc_store_persistent,
+        "embedding": embedding_src.label()
     }))
 }
 
@@ -799,14 +872,13 @@ fn handle_search(state: &Mutex<McpState>, params: &Value) -> Result<Value, Strin
             .filter_map(|v| v.as_f64().map(|f| f as f32))
             .collect::<Vec<_>>()
     });
-    let embedding = match embedding_opt {
-        Some(e) => e,
+    let (embedding, embedding_src) = match embedding_opt {
+        Some(e) => (e, EmbeddingSource::Provided),
         // fa1e528 parity (HTTP /search answers 400 without embedding): no
-        // text-hash fallback here either — SimCos noise with a 200-equivalent
-        // response is silent garbage ranking. Fail closed (17-nov EGM audit).
-        None => get_embedding_strict(query, dim).ok_or_else(|| {
-            "embedding unavailable: embed service unreachable — send an 'embedding' argument or start the embed server".to_string()
-        })?,
+        // SILENT text-hash fallback — SimCos noise reported with a success
+        // status is garbage ranking. It is allowed only under explicit
+        // opt-in and is then labelled `embedding: simcos` (A03-F10).
+        None => get_embedding_labeled(query, dim)?,
     };
 
     if embedding.len() != dim {
@@ -867,7 +939,7 @@ fn handle_search(state: &Mutex<McpState>, params: &Value) -> Result<Value, Strin
     // backend marker: scores are HRM2 engine distances (approximate path for
     // large stores), NOT the exact d² the HTTP /search emits — clients must
     // not reuse HTTP band calibrations against them (17-nov EGM audit).
-    Ok(json!({ "results": results, "backend": "hrm2" }))
+    Ok(json!({ "results": results, "backend": "hrm2", "embedding": embedding_src.label() }))
 }
 
 fn handle_status(state: &Mutex<McpState>) -> Result<Value, String> {
@@ -886,6 +958,7 @@ fn handle_status(state: &Mutex<McpState>) -> Result<Value, String> {
         "doc_count": doc_count,
         "persisted": s.doc_store_persistent,
         "ephemeral": !s.doc_store_persistent,
+        "embedding_fallback": if SIMCOS_ALLOWED.load(Ordering::Relaxed) { "simcos" } else { "none" },
         "has_hnsw": s.store.has_hnsw(),
         "has_lsh": s.store.has_lsh(),
         "has_quantization": s.store.has_quantization(),
@@ -914,8 +987,7 @@ fn handle_doc_add(state: &Mutex<McpState>, params: &Value) -> Result<Value, Stri
         s.store.get_statistics().embedding_dim
     }; // lock dropped here
 
-    // Compute embedding (real model or SimCos fallback)
-    let embedding = get_embedding(text, dim);
+    let (embedding, embedding_src) = get_embedding_labeled(text, dim)?;
     let arr = Array2::from_shape_vec((1, dim), embedding)
         .map_err(|e| format!("embedding error: {}", e))?;
 
@@ -979,7 +1051,7 @@ fn handle_doc_add(state: &Mutex<McpState>, params: &Value) -> Result<Value, Stri
         text.len(),
         metadata.is_some()
     );
-    Ok(json!({ "ok": true, "id": id }))
+    Ok(json!({ "ok": true, "id": id, "embedding": embedding_src.label() }))
 }
 
 fn handle_doc_get(state: &Mutex<McpState>, params: &Value) -> Result<Value, String> {
@@ -1063,7 +1135,7 @@ fn handle_graph_add_doc(state: &Mutex<McpState>, params: &Value) -> Result<Value
         s.store.get_statistics().embedding_dim
     }; // lock dropped here
 
-    let embedding = get_embedding(text, dim);
+    let (embedding, embedding_src) = get_embedding_labeled(text, dim)?;
 
     let mut s = state.lock().map_err(|e| {
         eprintln!("[mcp] mutex poisoned: {}", e);
@@ -1080,7 +1152,7 @@ fn handle_graph_add_doc(state: &Mutex<McpState>, params: &Value) -> Result<Value
         node_id,
         text.len()
     );
-    Ok(json!({ "node_id": node_id, "node_type": "document" }))
+    Ok(json!({ "node_id": node_id, "node_type": "document", "embedding": embedding_src.label() }))
 }
 
 fn handle_graph_add_entity(state: &Mutex<McpState>, params: &Value) -> Result<Value, String> {
@@ -1105,7 +1177,7 @@ fn handle_graph_add_entity(state: &Mutex<McpState>, params: &Value) -> Result<Va
         s.store.get_statistics().embedding_dim
     }; // lock dropped here
 
-    let embedding = get_embedding(name, dim);
+    let (embedding, embedding_src) = get_embedding_labeled(name, dim)?;
 
     let mut s = state.lock().map_err(|e| {
         eprintln!("[mcp] mutex poisoned: {}", e);
@@ -1123,7 +1195,9 @@ fn handle_graph_add_entity(state: &Mutex<McpState>, params: &Value) -> Result<Va
         name.len(),
         entity_type
     );
-    Ok(json!({ "node_id": node_id, "name": name, "entity_type": entity_type }))
+    Ok(
+        json!({ "node_id": node_id, "name": name, "entity_type": entity_type, "embedding": embedding_src.label() }),
+    )
 }
 
 fn handle_graph_add_relation(state: &Mutex<McpState>, params: &Value) -> Result<Value, String> {
@@ -1212,7 +1286,7 @@ fn handle_graph_search(state: &Mutex<McpState>, params: &Value) -> Result<Value,
     let dim = s.store.get_statistics().embedding_dim;
     drop(s); // release lock before potentially blocking HTTP call
 
-    let embedding = get_embedding(query, dim);
+    let (embedding, embedding_src) = get_embedding_labeled(query, dim)?;
 
     let s = state.lock().map_err(|e| {
         eprintln!("[mcp] mutex poisoned: {}", e);
@@ -1238,7 +1312,7 @@ fn handle_graph_search(state: &Mutex<McpState>, params: &Value) -> Result<Value,
         query.len(),
         out.len()
     );
-    Ok(json!({ "results": out }))
+    Ok(json!({ "results": out, "embedding": embedding_src.label() }))
 }
 
 fn handle_graph_search_entities(state: &Mutex<McpState>, params: &Value) -> Result<Value, String> {
@@ -1255,7 +1329,7 @@ fn handle_graph_search_entities(state: &Mutex<McpState>, params: &Value) -> Resu
     let dim = s.store.get_statistics().embedding_dim;
     drop(s); // release lock before potentially blocking HTTP call
 
-    let embedding = get_embedding(query, dim);
+    let (embedding, embedding_src) = get_embedding_labeled(query, dim)?;
 
     let s = state.lock().map_err(|e| {
         eprintln!("[mcp] mutex poisoned: {}", e);
@@ -1280,7 +1354,7 @@ fn handle_graph_search_entities(state: &Mutex<McpState>, params: &Value) -> Resu
         query.len(),
         out.len()
     );
-    Ok(json!({ "results": out }))
+    Ok(json!({ "results": out, "embedding": embedding_src.label() }))
 }
 
 fn handle_graph_stats(state: &Mutex<McpState>) -> Result<Value, String> {
@@ -1373,8 +1447,12 @@ fn handle_spatial_search(state: &Mutex<McpState>, params: &Value) -> Result<Valu
 
     drop(s); // release lock before potentially blocking HTTP call
 
-    // Get embedding for query (may make HTTP call)
-    let embedding = get_embedding(query, dim);
+    // Embedding for the query: client-provided when present, else the
+    // service — or SimCos only under explicit opt-in (may make an HTTP call).
+    let (embedding, embedding_src) = match parse_embedding_param(params) {
+        Some(e) => (e, EmbeddingSource::Provided),
+        None => get_embedding_labeled(query, dim)?,
+    };
     if embedding.len() != dim {
         return Err(format!(
             "Embedding dimension mismatch: expected {dim}, got {}",
@@ -1434,6 +1512,7 @@ fn handle_spatial_search(state: &Mutex<McpState>, params: &Value) -> Result<Valu
     Ok(json!({
         "results": out,
         "total": out.len(),
+        "embedding": embedding_src.label(),
         "filter": filter_desc,
         "candidates_scanned": candidate_vec_indices.len(),
     }))
@@ -1584,7 +1663,10 @@ fn handle_verbatim_search(state: &Mutex<McpState>, params: &Value) -> Result<Val
     }
 
     let k = top_k.min(n_active);
-    let embedding = get_embedding(query, dim);
+    let (embedding, embedding_src) = match parse_embedding_param(params) {
+        Some(e) => (e, EmbeddingSource::Provided),
+        None => get_embedding_labeled(query, dim)?,
+    };
     let query_vec = Array1::from_vec(embedding);
 
     // Re-acquire lock for the actual search and result assembly
@@ -1647,6 +1729,7 @@ fn handle_verbatim_search(state: &Mutex<McpState>, params: &Value) -> Result<Val
     Ok(json!({
         "query": query,
         "results": results,
+        "embedding": embedding_src.label(),
         "summary": {
             "total": results.len(),
             "high": high_count,
@@ -1851,6 +1934,11 @@ pub fn run_mcp_server() {
         env!("CARGO_PKG_VERSION")
     );
 
+    SIMCOS_ALLOWED.store(
+        simcos_opt_in(&std::env::var("SPLATSDB_ALLOW_SIMCOS").unwrap_or_default()),
+        Ordering::Relaxed,
+    );
+
     let config = SplatsDBConfig::mcp(None);
     let mut store = SplatStore::new(config);
 
@@ -1904,9 +1992,10 @@ pub fn run_mcp_server() {
 
     eprintln!("[splatsdb] MCP server ready. Waiting for JSON-RPC on stdin...");
     eprintln!(
-        "[splatsdb] Env vars: SPLATSDB_EMBED_URL={}, SPLATSDB_DOC_PATH={}",
+        "[splatsdb] Env vars: SPLATSDB_EMBED_URL={}, SPLATSDB_DOC_PATH={}, SPLATSDB_ALLOW_SIMCOS={}",
         std::env::var("SPLATSDB_EMBED_URL").unwrap_or_else(|_| "(default)".into()),
-        std::env::var("SPLATSDB_DOC_PATH").unwrap_or_else(|_| "(default)".into())
+        std::env::var("SPLATSDB_DOC_PATH").unwrap_or_else(|_| "(default)".into()),
+        if SIMCOS_ALLOWED.load(Ordering::Relaxed) { "1 (SimCos fallback AUTHORIZED)" } else { "0" }
     );
 
     // Bounded line reader (fix: `reader.lines()` buffers the ENTIRE line in
@@ -2104,6 +2193,7 @@ fn warm_start_reload(
     warm_start_t0: std::time::Instant,
 ) -> WarmStartSpatial {
     let mut warm_start_spatial: WarmStartSpatial = Vec::new();
+    let mut skipped_no_embedding = 0usize;
     let dim = store.get_statistics().embedding_dim;
     match doc_store.list_ids(false) {
         Ok(ids) => {
@@ -2150,7 +2240,18 @@ fn warm_start_reload(
                     };
 
                     // Re-compute embedding and add to vector store
-                    let embedding = get_embedding(&text, dim);
+                    // Never a silent fallback (A03-F10): without the service
+                    // and without explicit SimCos opt-in the doc is NOT
+                    // indexed (counted and reported below) instead of being
+                    // re-embedded with a text hash that makes it
+                    // unrecognizable to search.
+                    let (embedding, _) = match get_embedding_labeled(&text, dim) {
+                        Ok(res) => res,
+                        Err(_) => {
+                            skipped_no_embedding += 1;
+                            continue;
+                        }
+                    };
                     if let Ok(arr) = Array2::from_shape_vec((1, dim), embedding) {
                         let vector_idx = store.n_active();
                         if store.add_splat(&arr) {
@@ -2193,6 +2294,12 @@ fn warm_start_reload(
             }
         }
         Err(e) => eprintln!("[splatsdb] Warm start: could not list docs: {}", e),
+    }
+    if skipped_no_embedding > 0 {
+        eprintln!(
+            "[splatsdb] WARNING: Warm start: {} documents were NOT indexed (no usable embedding: embed service down and the SimCos fallback is not authorized). They stay in SQLite but are invisible to search until a restart with the embed service up, or with SPLATSDB_ALLOW_SIMCOS=1.",
+            skipped_no_embedding
+        );
     }
     warm_start_spatial
 }
@@ -2573,4 +2680,49 @@ mod tests {
         assert!(!all_finite(&[f32::NAN]));
         assert!(!all_finite(&[0.0, 1.0, f32::NAN, 2.0]));
     }
+
+    /// A03-F10: the opt-in parser accepts only explicit affirmations.
+    #[test]
+    fn f10_simcos_opt_in_truth_table() {
+        for v in ["1", "true", "yes", "on", "TRUE", " yes ", "On"] {
+            assert!(simcos_opt_in(v), "{v:?} must parse as opt-in");
+        }
+        for v in ["", "0", "false", "no", "off", "2", "anything-else"] {
+            assert!(!simcos_opt_in(v), "{v:?} must NOT parse as opt-in");
+        }
+    }
+
+    /// A03-F10: without the service, the resolver errors unless SimCos was
+    /// explicitly authorized — and then labels it. No silent path exists.
+    #[test]
+    fn f10_resolver_never_falls_back_silently() {
+        let (svc, opt) = (
+            EMBED_SERVICE_AVAILABLE.load(Ordering::Relaxed),
+            SIMCOS_ALLOWED.load(Ordering::Relaxed),
+        );
+        EMBED_SERVICE_AVAILABLE.store(false, Ordering::Relaxed);
+        SIMCOS_ALLOWED.store(false, Ordering::Relaxed);
+
+        let err = get_embedding_labeled("hello world", 16)
+            .err()
+            .expect("no service + no opt-in must fail closed");
+        assert!(err.contains("embedding unavailable"), "{err}");
+        assert!(err.contains("SPLATSDB_ALLOW_SIMCOS"), "{err}");
+
+        SIMCOS_ALLOWED.store(true, Ordering::Relaxed);
+        let (vec, src) =
+            get_embedding_labeled("hello world", 16).expect("opt-in authorizes SimCos");
+        assert_eq!(src, EmbeddingSource::SimCos);
+        assert_eq!(src.label(), "simcos");
+        assert_eq!(vec.len(), 16);
+        assert_eq!(vec, simcos_embedding("hello world", 16));
+        assert!(all_finite(&vec));
+
+        EMBED_SERVICE_AVAILABLE.store(svc, Ordering::Relaxed);
+        SIMCOS_ALLOWED.store(opt, Ordering::Relaxed);
+        assert_eq!(EmbeddingSource::Real.label(), "real");
+        assert_eq!(EmbeddingSource::Provided.label(), "provided");
+    }
+
+    // -- end of F05a inline tests --
 }

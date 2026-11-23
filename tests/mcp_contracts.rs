@@ -335,7 +335,7 @@ fn f10_strict_mode_fails_closed_and_labels_client_embeddings() {
     let dim = status["dimension"].as_u64().expect("dimension") as usize;
     assert_eq!(status["n_active"], serde_json::json!(0), "{status}");
 
-    // No service + no opt-in: every text-embedding entry point is a
+    // No service + no opt-in: every WRITE that needs a text embedding is a
     // controlled error, never a success built on a text-hash vector.
     for (id, name, args) in [
         (
@@ -350,28 +350,13 @@ fn f10_strict_mode_fails_closed_and_labels_client_embeddings() {
         ),
         (
             12,
-            "splatsdb_search",
-            serde_json::json!({ "query": "hello" }),
-        ),
-        (
-            13,
-            "splatsdb_spatial_search",
-            serde_json::json!({ "query": "hello" }),
-        ),
-        (
-            14,
-            "splatsdb_verbatim_search",
-            serde_json::json!({ "query": "hello" }),
-        ),
-        (
-            15,
             "splatsdb_graph_add_doc",
             serde_json::json!({ "text": "hello" }),
         ),
         (
-            16,
-            "splatsdb_graph_search",
-            serde_json::json!({ "query": "hello" }),
+            13,
+            "splatsdb_graph_add_entity",
+            serde_json::json!({ "name": "acme", "entity_type": "org" }),
         ),
     ] {
         let (is_error, payload) = srv.tool(id, name, args);
@@ -384,24 +369,25 @@ fn f10_strict_mode_fails_closed_and_labels_client_embeddings() {
         assert!(msg.contains("SPLATSDB_ALLOW_SIMCOS"), "{name}: {msg}");
     }
 
-    // Status exposes the embedding policy.
-    let status = srv.status(19);
+    // Nothing was indexed by the rejected calls. Status exposes the policy.
+    let status = srv.status(20);
+    assert_eq!(status["n_active"], serde_json::json!(0), "{status}");
+    assert_eq!(status["doc_count"], serde_json::json!(0), "{status}");
     assert_eq!(
         status["embedding_fallback"],
         serde_json::json!("none"),
         "{status}"
     );
 
-    // Nothing was indexed by the rejected calls.
-    let status = srv.status(20);
-    assert_eq!(status["n_active"], serde_json::json!(0), "{status}");
-    assert_eq!(status["doc_count"], serde_json::json!(0), "{status}");
-
     // Client-provided embeddings keep working and are labelled as such.
     let stored = srv.ok(
         30,
         "splatsdb_store",
-        serde_json::json!({ "text": "client embedded", "id": "d_client", "embedding": emb(dim, 1.0, 0.0) }),
+        serde_json::json!({
+            "text": "client embedded",
+            "id": "d_client",
+            "embedding": emb(dim, 1.0, 0.0)
+        }),
     );
     assert_eq!(
         stored["embedding"],
@@ -418,6 +404,25 @@ fn f10_strict_mode_fails_closed_and_labels_client_embeddings() {
     );
     assert_eq!(found["embedding"], serde_json::json!("provided"), "{found}");
     assert_eq!(ids(&found), vec!["d_client".to_string()], "{found}");
+
+    // Text queries against a NON-empty store fail closed as well.
+    for (id, name) in [
+        (40u64, "splatsdb_search"),
+        (41, "splatsdb_spatial_search"),
+        (42, "splatsdb_verbatim_search"),
+        (43, "splatsdb_graph_search"),
+        (44, "splatsdb_graph_search_entities"),
+    ] {
+        let (is_error, payload) = srv.tool(id, name, serde_json::json!({ "query": "hello" }));
+        assert!(
+            is_error,
+            "{name} must fail closed without embed service: {payload}"
+        );
+        let msg = payload.to_string();
+        assert!(msg.contains("embedding unavailable"), "{name}: {msg}");
+    }
+    let status = srv.status(50);
+    assert_eq!(status["n_active"], serde_json::json!(1), "{status}");
     srv.shutdown();
     let _ = std::fs::remove_dir_all(&tmp);
 }
