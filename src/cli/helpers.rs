@@ -146,6 +146,17 @@ pub fn exit_if_data_dir_locked(data_dir: &str, writer: &str) -> DataDirLock {
     }
 }
 
+/// What a CLI writer reports when the HNSW index could not be persisted:
+/// exit 1 and no success output (F02f). `on_disk` states exactly what was
+/// and was not written.
+pub fn exit_on_hnsw_persist_error(command: &str, data_dir: &str, e: String, on_disk: &str) -> ! {
+    eprintln!(
+        "Save error: {} NOT persisted: the HNSW index could not be written to {} ({}); {}",
+        command, data_dir, e, on_disk
+    );
+    std::process::exit(1)
+}
+
 /// Apply the energy state (alpha/kappa) `ingest` persisted for the 'default'
 /// shard to a CLI-loaded store — the policy `serve` applies since F02e1.
 ///

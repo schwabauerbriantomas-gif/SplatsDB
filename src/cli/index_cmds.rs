@@ -54,7 +54,21 @@ pub fn cmd_index(
         );
         std::process::exit(1);
     }
-    store.build_index_with_save(Some(&data_dir));
+    // F02f: a failed HNSW persist is an error, never "indexed" + exit 0
+    // with a missing/stale index on disk.
+    if let Err(e) = store.try_build_index_with_save(Some(&data_dir)) {
+        super::helpers::exit_on_hnsw_persist_error(
+            "index",
+            &data_dir,
+            e,
+            &format!(
+                "shard '{}' was written ({} vectors) but its index was not — the next process \
+                 that uses the HNSW index rebuilds it; re-run once the data-dir is writable",
+                shard,
+                vectors.nrows()
+            ),
+        );
+    }
 
     println!(
         "{}",
@@ -130,7 +144,21 @@ pub fn cmd_append(
 
     // Add new vectors
     let t0 = std::time::Instant::now();
-    let added = store.add_batch_with_hnsw(&vectors, Some(&data_dir));
+    // F02f: the HNSW index is persisted BEFORE the shard, so a failed index
+    // write leaves the data-dir untouched instead of "appended" + stale index.
+    let added = match store.try_add_batch_with_hnsw(&vectors, Some(&data_dir)) {
+        Ok(added) => added,
+        Err(e) => super::helpers::exit_on_hnsw_persist_error(
+            "append",
+            &data_dir,
+            e,
+            &format!(
+                "shard '{}' is unchanged on disk ({} vectors were not written)",
+                shard,
+                vectors.nrows()
+            ),
+        ),
+    };
     let elapsed = t0.elapsed();
 
     if !added {
@@ -211,7 +239,17 @@ pub fn cmd_ingest(
             // HNSW to data_dir) and write the splat centroids to the store,
             // otherwise the ingest result is lost when the process exits and
             // status/search see an empty store (issue #1).
-            store.build_index_with_save(Some(&data_dir));
+            // F02f: no "saved": true while the HNSW index is stale on disk.
+            if let Err(e) = store.try_build_index_with_save(Some(&data_dir)) {
+                super::helpers::exit_on_hnsw_persist_error(
+                    "ingest",
+                    &data_dir,
+                    e,
+                    "the ingested splats and energy state were written but the HNSW index was \
+                     not — the next process that uses it rebuilds the index; re-run once the \
+                     data-dir is writable",
+                );
+            }
 
             let persist = make_persistence(&data_dir, &backend, true).unwrap_or_else(|e| {
                 eprintln!("Storage error: {}", e);
@@ -300,7 +338,17 @@ pub fn cmd_ingest_hierarchical(
             // HNSW to data_dir) and write splat centroids + energy state,
             // otherwise the ingest result is lost when the process exits and
             // status/search see an empty store.
-            store.build_index_with_save(Some(&data_dir));
+            // F02f: no "saved": true while the HNSW index is stale on disk.
+            if let Err(e) = store.try_build_index_with_save(Some(&data_dir)) {
+                super::helpers::exit_on_hnsw_persist_error(
+                    "ingest-hierarchical",
+                    &data_dir,
+                    e,
+                    "the ingested splats and energy state were written but the HNSW index was \
+                     not — the next process that uses it rebuilds the index; re-run once the \
+                     data-dir is writable",
+                );
+            }
 
             let persist = make_persistence(&data_dir, &backend, true).unwrap_or_else(|e| {
                 eprintln!("Storage error: {}", e);

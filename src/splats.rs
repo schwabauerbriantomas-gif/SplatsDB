@@ -347,9 +347,27 @@ impl SplatStore {
     }
 
     /// Build the search index and optionally auto-save HNSW to `data_dir`.
+    ///
+    /// A failed HNSW persist is only a warning here: for a reader the index
+    /// built in memory is what answers. A writer that must not report
+    /// success with a missing/stale index on disk calls
+    /// [`Self::try_build_index_with_save`] instead.
     pub fn build_index_with_save(&mut self, data_dir: Option<&str>) {
+        if let Err(e) = self.try_build_index_with_save(data_dir) {
+            eprintln!("[splatsdb] Warning: failed to save HNSW index: {}", e);
+        }
+    }
+
+    /// Result-returning core of [`Self::build_index_with_save`]: builds
+    /// every enabled index, then persists the HNSW index to `data_dir`.
+    ///
+    /// `Err` means the index was built in memory but could NOT be written:
+    /// `data_dir/hnsw_index.bin` is missing or stale, and the caller must
+    /// not report the operation as persisted (F02f). `Ok(())` also when
+    /// there is no candidate backend or no `data_dir`: nothing to persist.
+    pub fn try_build_index_with_save(&mut self, data_dir: Option<&str>) -> Result<(), String> {
         if self.n_active == 0 {
-            return;
+            return Ok(());
         }
         let embeddings = self.mu.slice(ndarray::s![..self.n_active, ..]).to_owned();
 
@@ -372,13 +390,13 @@ impl SplatStore {
             lsh.index(embeddings);
         }
 
-        // Auto-save HNSW if data_dir provided
-        if let Some(dir) = data_dir {
-            if let Err(e) = self.save_hnsw(dir) {
-                eprintln!("[splatsdb] Warning: failed to save HNSW index: {}", e);
-            }
+        // Persist HNSW when a data_dir is given: the error is the caller's
+        match data_dir {
+            Some(dir) => self.save_hnsw(dir),
+            None => Ok(()),
         }
     }
+
 
     /// Build index only if not already built. Tries to load persisted HNSW first.
     ///
@@ -464,7 +482,9 @@ impl SplatStore {
             let dir = std::path::Path::new(data_dir);
             std::fs::create_dir_all(dir).map_err(|e| format!("create dir {}: {}", data_dir, e))?;
             let path = dir.join("hnsw_index.bin");
-            backend.save(&path)?;
+            backend
+                .save(&path)
+                .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
             eprintln!(
                 "[splatsdb] Saved HNSW index ({} vectors) to {}",
                 backend.len(),
@@ -620,11 +640,35 @@ impl SplatStore {
     /// Add a batch of vectors and incrementally insert them into HNSW.
     ///
     /// More efficient than calling `insert_with_hnsw` in a loop because
-    /// it only saves to disk once after all insertions.
+    /// it only saves to disk once after all insertions. Returns false when
+    /// the batch does not fit the store. A failed HNSW persist is only a
+    /// warning here; a writer that must not report success with a stale
+    /// index on disk calls [`Self::try_add_batch_with_hnsw`] instead.
     pub fn add_batch_with_hnsw(&mut self, vectors: &Array2<f32>, data_dir: Option<&str>) -> bool {
+        match self.try_add_batch_with_hnsw(vectors, data_dir) {
+            Ok(added) => added,
+            Err(e) => {
+                eprintln!("[splatsdb] Warning: failed to save HNSW after batch: {}", e);
+                true
+            }
+        }
+    }
+
+    /// Result-returning core of [`Self::add_batch_with_hnsw`]:
+    /// `Ok(false)` — the batch does not fit the store (nothing was added);
+    /// `Ok(true)` — added, and the HNSW index persisted when a `data_dir`
+    /// and a candidate backend are given;
+    /// `Err(e)` — the vectors were added in memory but the HNSW index could
+    /// not be written to `data_dir`: the index on disk is stale, so the
+    /// caller must not report the operation as persisted (F02f).
+    pub fn try_add_batch_with_hnsw(
+        &mut self,
+        vectors: &Array2<f32>,
+        data_dir: Option<&str>,
+    ) -> Result<bool, String> {
         let n_before = self.n_active;
         if !self.add_splat(vectors) {
-            return false;
+            return Ok(false);
         }
 
         if let Some(ref mut backend) = self.candidates {
@@ -645,13 +689,12 @@ impl SplatStore {
                 self.hnsw_indexed_count = self.n_active;
             }
             if let Some(dir) = data_dir {
-                if let Err(e) = self.save_hnsw(dir) {
-                    eprintln!("[splatsdb] Warning: failed to save HNSW after batch: {}", e);
-                }
+                self.save_hnsw(dir)?;
             }
         }
-        true
+        Ok(true)
     }
+
 
     /// Find k nearest neighbors for a single query.
     ///
@@ -2528,5 +2571,68 @@ mod f02e1_contract_tests {
         let mut q = Array1::zeros(32);
         q[31] = 0.5;
         q
+    }
+
+    // ── F02f: a failed HNSW persistence is reported, never a success ──────
+
+    #[test]
+    fn f02f_try_build_index_with_save_reports_a_failed_hnsw_persist() {
+        // A DIRECTORY where the index file goes: `File::create` fails for
+        // every user, root included — no chmod needed.
+        let dir = std::env::temp_dir().join(format!(
+            "splatdb-f02f-hnsw-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("hnsw_index.bin")).unwrap();
+        let mut cfg = SplatsDBConfig {
+            latent_dim: 8,
+            max_splats: 16,
+            enable_hnsw: true,
+            device: "cpu".to_string(),
+            enable_cuda: false,
+            enable_gpu_search: false,
+            ..Default::default()
+        };
+        cfg.finalize();
+        let vectors = Array2::from_shape_fn((4, 8), |(i, j)| (i * 8 + j) as f32);
+        let mut store = SplatStore::new(cfg.clone());
+        assert!(store.add_splat(&vectors));
+
+        let err = store
+            .try_build_index_with_save(Some(dir.to_str().unwrap()))
+            .expect_err("the failed HNSW persist must be reported");
+        assert!(err.contains("hnsw_index.bin"), "{err}");
+        // Only the persistence failed: the index is built and searchable.
+        assert!(store.candidates.as_ref().unwrap().is_built());
+        assert_eq!(store.hnsw_indexed_count(), 4);
+        assert!(!store.find_neighbors_fused(&vectors.row(0), 2).is_empty());
+
+        // Legacy API: same work, a warning instead of an error, still `()`.
+        let mut legacy = SplatStore::new(cfg);
+        assert!(legacy.add_splat(&vectors));
+        legacy.build_index_with_save(Some(dir.to_str().unwrap()));
+        assert!(legacy.candidates.as_ref().unwrap().is_built());
+
+        // Nothing to persist: no candidate backend, or an empty store.
+        let mut plain = SplatStore::new(SplatsDBConfig {
+            latent_dim: 8,
+            max_splats: 16,
+            ..Default::default()
+        });
+        assert!(plain.add_splat(&vectors));
+        assert!(plain.try_build_index_with_save(Some(dir.to_str().unwrap())).is_ok());
+        let mut empty = SplatStore::new(SplatsDBConfig {
+            latent_dim: 8,
+            max_splats: 16,
+            enable_hnsw: true,
+            ..Default::default()
+        });
+        assert!(empty.try_build_index_with_save(Some(dir.to_str().unwrap())).is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
