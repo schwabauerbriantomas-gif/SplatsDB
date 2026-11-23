@@ -34,6 +34,9 @@ pub enum QuantError {
     /// The score of a valid code against a valid query came out NaN/Inf (f32 overflow):
     /// an `Err`, never ranked or returned.
     NonFiniteScore,
+    /// `projections * dim` (or its byte size) does not fit in `usize`, or the allocator
+    /// refused the projection matrix. Checked before anything is allocated.
+    ProjectionMatrixTooLarge(String),
 }
 
 impl std::fmt::Display for QuantError {
@@ -58,6 +61,9 @@ impl std::fmt::Display for QuantError {
                 write!(f, "non-finite query context (NaN/Inf) at index {index}")
             }
             Self::NonFiniteScore => write!(f, "non-finite score (NaN/Inf, f32 overflow)"),
+            Self::ProjectionMatrixTooLarge(reason) => {
+                write!(f, "projection matrix too large: {reason}")
+            }
         }
     }
 }

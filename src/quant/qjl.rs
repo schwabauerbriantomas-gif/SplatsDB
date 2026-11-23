@@ -129,24 +129,16 @@ impl<'de> Deserialize<'de> for QjlSketch {
                 "QJL sketch schema v0 (no `norm` field): its inner-product estimates were biased by sqrt(pi/2)/||x|| and the norm cannot be recovered from the signs; re-encode the source vectors",
             ));
         }
-        if repr.signs.len() != repr.projections {
-            return Err(serde::de::Error::custom(format!(
-                "malformed QJL sketch: {} signs for {} projections",
-                repr.signs.len(),
-                repr.projections
-            )));
-        }
-        if !norm.is_finite() || norm < 0.0 {
-            return Err(serde::de::Error::custom(
-                "malformed QJL sketch: norm must be finite and non-negative",
-            ));
-        }
-        Ok(QjlSketch {
+        // A hostile payload is rejected when it is read, by the same rules a score
+        // applies to a sketch built by hand (F04e).
+        let sketch = QjlSketch {
             dim: repr.dim,
             projections: repr.projections,
             signs: repr.signs,
-            norm,
-        })
+            norm: repr.norm,
+        };
+        sketch.validate().map_err(serde::de::Error::custom)?;
+        Ok(sketch)
     }
 }
 
@@ -168,6 +160,30 @@ impl QjlSketch {
     /// `heap_bytes()` + the 4 B of the norm.
     pub fn heap_bytes(&self) -> usize {
         self.signs.len() * std::mem::size_of::<i8>()
+    }
+
+    /// Every invariant of a sketch, checked before it is scored or accepted by
+    /// deserialization (F04e): one sign per projection, every sign exactly +1 or -1
+    /// (anything else would scale the estimate by that value), and `norm` finite and
+    /// not negative -- a norm is a square root, so `-0.0` is not one either.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.signs.len() != self.projections {
+            return Err(format!(
+                "malformed QJL sketch: {} signs for {} projections",
+                self.signs.len(),
+                self.projections
+            ));
+        }
+        if let Some(index) = self.signs.iter().position(|&s| s != 1 && s != -1) {
+            return Err(format!(
+                "malformed QJL sketch: sign {} at projection {index} is not +1 or -1",
+                self.signs[index]
+            ));
+        }
+        if !self.norm.is_finite() || self.norm.is_sign_negative() {
+            return Err("malformed QJL sketch: norm must be finite and non-negative".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -215,8 +231,29 @@ impl QjlQuantizer {
         }
         // Generated once per quantizer configuration (A02-F02): before, every sketch()
         // and every estimate sampled m*d normals again.
+        // The size is checked with checked arithmetic and reserved fallibly BEFORE a
+        // single normal is sampled (F04e): a hostile `projections * dim` (or its byte
+        // size) that does not fit in `usize` is an `Err`, never a wrapping allocation.
+        // No limit is imposed beyond what `usize` and the allocator hold.
+        let elements = projections.checked_mul(dim).ok_or_else(|| {
+            QuantError::ProjectionMatrixTooLarge(format!(
+                "projections {projections} * dim {dim} overflows usize"
+            ))
+        })?;
+        let bytes = elements
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                QuantError::ProjectionMatrixTooLarge(format!(
+                    "{elements} f32 overflows usize bytes"
+                ))
+            })?;
         let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(0xDEAD_BEEF_1234_5678));
-        let mut matrix = Vec::with_capacity(projections * dim);
+        let mut matrix: Vec<f32> = Vec::new();
+        matrix.try_reserve_exact(elements).map_err(|_| {
+            QuantError::ProjectionMatrixTooLarge(format!(
+                "{elements} f32 ({bytes} B) refused by the allocator"
+            ))
+        })?;
         for _ in 0..projections {
             for _ in 0..dim {
                 matrix.push(StandardNormal.sample(&mut rng));
@@ -313,6 +350,9 @@ impl QjlQuantizer {
         if let Some(index) = query.iter().position(|v| !v.is_finite()) {
             return Err(QuantError::NonFiniteValue { index });
         }
+        // A finite query near `f32::MAX` can overflow the dot products themselves: the
+        // entries are left as computed and every consumer rejects a non-finite one
+        // before scoring (`score_projected`, `TurboQuantizer::prepare_query`).
         Ok(self
             .projection
             .chunks_exact(self.dim)
@@ -345,6 +385,15 @@ impl QjlQuantizer {
                 "projected query has {} entries, this quantizer has {} projections",
                 projected_query.len(),
                 self.projections
+            )));
+        }
+        // The projections and the signs are public fields: a sketch built by hand is
+        // rejected by the same rules as on deserialization (F04e).
+        sketch.validate().map_err(QuantError::MalformedCode)?;
+        if sketch.projections != self.projections {
+            return Err(QuantError::MalformedCode(format!(
+                "QJL sketch has {} projections, this quantizer has {}",
+                sketch.projections, self.projections
             )));
         }
         // A projected query is a public argument: a non-finite entry (a finite query near

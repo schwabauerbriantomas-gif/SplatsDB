@@ -117,7 +117,7 @@ impl TurboQueryContext {
 /// Configuration `(dim, bits, projections, seed)` fully determines state.
 /// Only these four values need to be persisted; the rotation and projection
 /// matrices are rebuilt from them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TurboQuantizer {
     dim: usize,
     bits: u8,
@@ -125,6 +125,51 @@ pub struct TurboQuantizer {
     seed: u64,
     polar: PolarQuantizer,
     qjl: QjlQuantizer,
+}
+
+impl<'de> Deserialize<'de> for TurboQuantizer {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Same wire fields as the derive this replaces.
+        #[derive(Deserialize)]
+        struct Repr {
+            dim: usize,
+            bits: u8,
+            projections: usize,
+            seed: u64,
+            polar: PolarQuantizer,
+            qjl: QjlQuantizer,
+        }
+        let repr = Repr::deserialize(deserializer)?;
+        // `new` ties the four values together (polar stage at `bits - 1`); a payload must
+        // not bypass it with a configuration that was never built (F04e).
+        let consistent = repr.dim == repr.polar.dim()
+            && repr.dim == repr.qjl.dim()
+            && repr.bits == repr.polar.bits() + 1
+            && repr.projections == repr.qjl.projections();
+        if !consistent {
+            return Err(serde::de::Error::custom(format!(
+                "malformed TurboQuantizer: dim {}, bits {}, projections {} do not match the polar stage (dim {}, bits {}) and the QJL stage (dim {}, projections {})",
+                repr.dim,
+                repr.bits,
+                repr.projections,
+                repr.polar.dim(),
+                repr.polar.bits(),
+                repr.qjl.dim(),
+                repr.qjl.projections()
+            )));
+        }
+        Ok(Self {
+            dim: repr.dim,
+            bits: repr.bits,
+            projections: repr.projections,
+            seed: repr.seed,
+            polar: repr.polar,
+            qjl: repr.qjl,
+        })
+    }
 }
 
 impl TurboQuantizer {
