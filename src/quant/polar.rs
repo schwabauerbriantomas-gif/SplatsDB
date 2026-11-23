@@ -284,9 +284,6 @@ static TRIG_TABLES: [OnceLock<TrigTable>; 17] = [
     OnceLock::new(),
 ];
 
-/// Highest bit width a polar quantizer accepts ([`PolarQuantizer::new`]).
-const MAX_POLAR_BITS: usize = TRIG_TABLES.len() - 1;
-
 /// The cos/sin table of `bits`, built on first use; `None` above the highest bit width a
 /// quantizer accepts, whose (foreign) codes keep the direct evaluation.
 fn trig_table(bits: u8) -> Option<&'static TrigTable> {
