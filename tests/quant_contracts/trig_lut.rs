@@ -318,8 +318,8 @@ fn store_ranking_is_bit_identical_to_the_reference_in_both_modes() {
                 None,
             ),
         };
-        for qi in 0..4 {
-            let query = with_norm(gaussian(&mut rng, dim), NORMS[qi]);
+        for norm in NORMS {
+            let query = with_norm(gaussian(&mut rng, dim), norm);
             let rotated = polar.rotated_query(&query).unwrap();
             for mode in MODES {
                 let reference: Vec<f32> = rows
@@ -521,7 +521,7 @@ fn non_finite_and_wrong_dimension_queries_keep_their_behaviour() {
 }
 
 #[test]
-#[ignore = "evidence probe (F04d): prints the heap bytes left by the first search (the table), run alone"]
+#[ignore = "evidence probe (F04d): prints the heap bytes of the cos/sin table, run alone"]
 fn probe_lut_bytes() {
     let env =
         |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.to_string());
@@ -541,24 +541,44 @@ fn probe_lut_bytes() {
             QuantAlgorithm::TurboQuant
         },
     };
+
+    // 1. Isolated: one single-threaded polar score is the first user of the table of this
+    //    bit width, so the heap bytes it leaves behind are exactly the table's.
+    let polar_bits = if polar_only { bits } else { bits - 1 };
+    let polar = PolarQuantizer::new(dim, polar_bits, 42).unwrap();
+    let code = polar.encode(&query).unwrap();
+    let rotated = polar.rotated_query(&query).unwrap();
+    let before = LIVE.load(Relaxed);
+    let score = std::hint::black_box(
+        polar
+            .inner_product_estimate_rotated(&code, &rotated)
+            .unwrap(),
+    );
+    let isolated = LIVE.load(Relaxed).saturating_sub(before);
+
+    // 2. The first store search (rayon, context, sort): the table already exists here, so
+    //    what this leaves behind is NOT the table.
     let mut store = QuantizedStore::new(dim, config).unwrap();
     store
         .add_batch(&Array2::from_shape_fn((64, dim), |(r, c)| batch[r][c]), 0)
         .unwrap();
-
     let before = LIVE.load(Relaxed);
     let hits = std::hint::black_box(store.search(&view(&query), 10));
-    let retained = LIVE.load(Relaxed).saturating_sub(before);
-    let entries = 1usize << (if polar_only { bits } else { bits - 1 });
+    let first_search = LIVE.load(Relaxed).saturating_sub(before);
+
     println!(
         "{}",
         json!({
             "probe": "lut_bytes",
             "bits": bits,
+            "polar_bits": polar_bits,
             "algorithm": if polar_only { "polar" } else { "turbo" },
-            "table_entries": entries,
-            "table_bytes_nominal": entries * std::mem::size_of::<[f32; 2]>(),
-            "heap_retained_by_first_search_bytes": retained,
+            "table_entries": 1usize << polar_bits,
+            "table_bytes_nominal": (1usize << polar_bits) * std::mem::size_of::<[f32; 2]>(),
+            "trig_table_bytes_accessor": polar.trig_table_bytes(),
+            "heap_retained_by_isolated_polar_score_bytes": isolated,
+            "heap_retained_by_first_search_bytes": first_search,
+            "isolated_score": score,
             "hits": hits.len(),
             "memory_usage": store.memory_usage(),
         })
