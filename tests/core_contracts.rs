@@ -204,3 +204,106 @@ fn f01_unit_norm_data_is_unchanged() {
         assert!((r.distance - expected).abs() <= 1e-5 * expected.max(1.0));
     }
 }
+
+// ── A01-F02: `*_with_hnsw` must respect the unindexed backlog ──────────────
+//
+// Backend positions are store indices. `add_batch` appends at the backend's
+// current length, so appending a new vector while earlier rows are still
+// unindexed shifts it onto the wrong position — and the old code then set
+// `hnsw_indexed_count = n_active`, hiding the misalignment forever.
+
+/// HNSW + quant + LSH all enabled: fused search goes through the candidate
+/// backend and an invalidation has to cover every positional index.
+fn config_all_subsystems(dim: usize, max_splats: usize) -> SplatsDBConfig {
+    SplatsDBConfig {
+        max_splats,
+        latent_dim: dim,
+        enable_hnsw: true,
+        hnsw_m: 8,
+        hnsw_ef_construction: 40,
+        hnsw_ef_search: 32,
+        enable_lsh: true,
+        enable_quantization: true,
+        ..Default::default()
+    }
+}
+
+/// A self-query through the fused path must resolve to `expected_idx` at
+/// (numerically) zero distance: backend position == store row.
+fn assert_self_query_hits(
+    store: &SplatStore,
+    row: &ArrayView1<f32>,
+    expected_idx: usize,
+    label: &str,
+) {
+    let results = store.find_neighbors_fused(row, 5);
+    assert!(
+        !results.is_empty(),
+        "{label}: fused search returned nothing"
+    );
+    assert_eq!(
+        results[0].index, expected_idx,
+        "{label}: self-query must resolve to the store row itself"
+    );
+    assert!(
+        results[0].distance < 1e-4,
+        "{label}: self-query distance {} for idx {}",
+        results[0].distance,
+        expected_idx
+    );
+}
+
+#[test]
+fn f02_add_batch_with_hnsw_indexes_backlog_in_positional_order() {
+    let dim = 32;
+    let mut store = SplatStore::new(config_all_subsystems(dim, 1000));
+    let first = random_vectors(50, dim, 42);
+    store.add_splat(&first);
+    // No build_index: 50 rows are waiting in the backlog.
+    assert!(store.hnsw_needs_sync());
+
+    let batch = random_vectors(10, dim, 7);
+    assert!(store.add_batch_with_hnsw(&batch, None));
+    assert_eq!(store.n_active(), 60);
+    assert_eq!(store.hnsw_indexed_count(), 60);
+    assert!(!store.hnsw_needs_sync());
+
+    // Backend position i must be store row i for the WHOLE range, not only
+    // for the batch that was appended.
+    for (row, expected) in [
+        (first.row(0), 0usize),
+        (first.row(17), 17),
+        (batch.row(5), 55),
+    ] {
+        let query = row.to_owned();
+        assert_self_query_hits(&store, &query.view(), expected, "add_batch_with_hnsw");
+    }
+}
+
+#[test]
+fn f02_insert_with_hnsw_single_does_not_skip_the_backlog() {
+    let dim = 32;
+    let mut store = SplatStore::new(config_all_subsystems(dim, 1000));
+    let first = random_vectors(50, dim, 42);
+    store.add_splat(&first);
+
+    let vec: Vec<f32> = random_vectors(1, dim, 5).row(0).to_vec();
+    let idx = store
+        .insert_with_hnsw(&vec, None)
+        .expect("insert should succeed");
+    assert_eq!(idx, 50);
+    assert_eq!(store.hnsw_indexed_count(), 51);
+    assert!(!store.hnsw_needs_sync());
+
+    for (row, expected) in [(first.row(0), 0usize), (first.row(49), 49)] {
+        let query = row.to_owned();
+        assert_self_query_hits(
+            &store,
+            &query.view(),
+            expected,
+            "insert_with_hnsw backlog row",
+        );
+    }
+    let query = Array1::from_vec(vec);
+    assert_self_query_hits(&store, &query.view(), 50, "insert_with_hnsw new vector");
+}

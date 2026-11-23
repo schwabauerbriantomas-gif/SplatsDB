@@ -480,29 +480,20 @@ impl SplatStore {
     /// 3. Optionally saves the updated HNSW to disk
     ///
     /// Returns the index of the new vector, or None if capacity exceeded.
+    ///
+    /// Backlog-safe: rows added since the last build/sync are inserted too,
+    /// in positional order — this routes through `hnsw_sync_incremental`.
     pub fn insert_with_hnsw(&mut self, vec: &[f32], data_dir: Option<&str>) -> Option<usize> {
         let idx = self.insert(vec)?;
-        if let Some(ref mut backend) = self.candidates {
-            if backend.capabilities().incremental {
-                if let Err(e) = backend.add_batch(std::slice::from_ref(&vec.to_vec())) {
-                    eprintln!("[splatsdb] Warning: backend insert failed: {}", e);
-                    // Do NOT mark it indexed: the next sync retries it.
-                } else {
-                    self.hnsw_indexed_count = self.n_active;
-                }
-            } else {
-                let embeddings = self.mu.slice(ndarray::s![..self.n_active, ..]).to_owned();
-                backend.build(&embeddings);
-                self.hnsw_indexed_count = self.n_active;
-            }
-            if let Some(dir) = data_dir {
-                if let Err(e) = self.save_hnsw(dir) {
-                    eprintln!(
-                        "[splatsdb] Warning: failed to save HNSW after insert: {}",
-                        e
-                    );
-                }
-            }
+        // Backend positions are store indices. Appending this vector alone
+        // would place it at the backend's current length — ahead of rows that
+        // are still waiting in the backlog — and the previous code then marked
+        // everything indexed. The shared sync inserts the whole range
+        // [hnsw_indexed_count, n_active) in positional order instead.
+        if let Some(dir) = data_dir {
+            self.hnsw_sync_and_save(dir);
+        } else {
+            self.hnsw_sync_incremental();
         }
         Some(idx)
     }
@@ -511,34 +502,18 @@ impl SplatStore {
     ///
     /// More efficient than calling `insert_with_hnsw` in a loop because
     /// it only saves to disk once after all insertions.
+    ///
+    /// Backlog-safe: rows added since the last build/sync are inserted too,
+    /// in positional order — this routes through `hnsw_sync_incremental`.
     pub fn add_batch_with_hnsw(&mut self, vectors: &Array2<f32>, data_dir: Option<&str>) -> bool {
-        let n_before = self.n_active;
         if !self.add_splat(vectors) {
             return false;
         }
-
-        if let Some(ref mut backend) = self.candidates {
-            if backend.capabilities().incremental {
-                let new_vecs: Vec<Vec<f32>> = (n_before..self.n_active)
-                    .map(|i| self.mu.row(i).to_vec())
-                    .collect();
-                if let Err(e) = backend.add_batch(&new_vecs) {
-                    eprintln!("[splatsdb] Warning: backend add_batch failed: {}", e);
-                    // Leave hnsw_indexed_count behind: the next incremental
-                    // sync retries these vectors instead of forgetting them.
-                } else {
-                    self.hnsw_indexed_count = self.n_active;
-                }
-            } else {
-                let embeddings = self.mu.slice(ndarray::s![..self.n_active, ..]).to_owned();
-                backend.build(&embeddings);
-                self.hnsw_indexed_count = self.n_active;
-            }
-            if let Some(dir) = data_dir {
-                if let Err(e) = self.save_hnsw(dir) {
-                    eprintln!("[splatsdb] Warning: failed to save HNSW after batch: {}", e);
-                }
-            }
+        // Same alignment rule as `insert_with_hnsw` (see the note there).
+        if let Some(dir) = data_dir {
+            self.hnsw_sync_and_save(dir);
+        } else {
+            self.hnsw_sync_incremental();
         }
         true
     }
