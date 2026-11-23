@@ -784,8 +784,12 @@ fn f11_doc_del_and_re_store_leave_no_orphans_before_and_after_restart() {
 /// server must NOT re-embed persisted docs with a text hash. It comes up with
 /// an empty vector store and says so: a visible failure instead of silent
 /// garbage ranking.
+/// F05b (A03-F10, persistence half): a document stored WITH a vector is
+/// reloaded from SQLite on restart — no embed service, nothing re-embedded.
+/// Only rows WITHOUT a stored vector (legacy schema) stay unindexed in
+/// strict mode, counted and reported (the F05a contract is intact).
 #[test]
-fn f10_warm_start_without_service_indexes_nothing_and_warns() {
+fn f10_warm_start_without_service_loads_stored_vectors_and_warns_for_legacy_rows() {
     let tmp = scratch("f10_warm");
     let doc_db = tmp.join("docs.db");
     let mut dim: usize;
@@ -800,6 +804,20 @@ fn f10_warm_start_without_service_indexes_nothing_and_warns() {
         assert_eq!(srv.status(3)["n_active"], serde_json::json!(1));
         srv.shutdown();
     }
+    // A row written by the pre-vector schema (no stored embedding).
+    {
+        let db = rusqlite::Connection::open(&doc_db).expect("open doc db");
+        db.execute(
+            "INSERT INTO documents (id, shard_idx, vector_idx, metadata, document, deleted, created_at, updated_at)
+             VALUES (?1, 0, 0, ?2, ?3, 0, 1.0, 1.0)",
+            rusqlite::params![
+                "d_legacy",
+                r#"{"text":"legacy row without vector"}"#,
+                "legacy row without vector"
+            ],
+        )
+        .expect("insert legacy row");
+    }
     {
         let mut srv = spawn_server(&doc_db, &[]);
         assert!(
@@ -809,20 +827,25 @@ fn f10_warm_start_without_service_indexes_nothing_and_warns() {
         let status = srv.status(1);
         assert_eq!(
             status["doc_count"],
-            serde_json::json!(1),
-            "the doc is still in SQLite: {status}"
+            serde_json::json!(2),
+            "both docs are still in SQLite: {status}"
         );
         assert_eq!(
             status["n_active"],
-            serde_json::json!(0),
-            "a doc was indexed with an unauthorized hash vector: {status}"
+            serde_json::json!(1),
+            "the doc with a stored vector must be indexed from SQLite: {status}"
         );
         let res = srv.ok(
             2,
             "splatsdb_search",
             serde_json::json!({ "query": "persisted doc", "embedding": emb(dim, 1.0, 0.0) }),
         );
-        assert!(ids(&res).is_empty(), "{res}");
+        assert_eq!(ids(&res), vec!["d_p".to_string()], "{res}");
+        assert_eq!(
+            res["results"][0]["embedding_source"],
+            serde_json::json!("stored_provided"),
+            "{res}"
+        );
         srv.shutdown();
     }
     let _ = std::fs::remove_dir_all(&tmp);

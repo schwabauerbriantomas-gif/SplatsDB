@@ -428,29 +428,26 @@ fn store_handler_characterization() {
             serde_json::json!(3),
             "spatial_info total after stores: {info}"
         );
-        // KNOWN INCONSISTENCY (behavior, not refactor — flag, don't "fix"
-        // silently): handle_store registers wing/room/hall in the live
-        // in-memory spatial_index but persists only {text, category} to the
-        // SQLite metadata JSON, while handle_spatial_info counts by scanning
-        // SQLite. Net effect: store-registered spatial metadata is invisible
-        // to spatial_info AND lost across restarts (doc_add persists spatial
-        // keys and does not have this problem).
+        // F05b (A04-F14): handle_store persists wing/room/hall into the
+        // SQLite metadata exactly like doc_add, so spatial_info (which scans
+        // SQLite) sees them and they survive a restart. Until F05b these keys
+        // lived only in the in-memory spatial_index and were lost on restart
+        // (this test pinned that loss as "current behavior").
         assert_eq!(
             info["documents_with_spatial_metadata"],
-            serde_json::json!(0),
-            "current behavior: store spatial keys are not persisted, spatial_info sees 0: {info}"
+            serde_json::json!(1),
+            "spatial_info must see the wing stored via splatsdb_store: {info}"
         );
         assert_eq!(
             info["wings"],
-            serde_json::json!({}),
-            "current behavior: no persisted wings: {info}"
+            serde_json::json!({"store_w": ["store_r"]}),
+            "persisted wings: {info}"
         );
         assert_eq!(
             info["halls"],
-            serde_json::json!([]),
-            "current behavior: no persisted halls: {info}"
+            serde_json::json!(["store_h"]),
+            "persisted halls: {info}"
         );
-
         srv.shutdown();
     }
 
