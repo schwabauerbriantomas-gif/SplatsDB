@@ -68,6 +68,12 @@ impl SplatStore {
     pub(crate) fn cmp_value_then_id(a: &(f32, usize), b: &(f32, usize)) -> std::cmp::Ordering {
         a.0.total_cmp(&b.0).then(a.1.cmp(&b.1))
     }
+
+    /// Same total order on `(id, value)` pairs.
+    #[inline]
+    pub(crate) fn cmp_dist_then_id(a: &(usize, f32), b: &(usize, f32)) -> std::cmp::Ordering {
+        a.1.total_cmp(&b.1).then(a.0.cmp(&b.0))
+    }
 }
 
 /// Contractual top-k from kernel-ordered windows (F02e1).
@@ -186,6 +192,11 @@ pub struct SplatStore {
     /// Number of vectors currently indexed in the candidate backend. When this
     /// < n_active, there are unindexed vectors that need incremental insertion.
     hnsw_indexed_count: usize,
+    /// Rows covered by the HRM2 engine (and the quantized / LSH stores, all
+    /// rebuilt together by `build_index`): rows `[approx_indexed_count,
+    /// n_active)` were appended afterwards and belong to no cluster/table
+    /// yet. Reset to 0 by `invalidate_positional_indexes` (F06a).
+    approx_indexed_count: usize,
     lsh: Option<crate::lsh_index::CrossPolytopeLSH>,
 }
 
@@ -296,6 +307,7 @@ impl SplatStore {
             quant_store,
             candidates,
             hnsw_indexed_count: 0,
+            approx_indexed_count: 0,
             lsh,
         }
     }
@@ -401,6 +413,7 @@ impl SplatStore {
 
         // Primary HRM2 index
         self.engine.index(Some(embeddings.clone()));
+        self.approx_indexed_count = self.n_active;
 
         // Quantized store
         if let Some(ref mut qs) = self.quant_store {
@@ -441,6 +454,7 @@ impl SplatStore {
             // Still need to build other indexes (HRM2, quant, LSH) if not done
             let embeddings = self.mu.slice(ndarray::s![..self.n_active, ..]).to_owned();
             self.engine.index(Some(embeddings.clone()));
+            self.approx_indexed_count = self.n_active;
             if let Some(ref mut qs) = self.quant_store {
                 qs.add_batch(&embeddings, 0);
             }
@@ -541,6 +555,7 @@ impl SplatStore {
             backend.build(&Array2::zeros((0, dim)));
         }
         self.hnsw_indexed_count = 0;
+        self.approx_indexed_count = 0;
         self.engine.invalidate();
         self.quant_store = build_quant_store(&self.config, dim);
         self.lsh = build_lsh(&self.config, dim);
@@ -814,9 +829,15 @@ impl SplatStore {
                 .sqrt()
         };
 
-        // Strategy 1: candidate backend primary (sub-linear, high recall)
+        // Strategy 1: candidate backend primary (sub-linear, high recall).
+        // F06a: the graph covers only the prefix `[0, indexed)`. Rows
+        // appended since the last build/sync (`add_splat` without
+        // `*_with_hnsw` — the backlog, `hnsw_needs_sync()`) are merged with
+        // exact distances BEFORE the re-rank. Before, they were invisible: a
+        // query equal to a new row answered another vector.
         if let Some(ref backend) = self.candidates {
             if backend.is_built() {
+                let indexed = self.hnsw_indexed_count.min(backend.len()).min(n);
                 // Over-fetch for better recall, then exact re-rank
                 let fetch_k = (k * self.config.over_fetch).min(n);
                 let hresults = backend.search(query.as_slice().unwrap_or(&[]), fetch_k);
@@ -824,16 +845,18 @@ impl SplatStore {
                 // Re-rank with exact distances
                 let mut ranked: Vec<(usize, f32)> = hresults
                     .into_iter()
-                    .filter(|&(idx, _)| idx < n)
+                    .filter(|&(idx, _)| idx < indexed)
                     .map(|(idx, _)| (idx, exact_dist(idx)))
                     .collect();
+                ranked.extend((indexed..n).map(|idx| (idx, exact_dist(idx))));
+                ranked.sort_by(Self::cmp_dist_then_id);
 
-                ranked.sort_by(|a, b| {
-                    a.1.partial_cmp(&b.1)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then(a.0.cmp(&b.0))
-                });
-
+                // A tie crossing the k-th distance means the candidate window
+                // may be hiding a lower id at that distance: the exact stable
+                // linear order decides (rare — exact duplicates at the edge).
+                if Self::boundary_tie(&ranked, k) || ranked.len() < k {
+                    return self.find_neighbors(query, k);
+                }
                 // The backend may return fewer than `fetch_k` candidates
                 // (early termination, removals); clamp so the slice below
                 // cannot panic.
@@ -852,8 +875,11 @@ impl SplatStore {
             }
         }
 
-        // Strategy 2: Collect candidates from approximate backends
-        let candidate_set = self.collect_candidate_indices(query, k, n);
+        // Strategy 2: Collect candidates from approximate backends (quantized,
+        // LSH). F06a: they cover `[0, approx_indexed)` only — rows appended
+        // since join with exact distances (same backlog rule as strategy 1).
+        let approx_indexed = self.approx_indexed_count.min(n);
+        let candidate_set = self.collect_candidate_indices(query, k, approx_indexed);
 
         // If we have candidates from approximate backends, re-rank them
         if !candidate_set.is_empty() {
@@ -861,11 +887,11 @@ impl SplatStore {
                 .into_iter()
                 .map(|idx| (idx, exact_dist(idx)))
                 .collect();
-            ranked.sort_by(|a, b| {
-                a.1.partial_cmp(&b.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(a.0.cmp(&b.0))
-            });
+            ranked.extend((approx_indexed..n).map(|idx| (idx, exact_dist(idx))));
+            ranked.sort_by(Self::cmp_dist_then_id);
+            if Self::boundary_tie(&ranked, k) || ranked.len() < k {
+                return self.find_neighbors(query, k);
+            }
             if ranked.len() > k {
                 ranked.truncate(k);
             }
@@ -1083,17 +1109,25 @@ impl SplatStore {
     /// Find k nearest neighbors using HRM2 engine (fast path).
     ///
     /// Uses the HRM2 hierarchical index with LOD 2 (exact within probed clusters)
-    /// for approximate search. Falls back to linear scan if:
+    /// for approximate search. Falls back to the exact linear scan if:
     /// - Dataset has fewer than 100 active vectors (not worth the overhead)
     /// - HRM2 engine is not indexed
-    /// - HRM2 query returns an error
+    /// - HRM2 query returns an error or delivers fewer than `k` distinct rows
+    ///   (F06a: e.g. exact duplicates collapsing the probed set)
+    /// - a tie crosses the k-th distance (F06a: the probed set may hide a
+    ///   lower id at that distance)
+    ///
+    /// Rows appended since the last `build_index` (`[approx_indexed_count,
+    /// n_active)`) belong to no cluster yet: they are merged with exact
+    /// distances before the re-rank (F06a — before, they were invisible).
     ///
     /// Distance contract (identical on every branch): `distance` is the exact
     /// raw L2 `||q - mu||` recomputed against the store's `mu` for each
     /// returned candidate, and `score` derives from it. The engine ranks in
     /// its own metric space (cosine: L2-normalized rows), so its distances
     /// are candidate hints only. The candidate SET stays approximate (probed
-    /// clusters); results are ordered by the exported distance.
+    /// clusters); results are ordered by `(distance, id)` — exactly equal
+    /// distances by ascending id, a total order (F06a).
     pub fn find_neighbors_fast(
         &mut self,
         query: &ArrayView1<f32>,
@@ -1110,9 +1144,10 @@ impl SplatStore {
             return self.find_neighbors(query, k);
         }
 
-        // Try HRM2 fast path with LOD 2 (exact within probed clusters)
-        match self.engine.query(query, k, 2) {
-            Ok(candidates) if !candidates.is_empty() => {
+        // F06a: one row beyond k, so a tie crossing the k-th distance is visible.
+        let indexed = self.approx_indexed_count.min(n);
+        if let Ok(candidates) = self.engine.query(query, k.saturating_add(1), 2) {
+            if !candidates.is_empty() {
                 let index_data = self.mu.slice(ndarray::s![..n, ..]);
                 // The engine ranks in its own space (metric "cosine": L2-
                 // normalized rows, distances in [0, 2]) and only searches the
@@ -1120,41 +1155,64 @@ impl SplatStore {
                 // exported `distance` is the exact raw L2 ||q - mu_i|| against
                 // the store's `mu` — the same value the linear path reports
                 // for the same index — and `score` derives from it.
+                let dist_sq = |idx: usize| -> f32 {
+                    index_data
+                        .row(idx)
+                        .iter()
+                        .zip(query.iter())
+                        .map(|(a, b)| {
+                            let d = a - b;
+                            d * d
+                        })
+                        .sum::<f32>()
+                };
                 let mut ranked: Vec<(usize, f32)> = candidates
                     .into_iter()
-                    .map(|(idx, _hint)| {
-                        let dist_sq = index_data
-                            .row(idx)
-                            .iter()
-                            .zip(query.iter())
-                            .map(|(a, b)| {
-                                let d = a - b;
-                                d * d
-                            })
-                            .sum::<f32>();
-                        (idx, dist_sq)
-                    })
+                    .filter(|&(idx, _)| idx < indexed)
+                    .map(|(idx, _hint)| (idx, dist_sq(idx)))
                     .collect();
-                // Stable sort: ties keep the engine's order, so the generator
-                // order survives whenever it agrees with the raw distance.
-                ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                ranked
-                    .into_iter()
-                    .map(|(idx, dist_sq)| NeighborResult {
-                        mu: index_data.row(idx).to_vec(),
-                        alpha: self.alpha[idx],
-                        kappa: self.kappa[idx],
-                        index: idx,
-                        distance: dist_sq.sqrt(),
-                        score: Self::gaussian_score(self.alpha[idx], self.kappa[idx], dist_sq),
-                    })
-                    .collect()
-            }
-            _ => {
-                // HRM2 not indexed or query failed — fall back to linear scan
-                self.find_neighbors(query, k)
+                // Rows appended since the last build belong to no cluster yet.
+                ranked.extend((indexed..n).map(|idx| (idx, dist_sq(idx))));
+                // Total order (F06a/F02e1): distance, then ascending id.
+                ranked.sort_by(Self::cmp_dist_then_id);
+                ranked.dedup_by(|a, b| a.0 == b.0);
+                if ranked.len() >= k && !Self::boundary_tie(&ranked, k) {
+                    ranked.truncate(k);
+                    return ranked
+                        .into_iter()
+                        .map(|(idx, dist_sq)| NeighborResult {
+                            mu: index_data.row(idx).to_vec(),
+                            alpha: self.alpha[idx],
+                            kappa: self.kappa[idx],
+                            index: idx,
+                            distance: dist_sq.sqrt(),
+                            score: Self::gaussian_score(self.alpha[idx], self.kappa[idx], dist_sq),
+                        })
+                        .collect();
+                }
+                // Fewer than k distinct rows, or a tie at the boundary: the
+                // exact stable linear order completes the answer without
+                // duplicating ids.
             }
         }
+        // HRM2 not indexed, query failed, under-delivery or boundary tie —
+        // fall back to linear scan
+        self.find_neighbors(query, k)
+    }
+
+    /// F06a: true when only the exact linear scan can certify the answer:
+    /// the k-th and (k+1)-th values of a value-sorted row are exactly equal
+    /// (the candidate set may hide a lower id at that value), or one of the
+    /// first k values is an exact match (0.0) — the graph / the probed
+    /// clusters cannot prove they hold EVERY duplicate of the query, so the
+    /// lowest ids among them are unknown.
+    #[inline]
+    fn boundary_tie(ranked: &[(usize, f32)], k: usize) -> bool {
+        let head = &ranked[..k.min(ranked.len())];
+        head.iter().any(|&(_, d)| d == 0.0)
+            || (k > 0
+                && ranked.len() > k
+                && ranked[k].1.total_cmp(&ranked[k - 1].1) == std::cmp::Ordering::Equal)
     }
 
     /// Find neighbors with validation. Returns error on invalid input.
