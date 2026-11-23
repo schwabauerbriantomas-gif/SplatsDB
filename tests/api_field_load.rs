@@ -111,7 +111,7 @@ fn seed_shards(
 /// - raw rows: [0.0×dim], [0.1×dim], [0.2×dim]; query zeros → d² = 0, 10.24, 40.96
 /// - splat mus: [0.05×dim], [0.15×dim]; radii [1.0, 1.0]
 /// - CSR: chunk0 = {0,1}, chunk1 = {2}; offsets [0,2,3]
-/// → d_mu ≈ [1.6, 4.8]; lower bound of chunk1 ≈ (4.8−1)² ≈ 14.44 > kth 10.24
+///   → d_mu ≈ [1.6, 4.8]; lower bound of chunk1 ≈ (4.8−1)² ≈ 14.44 > kth 10.24
 ///   after chunk0 fills top-2 → chunk1 pruned: clusters_visited=1,
 ///   vectors_scanned=2, results [{0,~0}, {1,~10.24}].
 #[test]

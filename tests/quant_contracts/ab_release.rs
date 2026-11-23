@@ -4,13 +4,13 @@
 //! packed codes), so the same source measures both: N=10000, d=640, m=256, k=10,
 //! TurboQuant, `bits` from `AB_BITS` (default 4), 10 queries per pass, 2 warm-up passes
 //! + `AB_RUNS` (at least 5) timed passes, rayon threads from the environment. Reports
-//! per-query latency (median / p95, nearest rank) over every sample of every pass,
-//! throughput per pass (median), encode time, encoded bytes, reported memory,
-//! `is_bit_packed`, compression ratio, the heap bytes retained by the store after the
-//! encode and the peak live delta during the searches (counting global allocator),
-//! VmRSS / VmHWM, and a hash of (id, f32 score bits) over the FULL ranking of every
-//! query in both modes — identical across commits iff ids, order and scores are.
-//! Run ALONE, release profile:
+//!   per-query latency (median / p95, nearest rank) over every sample of every pass,
+//!   throughput per pass (median), encode time, encoded bytes, reported memory,
+//!   `is_bit_packed`, compression ratio, the heap bytes retained by the store after the
+//!   encode and the peak live delta during the searches (counting global allocator),
+//!   VmRSS / VmHWM, and a hash of (id, f32 score bits) over the FULL ranking of every
+//!   query in both modes — identical across commits iff ids, order and scores are.
+//!   Run ALONE, release profile:
 //!
 //! `cargo test --release --no-default-features --test quant_contracts probe_ab_release
 //!  -- --ignored --nocapture --exact --test-threads=1`
