@@ -25,12 +25,12 @@ const N: usize = 400;
 const N_QUERIES: usize = 16;
 const K: usize = 10;
 
-fn gaussian_matrix(rows: usize, cols: usize, seed: u64) -> Array2<f32> {
+pub(super) fn gaussian_matrix(rows: usize, cols: usize, seed: u64) -> Array2<f32> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     Array2::from_shape_fn((rows, cols), |(_, _)| StandardNormal.sample(&mut rng))
 }
 
-fn uniform_matrix(rows: usize, cols: usize, seed: u64) -> Array2<f32> {
+pub(super) fn uniform_matrix(rows: usize, cols: usize, seed: u64) -> Array2<f32> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     Array2::from_shape_fn((rows, cols), |(_, _)| rng.gen::<f32>())
 }
@@ -75,16 +75,16 @@ fn ip_f64(a: &[f32], b: &[f32]) -> f64 {
         .sum()
 }
 
-fn exact_l2_top_k(query: &[f32], data: &Array2<f32>, k: usize) -> Vec<usize> {
+pub(super) fn exact_l2_top_k(query: &[f32], data: &Array2<f32>, k: usize) -> Vec<usize> {
     exact_top_k(query, data, k, l2_sq, false)
 }
 
-fn exact_ip_top_k(query: &[f32], data: &Array2<f32>, k: usize) -> Vec<usize> {
+pub(super) fn exact_ip_top_k(query: &[f32], data: &Array2<f32>, k: usize) -> Vec<usize> {
     exact_top_k(query, data, k, ip_f64, true)
 }
 
 /// FNV-1a over the little-endian bytes of `value`, seeded with `hash`.
-fn mix(hash: u64, value: u64) -> u64 {
+pub(super) fn mix(hash: u64, value: u64) -> u64 {
     let mut h = hash;
     for byte in value.to_le_bytes() {
         h ^= u64::from(byte);
@@ -93,13 +93,13 @@ fn mix(hash: u64, value: u64) -> u64 {
     h
 }
 
-const HASH_INIT: u64 = 0xcbf2_9ce4_8422_2325;
+pub(super) const HASH_INIT: u64 = 0xcbf2_9ce4_8422_2325;
 
 fn hash_ids(ids: &[u64]) -> u64 {
     ids.iter().fold(HASH_INIT, |h, id| mix(h, *id))
 }
 
-fn overlap(a: &[u64], b: &[usize]) -> f64 {
+pub(super) fn overlap(a: &[u64], b: &[usize]) -> f64 {
     let set: HashSet<usize> = a.iter().map(|id| *id as usize).collect();
     b.iter().filter(|i| set.contains(i)).count() as f64
 }

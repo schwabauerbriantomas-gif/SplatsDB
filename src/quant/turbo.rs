@@ -10,6 +10,17 @@
 //! mean over 1000 projection seeds within 2%). This holds since the QJL scale fix;
 //! before it, the residual term was biased by sqrt(pi/2)/||residual||.
 //!
+//! # Ranking modes (D18)
+//!
+//! [`TurboQuantizer::score`] selects the objective explicitly:
+//!
+//! * [`ScoreMode::InnerProduct`]: `polar_est + unbiased QJL term` (the estimator above).
+//! * [`ScoreMode::L2Heuristic`] (default of a search): `polar_est + legacy QJL term
+//!   sqrt(pi/2)/m * sum_i sign_i (g_i.q)`, i.e. the order every version <= 2.11.0 used.
+//!   It is NOT `(polar_est + unbiased term) / ||x||`: the legacy order applied the
+//!   `1/||residual||` factor to the residual term only, and that is the order that is
+//!   reproduced bit for bit. A heuristic for L2 candidate generation, not an estimator.
+//!
 //! License: MIT (adapted from github.com/RecursiveIntell/turbo-quant)
 
 use rayon::prelude::*;
@@ -17,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use super::error::{QuantError, Result};
 use super::polar::{PolarCode, PolarQuantizer};
-use super::qjl::{QjlQuantizer, QjlSketch};
+use super::qjl::{QjlQuantizer, QjlSketch, ScoreMode};
 
 /// A TurboQuant-compressed vector: polar code + QJL residual sketch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -42,10 +53,10 @@ impl TurboCode {
     }
 }
 
-/// Everything in an estimate that depends only on the query (A02-F02): the rotated
-/// query `R·q` for the polar stage and `g_i·q` for the QJL stage. Built once per
-/// search by [`TurboQuantizer::prepare_query`] and shared by every code, so the O(d²)
-/// rotation and the O(m·d) projection are paid once per query instead of once per code.
+/// Everything in a score that depends only on the query (A02-F02): the rotated query
+/// `R·q` for the polar stage and `g_i·q` for the QJL stage. Built once per search by
+/// [`TurboQuantizer::prepare_query`] and shared by every code, so the O(d²) rotation
+/// and the O(m·d) projection are paid once per query instead of once per code.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurboQueryContext {
     rotated_query: Vec<f32>,
@@ -157,17 +168,22 @@ impl TurboQuantizer {
         vectors.par_iter().map(|v| self.encode(v)).collect()
     }
 
-    /// Estimate <original_vector, query> from a TurboCode and raw query.
+    /// Unbiased estimate of `<original_vector, query>` ([`ScoreMode::InnerProduct`]).
     /// Unbiased in expectation over the projection matrix (see module docs); not a
     /// per-code guarantee.
     pub fn inner_product_estimate(&self, code: &TurboCode, query: &[f32]) -> Result<f32> {
+        self.score(code, query, ScoreMode::InnerProduct)
+    }
+
+    /// Score of `code` against `query` under `mode` (see the module docs and
+    /// [`ScoreMode`]).
+    pub fn score(&self, code: &TurboCode, query: &[f32], mode: ScoreMode) -> Result<f32> {
         let context = self.prepare_query(query)?;
-        self.inner_product_estimate_projected(code, &context)
+        self.score_projected(code, &context, mode)
     }
 
     /// Build the per-query context once and score every code with
-    /// [`Self::inner_product_estimate_projected`]: O(d² + m·d) once per query,
-    /// O(d + m) per code.
+    /// [`Self::score_projected`]: O(d² + m·d) once per query, O(d + m) per code.
     pub fn prepare_query(&self, query: &[f32]) -> Result<TurboQueryContext> {
         if query.len() != self.dim {
             return Err(QuantError::DimensionMismatch {
@@ -181,20 +197,21 @@ impl TurboQuantizer {
         })
     }
 
-    /// [`Self::inner_product_estimate`] against a query already prepared by
-    /// [`Self::prepare_query`]. Bit-identical to the per-code path.
-    pub fn inner_product_estimate_projected(
+    /// [`Self::score`] against a query already prepared by [`Self::prepare_query`].
+    /// Bit-identical to the per-code path.
+    pub fn score_projected(
         &self,
         code: &TurboCode,
         context: &TurboQueryContext,
+        mode: ScoreMode,
     ) -> Result<f32> {
         let polar_est = self
             .polar
             .inner_product_estimate_rotated(&code.polar_code, &context.rotated_query)?;
-        let qjl_correction = self
-            .qjl
-            .inner_product_estimate_projected(&code.residual_sketch, &context.projected_query)?;
-        Ok(polar_est + qjl_correction)
+        let qjl_term =
+            self.qjl
+                .score_projected(&code.residual_sketch, &context.projected_query, mode)?;
+        Ok(polar_est + qjl_term)
     }
 
     /// Estimate squared L2 distance.
@@ -283,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_query_estimates_are_bit_identical() {
+    fn prepared_query_scores_are_bit_identical_in_both_modes() {
         let dim = 32;
         let q = TurboQuantizer::new(dim, 4, 64, 11).unwrap();
         let query = random_vector(dim, 77);
@@ -292,13 +309,13 @@ mod tests {
         for i in 0..1000 {
             let x = random_vector(dim, 5000 + i);
             let code = q.encode(&x).unwrap();
-            assert_eq!(
-                q.inner_product_estimate(&code, &query).unwrap().to_bits(),
-                q.inner_product_estimate_projected(&code, &context)
-                    .unwrap()
-                    .to_bits(),
-                "code {i}"
-            );
+            for mode in [ScoreMode::L2Heuristic, ScoreMode::InnerProduct] {
+                assert_eq!(
+                    q.score(&code, &query, mode).unwrap().to_bits(),
+                    q.score_projected(&code, &context, mode).unwrap().to_bits(),
+                    "code {i} {mode:?}"
+                );
+            }
         }
     }
 
@@ -314,11 +331,11 @@ mod tests {
         let back: TurboQuantizer =
             serde_json::from_str(&serde_json::to_string(&q).unwrap()).unwrap();
         assert_eq!(back.encode(&x).unwrap(), code);
-        assert_eq!(
-            back.inner_product_estimate(&code, &query)
-                .unwrap()
-                .to_bits(),
-            q.inner_product_estimate(&code, &query).unwrap().to_bits()
-        );
+        for mode in [ScoreMode::L2Heuristic, ScoreMode::InnerProduct] {
+            assert_eq!(
+                back.score(&code, &query, mode).unwrap().to_bits(),
+                q.score(&code, &query, mode).unwrap().to_bits()
+            );
+        }
     }
 }

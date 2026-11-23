@@ -7,6 +7,9 @@
 //! A02-F03: the estimator contract (property tests + evidence probes) lives in
 //! `quant_contracts/properties.rs`.
 //!
+//! D18: ranking objective vs unbiased estimator (default `l2_heuristic` = legacy order,
+//! `ip` separate; parity, zero norm) lives in `quant_contracts/ranking.rs`.
+//!
 //! A02-F02: the projection cache and the per-query context (bit-identity, memory counted
 //! once, A/B bench) live in `quant_contracts/ab_bench.rs`; `quant_contracts/d18_probe.rs`
 //! is the cross-commit evidence probe (default order: recall vs exact-L2 GT + hash).
@@ -19,6 +22,8 @@ mod ab_bench;
 mod d18_probe;
 #[path = "quant_contracts/properties.rs"]
 mod properties;
+#[path = "quant_contracts/ranking.rs"]
+mod ranking;
 
 use ndarray::Array2;
 use rand::Rng;

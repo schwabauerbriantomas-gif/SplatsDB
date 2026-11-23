@@ -14,6 +14,16 @@
 //! ||x|| = sqrt(pi/2)). Verified numerically in tests/quant_contracts (mean over 2000
 //! deterministic pairs per norm group, tolerance 2%).
 //!
+//! # Two separate contracts: estimator vs ranking objective (D18)
+//!
+//! [`ScoreMode::InnerProduct`] ranks by the unbiased estimator above. It is NOT kept as
+//! the default order of a search that generates L2 candidates: an unbiased inner product
+//! is not an L2 ranking. [`ScoreMode::L2Heuristic`] (the default) ranks by the legacy
+//! order `estimate / ||x||`, i.e. `sqrt(pi/2)/m * sum_i sign(g_i.x)(g_i.q)`, which is
+//! what every version <= 2.11.0 computed and is reproduced bit for bit. It is a
+//! heuristic for L2 candidate generation, not an unbiased estimator of anything; the
+//! two modes are selected explicitly and the mode travels with the result.
+//!
 //! Reference: "Quantized Johnson-Lindenstrauss is Optimal for Inner Products"
 //! Zandieh et al., AAAI 2025.
 //!
@@ -31,6 +41,51 @@ use super::error::{QuantError, Result};
 /// Wire schema version of [`QjlSketch`]. v1 adds `norm`; v0 (<= 2.11.0: `{dim,
 /// projections, signs}` only) is rejected on deserialization and never reinterpreted.
 pub const QJL_SKETCH_SCHEMA_VERSION: u32 = 1;
+
+/// Objective a score ranks by. The unbiased inner-product estimator and the ranking
+/// used to generate L2 candidates are separate contracts (D18): neither is a bug fix
+/// of the other, and a search states which one it used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ScoreMode {
+    /// Default order of approximate L2 candidate generation: the legacy
+    /// `estimate / ||x||`, i.e. `sqrt(pi/2)/m * sum_i sign(g_i.x)(g_i.q)` — exactly what
+    /// versions <= 2.11.0 ranked by. A heuristic: it is `sqrt(pi/2) * cos(x, q)`, not an
+    /// unbiased estimator of the inner product nor of the L2 distance.
+    ///
+    /// `||x|| == 0` needs no special case: there is no division. Every sign of the zero
+    /// vector is +1 and the score is `sqrt(pi/2)/m * sum_i (g_i.q)`, finite and
+    /// deterministic — the same value the legacy estimator returned for it.
+    #[default]
+    L2Heuristic,
+    /// Ranks by the unbiased inner-product estimate `sqrt(pi/2) * ||x|| / m * sum_i ...`
+    /// (zero for the zero vector).
+    InnerProduct,
+}
+
+impl ScoreMode {
+    /// Stable wire name (CLI/JSON): `l2_heuristic` | `ip`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::L2Heuristic => "l2_heuristic",
+            Self::InnerProduct => "ip",
+        }
+    }
+
+    /// Parses a wire name (case-sensitive; surrounding whitespace ignored).
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim() {
+            "l2_heuristic" => Some(Self::L2Heuristic),
+            "ip" => Some(Self::InnerProduct),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ScoreMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// A QJL sketch: the sign of each random projection (+1 or -1) plus the norm of the
 /// sketched vector `x`, which the unbiased estimator needs as a multiplicative factor.
@@ -115,12 +170,12 @@ impl QjlSketch {
     }
 }
 
-/// Projects vectors to QJL sketches and estimates inner products.
+/// Projects vectors to QJL sketches and scores them against a query.
 ///
 /// The `projections x dim` Gaussian matrix is a pure function of `(dim, projections,
 /// seed)`. It is generated exactly once, in [`Self::new`], and shared (never copied per
-/// sketch or per row) by every `sketch`, estimate and search of this quantizer
-/// (A02-F02); [`Self::projection_bytes`] is what it costs.
+/// sketch or per row) by every `sketch`, score and search of this quantizer (A02-F02);
+/// [`Self::projection_bytes`] is what it costs.
 #[derive(Debug, Clone, Serialize)]
 pub struct QjlQuantizer {
     dim: usize,
@@ -230,17 +285,21 @@ impl QjlQuantizer {
         })
     }
 
-    /// Unbiased estimate of `<x, query>`:
-    /// `sqrt(pi/2) * ||x|| / m * sum_i sign(g_i.x) * (g_i.query)`.
+    /// Unbiased estimate of `<x, query>` ([`ScoreMode::InnerProduct`]).
     pub fn inner_product_estimate(&self, sketch: &QjlSketch, query: &[f32]) -> Result<f32> {
+        self.score(sketch, query, ScoreMode::InnerProduct)
+    }
+
+    /// Score of `sketch` against `query` under `mode` (see [`ScoreMode`]).
+    pub fn score(&self, sketch: &QjlSketch, query: &[f32], mode: ScoreMode) -> Result<f32> {
         let projected = self.projected_query(query)?;
-        self.inner_product_estimate_projected(sketch, &projected)
+        self.score_projected(sketch, &projected, mode)
     }
 
     /// `g_i . query` for every projection row `i` (`projections` values): the only part
-    /// of an estimate that depends on the query. Compute it once per query and score any
-    /// number of sketches against it with [`Self::inner_product_estimate_projected`] —
-    /// the per-sketch cost drops from `m*d` to `m` (A02-F02). Bit-identical to the dot
+    /// of a score that depends on the query. Compute it once per query and score any
+    /// number of sketches against it with [`Self::score_projected`] — the per-sketch cost
+    /// drops from `m*d` to `m` (A02-F02). The values are bit-identical to the dot
     /// product the per-sketch path used to recompute.
     pub fn projected_query(&self, query: &[f32]) -> Result<Vec<f32>> {
         if query.len() != self.dim {
@@ -256,12 +315,12 @@ impl QjlQuantizer {
             .collect())
     }
 
-    /// [`Self::inner_product_estimate`] against a query already projected by
-    /// [`Self::projected_query`].
-    pub fn inner_product_estimate_projected(
+    /// [`Self::score`] against a query already projected by [`Self::projected_query`].
+    pub fn score_projected(
         &self,
         sketch: &QjlSketch,
         projected_query: &[f32],
+        mode: ScoreMode,
     ) -> Result<f32> {
         if sketch.dim != self.dim {
             return Err(QuantError::DimensionMismatch {
@@ -284,8 +343,6 @@ impl QjlQuantizer {
             )));
         }
         let m = self.projections as f32;
-        // E[sign(g.x)(g.q)] = sqrt(2/pi) * <x,q>/||x||  =>  scale = sqrt(pi/2) * ||x|| / m
-        let scale = (PI / 2.0).sqrt() * sketch.norm / m;
         // Same accumulation order as the per-sketch estimator (bit-identical values).
         let estimate: f32 = sketch
             .signs
@@ -293,6 +350,13 @@ impl QjlQuantizer {
             .zip(projected_query.iter())
             .map(|(&sign, &g_dot_query)| sign as f32 * g_dot_query)
             .sum();
+        let scale = match mode {
+            // E[sign(g.x)(g.q)] = sqrt(2/pi) * <x,q>/||x||  =>  scale = sqrt(pi/2) * ||x|| / m
+            ScoreMode::InnerProduct => (PI / 2.0).sqrt() * sketch.norm / m,
+            // Legacy order (<= 2.11.0, scale pi/(2m)) = sqrt(pi/2) * estimate / ||x||;
+            // no division, so ||x|| == 0 is finite.
+            ScoreMode::L2Heuristic => PI / (2.0 * m),
+        };
         Ok(scale * estimate)
     }
 }
@@ -341,62 +405,44 @@ mod tests {
     }
 
     #[test]
-    fn cached_matrix_matches_the_regenerated_one_bit_for_bit() {
-        // The matrix is the same function of the seed as the per-call generator of
-        // <= F04a: same RNG stream, row-major, one f32 per sample.
-        let dim = 24;
-        let m = 48;
-        let seed = 77;
-        let q = QjlQuantizer::new(dim, m, seed).unwrap();
-        let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(0xDEAD_BEEF_1234_5678));
-        let expected: Vec<f32> = (0..m * dim)
-            .map(|_| StandardNormal.sample(&mut rng))
-            .collect();
-        assert_eq!(q.projection.len(), m * dim);
-        for (a, b) in q.projection.iter().zip(expected.iter()) {
-            assert_eq!(a.to_bits(), b.to_bits());
+    fn score_mode_wire_names_round_trip() {
+        assert_eq!(ScoreMode::default(), ScoreMode::L2Heuristic);
+        for mode in [ScoreMode::L2Heuristic, ScoreMode::InnerProduct] {
+            assert_eq!(ScoreMode::parse(mode.as_str()), Some(mode));
+            assert_eq!(mode.to_string(), mode.as_str());
         }
-        assert_eq!(q.projection_bytes(), m * dim * 4);
+        assert_eq!(ScoreMode::parse("inner_product"), None);
+        assert_eq!(ScoreMode::parse(""), None);
     }
 
     #[test]
-    fn projected_query_reuse_is_bit_identical() {
+    fn projected_query_reuse_is_bit_identical_for_both_modes() {
         let dim = 32;
         let q = QjlQuantizer::new(dim, 64, 9).unwrap();
         let mut rng = ChaCha8Rng::seed_from_u64(1234);
         let query: Vec<f32> = (0..dim).map(|_| StandardNormal.sample(&mut rng)).collect();
         let projected = q.projected_query(&query).unwrap();
-        // Reference: the per-sketch loop of <= F04a, on the cached matrix.
-        let m = q.projections as f32;
         for i in 0..1000 {
             let mut rng = ChaCha8Rng::seed_from_u64(10_000 + i);
             let x: Vec<f32> = (0..dim).map(|_| StandardNormal.sample(&mut rng)).collect();
             let sketch = q.sketch(&x).unwrap();
-            let estimate: f32 = q
-                .projection
-                .chunks_exact(dim)
-                .zip(sketch.signs.iter())
-                .map(|(row, &sign)| {
-                    let g_dot_query: f32 = row.iter().zip(query.iter()).map(|(g, q)| g * q).sum();
-                    sign as f32 * g_dot_query
-                })
-                .sum();
-            let reference = (PI / 2.0).sqrt() * sketch.norm / m * estimate;
-            assert_eq!(
-                q.inner_product_estimate(&sketch, &query).unwrap().to_bits(),
-                reference.to_bits(),
-                "pair {i}"
-            );
-            assert_eq!(
-                q.inner_product_estimate_projected(&sketch, &projected)
-                    .unwrap()
-                    .to_bits(),
-                reference.to_bits(),
-                "pair {i}"
-            );
+            for mode in [ScoreMode::L2Heuristic, ScoreMode::InnerProduct] {
+                assert_eq!(
+                    q.score(&sketch, &query, mode).unwrap().to_bits(),
+                    q.score_projected(&sketch, &projected, mode)
+                        .unwrap()
+                        .to_bits(),
+                    "pair {i} {mode:?}"
+                );
+            }
         }
+        // A projected query of the wrong length is rejected, not misread.
         assert!(q
-            .inner_product_estimate_projected(&q.sketch(&query).unwrap(), &projected[..63])
+            .score_projected(
+                &q.sketch(&query).unwrap(),
+                &projected[..63],
+                ScoreMode::InnerProduct
+            )
             .is_err());
     }
 
@@ -411,11 +457,15 @@ mod tests {
         let wire = serde_json::to_string(&q).unwrap();
         assert!(!wire.contains("\"projection\":"), "{wire}");
         let back: QjlQuantizer = serde_json::from_str(&wire).unwrap();
-        // The deserialized quantizer rebuilt the same matrix: same signs, same estimate.
+        // The deserialized quantizer rebuilt the same matrix: same signs, same scores.
         assert_eq!(back.sketch(&x).unwrap(), sketch);
         assert_eq!(
-            back.inner_product_estimate(&sketch, &y).unwrap().to_bits(),
-            q.inner_product_estimate(&sketch, &y).unwrap().to_bits()
+            back.score(&sketch, &y, ScoreMode::L2Heuristic)
+                .unwrap()
+                .to_bits(),
+            q.score(&sketch, &y, ScoreMode::L2Heuristic)
+                .unwrap()
+                .to_bits()
         );
         assert_eq!(back.projection_bytes(), q.projection_bytes());
     }

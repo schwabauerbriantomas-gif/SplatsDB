@@ -9,14 +9,17 @@
 //! smaller than f32 — not the 8x of the nominal `dim*bits/8` formula.
 //! `encoded_bytes()`, `memory_usage()` and `compression_ratio()` report that real layout.
 //!
-//! # Query reuse (A02-F02)
+//! # Ranking objective (D18)
 //!
-//! The quantizer caches its deterministic matrices once per store (the d×d rotation and
-//! the m×d QJL projection); a search rotates and projects the query once and scores
-//! every code against that context. Scores are bit-identical to the per-code path, and
-//! `memory_usage()` counts each cache exactly once.
+//! A search ranks by [`ScoreMode`], stated explicitly and carried by every
+//! [`SearchHit`]. The default, [`ScoreMode::L2Heuristic`], preserves the order of
+//! versions <= 2.11.0 (`estimate / ||x||`: a heuristic for L2 candidate generation, not
+//! an unbiased estimator); [`ScoreMode::InnerProduct`] ranks by the unbiased inner-product
+//! estimate and is selected on purpose. `search` is the default mode;
+//! `search_scored` takes the mode.
 
-use crate::quant::{PolarCode, PolarQuantizer, QjlSketch, TurboCode, TurboQuantizer};
+pub use crate::quant::qjl::ScoreMode;
+use crate::quant::{PolarCode, PolarQuantizer, QjlSketch, QuantError, TurboCode, TurboQuantizer};
 use ndarray::{Array2, ArrayView1};
 use rayon::prelude::*;
 
@@ -82,6 +85,18 @@ impl QuantConfig {
             algorithm: QuantAlgorithm::TurboQuant,
         }
     }
+}
+
+/// One ranked result of a quantized search. `score` means exactly what `mode` says:
+/// under [`ScoreMode::L2Heuristic`] it is the legacy `estimate / ||x||` order value
+/// (`sqrt(pi/2) * cos`-like, higher = closer), under [`ScoreMode::InnerProduct`] the
+/// unbiased inner-product estimate. Neither is a distance; neither is comparable
+/// across modes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SearchHit {
+    pub id: u64,
+    pub score: f32,
+    pub mode: ScoreMode,
 }
 
 /// Compressed vector store using TurboQuant.
@@ -212,62 +227,92 @@ impl QuantizedStore {
         true
     }
 
-    /// Search for k nearest neighbors using parallel inner product estimation.
-    /// Returns (id, estimated_inner_product) pairs sorted by similarity (descending).
+    /// The objective `search` ranks by when no mode is given (D18): the legacy
+    /// `estimate / ||x||` order, as an explicit L2 candidate heuristic.
+    pub const fn default_score_mode() -> ScoreMode {
+        ScoreMode::L2Heuristic
+    }
+
+    /// Top-k neighbours of `query` under [`Self::default_score_mode`], as
+    /// `(id, score)` pairs sorted by score (descending).
     ///
-    /// The query-dependent work — the rotation `R·q` and the projections `g_i·q` — is
-    /// done once per call and shared by every code (A02-F02); a code that fails
-    /// validation is skipped, as before.
+    /// Compatibility wrapper: a query of the wrong dimension yields an empty result.
+    /// Use [`Self::search_scored`] to get the error.
     pub fn search(&self, query: &ArrayView1<f32>, k: usize) -> Vec<(u64, f32)> {
+        self.search_scored(query, k, Self::default_score_mode())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|hit| (hit.id, hit.score))
+            .collect()
+    }
+
+    /// Top-k neighbours of `query` ranked by `mode`, higher score first (ties keep
+    /// insertion order).
+    ///
+    /// The query-dependent work is done once per call — the rotation `R·q` and the
+    /// projections `g_i·q` are shared by every code (A02-F02). A query of the wrong
+    /// dimension is an `Err`, not an empty ranking.
+    pub fn search_scored(
+        &self,
+        query: &ArrayView1<f32>,
+        k: usize,
+        mode: ScoreMode,
+    ) -> Result<Vec<SearchHit>, QuantError> {
+        if query.len() != self.dim {
+            return Err(QuantError::DimensionMismatch {
+                expected: self.dim,
+                got: query.len(),
+            });
+        }
         let q: Vec<f32> = query.to_vec();
         let n = self.ids.len();
         let k = k.min(n);
         if k == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let mut scores: Vec<(usize, f32)> = if let Some(ref turbo) = self.turbo {
-            match turbo.prepare_query(&q) {
-                Ok(context) => self
-                    .codes_turbo
-                    .par_iter()
-                    .enumerate()
-                    .filter_map(|(i, code)| {
-                        turbo
-                            .inner_product_estimate_projected(code, &context)
-                            .ok()
-                            .map(|s| (i, s))
-                    })
-                    .collect(),
-                Err(_) => Vec::new(),
-            }
+            let context = turbo.prepare_query(&q)?;
+            self.codes_turbo
+                .par_iter()
+                .enumerate()
+                .filter_map(|(i, code)| {
+                    turbo
+                        .score_projected(code, &context, mode)
+                        .ok()
+                        .map(|s| (i, s))
+                })
+                .collect()
         } else if let Some(ref polar) = self.polar {
-            match polar.rotated_query(&q) {
-                Ok(rotated_query) => self
-                    .codes_polar
-                    .par_iter()
-                    .enumerate()
-                    .filter_map(|(i, code)| {
-                        polar
-                            .inner_product_estimate_rotated(code, &rotated_query)
-                            .ok()
-                            .map(|s| (i, s))
-                    })
-                    .collect(),
-                Err(_) => Vec::new(),
-            }
+            // No QJL stage: both modes rank by the polar reconstruction inner product
+            // (the legacy order; nothing was ever divided by a norm here).
+            let rotated_query = polar.rotated_query(&q)?;
+            self.codes_polar
+                .par_iter()
+                .enumerate()
+                .filter_map(|(i, code)| {
+                    polar
+                        .inner_product_estimate_rotated(code, &rotated_query)
+                        .ok()
+                        .map(|s| (i, s))
+                })
+                .collect()
         } else {
             Vec::new()
         };
 
-        // Sort descending by inner product (higher = more similar)
+        // Sort descending by score (higher = more similar)
         scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scores.truncate(k);
 
-        scores
+        Ok(scores
             .into_iter()
-            .map(|(i, score)| (self.ids[i], score))
-            .collect()
+            .map(|(i, score)| SearchHit {
+                id: self.ids[i],
+                score,
+                mode,
+            })
+            .collect())
     }
 
     /// Get number of stored codes.
@@ -391,12 +436,26 @@ impl QuantizedStore {
         &self.config
     }
 
-    /// Measure recall@k against brute-force ground truth.
+    /// Measure recall@k of [`Self::search`] (the default mode) against brute-force
+    /// ground truth.
     ///
     /// Given a set of query vectors and the full dataset, computes what fraction
     /// of the true top-k neighbors are recovered by quantized search.
     /// Returns recall in [0.0, 1.0] where 1.0 = perfect recall.
     pub fn measure_recall(&self, queries: &Array2<f32>, data: &Array2<f32>, k: usize) -> f32 {
+        self.measure_recall_with_mode(queries, data, k, Self::default_score_mode())
+    }
+
+    /// [`Self::measure_recall`] under an explicit `mode`. The ground truth is exact L2;
+    /// for [`ScoreMode::InnerProduct`] that is a different objective, so its recall is
+    /// reported separately and never mixed with the default's (D18).
+    pub fn measure_recall_with_mode(
+        &self,
+        queries: &Array2<f32>,
+        data: &Array2<f32>,
+        k: usize,
+        mode: ScoreMode,
+    ) -> f32 {
         if self.is_empty() || queries.nrows() == 0 {
             return 0.0;
         }
@@ -430,10 +489,10 @@ impl QuantizedStore {
             let gt_set: std::collections::HashSet<usize> =
                 gt_dists[..k].iter().map(|(i, _)| *i).collect();
 
-            // Quantized search top-k
-            let qresults = self.search(&query, k);
+            // Quantized search top-k (a rejected query contributes zero recall)
+            let qresults = self.search_scored(&query, k, mode).unwrap_or_default();
             let quant_set: std::collections::HashSet<usize> =
-                qresults.iter().map(|(id, _)| *id as usize).collect();
+                qresults.iter().map(|hit| hit.id as usize).collect();
 
             // Recall = |quantized ∩ ground_truth| / k
             let overlap = gt_set.intersection(&quant_set).count() as f32;
