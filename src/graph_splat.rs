@@ -1435,4 +1435,197 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // -----------------------------------------------------------------------
+    // F05d (A04-F11 / A04-F12) — explicit, deterministic ranking semantics
+    // -----------------------------------------------------------------------
+
+    /// Unit vector at cosine `c` from the query `[1, 0, 0, 0]`.
+    fn f05d_doc_at(c: f64) -> Vec<f32> {
+        vec![c as f32, (1.0 - c * c).sqrt() as f32, 0.0, 0.0]
+    }
+    const F05D_QUERY: [f32; 4] = [1.0, 0.0, 0.0, 0.0];
+
+    /// A: cosine 0.90, no edges. B: cosine 0.75, five edges to five entities.
+    fn f05d_graph_with_a_popular_b() -> (GaussianGraphStore, usize, usize) {
+        let mut g = GaussianGraphStore::new();
+        let a = g.add_document("A", &f05d_doc_at(0.90)).unwrap();
+        let b = g.add_document("B", &f05d_doc_at(0.75)).unwrap();
+        for i in 0..5 {
+            let e = g
+                .add_entity(&format!("entity {i}"), &[0.0, 0.0, 1.0, 0.0], "concept")
+                .unwrap();
+            g.add_relation(b, e, "MENTIONS", 1.0).unwrap();
+        }
+        assert_eq!(g.outgoing_count(b), 5);
+        (g, a, b)
+    }
+
+    #[test]
+    fn f05d_default_ranking_is_the_raw_cosine_and_degree_does_not_reorder() {
+        let (g, a, b) = f05d_graph_with_a_popular_b();
+        let r = g.hybrid_search(&F05D_QUERY, 10);
+        assert_eq!(
+            r[0].node_id, a,
+            "A (cos 0.90, 0 edges) must rank first, not B (cos 0.75, 5 edges)"
+        );
+        assert_eq!(r[1].node_id, b);
+        assert!(
+            (r[0].score - 0.90).abs() < 1e-5,
+            "`score` must be the raw cosine, got {}",
+            r[0].score
+        );
+        assert!(
+            (r[1].score - 0.75).abs() < 1e-5,
+            "`score` must be the raw cosine, got {}",
+            r[1].score
+        );
+    }
+
+    #[test]
+    fn f05d_add_relation_is_idempotent_on_source_target_type() {
+        let mut g = GaussianGraphStore::new();
+        let d = g.add_document("D", &[1.0, 0.0]).unwrap();
+        let e = g.add_entity("E", &[0.0, 1.0], "concept").unwrap();
+        g.add_relation(d, e, "MENTIONS", 0.9).unwrap();
+        for _ in 0..4 {
+            g.add_relation(d, e, "MENTIONS", 0.9).unwrap();
+        }
+        assert_eq!(g.n_edges(), 1, "repeating a relation must not duplicate it");
+        assert_eq!(
+            g.outgoing_count(d),
+            1,
+            "repeating a relation must not inflate the degree"
+        );
+        // Another relation type is another relation.
+        g.add_relation(d, e, "CITES", 0.5).unwrap();
+        assert_eq!(g.n_edges(), 2);
+    }
+
+    #[test]
+    fn f05d_add_with_another_dimension_is_a_controlled_error() {
+        let mut g = GaussianGraphStore::new();
+        g.add_document("A", &f05d_doc_at(0.9)).unwrap();
+        assert!(
+            g.add_document("3-d", &[1.0, 0.0, 0.0]).is_err(),
+            "a 3-d node was accepted by a 4-d graph"
+        );
+        assert!(
+            g.add_entity("E", &[1.0, 0.0, 0.0], "concept").is_err(),
+            "a 3-d entity was accepted by a 4-d graph"
+        );
+        assert_eq!(g.n_nodes(), 1, "a refused node must not be inserted");
+
+        // The first node fixes the dimension, whichever add_* it came from.
+        let mut first_entity = GaussianGraphStore::new();
+        first_entity
+            .add_entity("first", &[1.0, 0.0, 0.0], "concept")
+            .unwrap();
+        assert!(
+            first_entity.add_document("4-d", &f05d_doc_at(0.5)).is_err(),
+            "a 4-d document was accepted by a 3-d graph"
+        );
+        assert_eq!(first_entity.n_nodes(), 1);
+    }
+
+    #[test]
+    fn f05d_non_finite_embeddings_are_rejected() {
+        let mut g = GaussianGraphStore::new();
+        assert!(
+            g.add_document("nan", &[f32::NAN, 0.0, 0.0, 0.0]).is_err(),
+            "a NaN embedding was accepted"
+        );
+        assert!(
+            g.add_document("inf", &[f32::INFINITY, 0.0, 0.0, 0.0]).is_err(),
+            "an infinite embedding was accepted"
+        );
+        assert!(
+            g.add_document("-inf", &[f32::NEG_INFINITY, 0.0, 0.0, 0.0]).is_err(),
+            "a -inf embedding was accepted"
+        );
+        assert!(
+            g.add_entity("nan", &[f32::NAN, 0.0, 0.0, 0.0], "concept")
+                .is_err(),
+            "a NaN entity embedding was accepted"
+        );
+        assert_eq!(g.n_nodes(), 0);
+    }
+
+    #[test]
+    fn f05d_query_with_another_dimension_is_not_a_zero_similarity() {
+        let (g, _a, _b) = f05d_graph_with_a_popular_b();
+        let entities = g.search_entities(&[1.0, 0.0], 5);
+        assert!(
+            entities.is_empty(),
+            "a 2-d query against a 4-d graph returned {} 'most similar' entities",
+            entities.len()
+        );
+        let docs = g.hybrid_search(&[1.0, 0.0], 5);
+        assert!(
+            docs.is_empty(),
+            "a 2-d query against a 4-d graph returned {} 'most similar' documents",
+            docs.len()
+        );
+    }
+
+    #[test]
+    fn f05d_equal_scores_are_ordered_by_ascending_node_id() {
+        let mut g = GaussianGraphStore::new();
+        for i in 0..16u32 {
+            g.add_entity(&format!("same {i}"), &[0.0, 1.0, 0.0, 0.0], "concept")
+                .unwrap();
+        }
+        let entities = g.search_entities(&F05D_QUERY, 16);
+        let ids: Vec<usize> = entities.iter().map(|n| n.id).collect();
+        assert_eq!(
+            ids,
+            (1..=16).collect::<Vec<_>>(),
+            "equal scores must be ordered by ascending node id"
+        );
+        for i in 0..16u32 {
+            g.add_document(&format!("doc {i}"), &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        }
+        let docs = g.hybrid_search(&F05D_QUERY, 16);
+        let ids: Vec<usize> = docs.iter().map(|r| r.node_id).collect();
+        assert_eq!(
+            ids,
+            (17..=32).collect::<Vec<_>>(),
+            "equal scores must be ordered by ascending node id"
+        );
+    }
+
+    #[test]
+    fn f05d_legacy_state_with_mixed_dimensions_fails_closed() {
+        let dir = f05c_dir("mixed-dims");
+        let mixed = br#"{"version":1,"next_id":3,"nodes":[{"id":1,"node_type":"Document","content":"3-d","embedding":[1.0,0.0,0.0],"alpha":1.0,"kappa":10.0},{"id":2,"node_type":"Entity","content":"5-d","embedding":[1.0,0.0,0.0,0.0,0.0],"alpha":0.8,"kappa":15.0}],"edges":[]}"#;
+        std::fs::write(f05c_state(&dir), mixed).unwrap();
+        assert!(
+            GaussianGraphStore::load_from_dir(&dir).is_err(),
+            "a state file mixing 3-d and 5-d nodes loaded as if it were one vector space"
+        );
+        assert!(GaussianGraphStore::load_or_empty(&dir).is_err());
+        assert_eq!(std::fs::read(f05c_state(&dir)).unwrap(), mixed.as_slice());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f05d_dimension_survives_save_and_load() {
+        let dir = f05c_dir("dim-roundtrip");
+        let mut g = GaussianGraphStore::new();
+        g.add_document("A", &f05d_doc_at(0.9)).unwrap();
+        let path = g.save_to_dir(&dir).unwrap();
+        assert!(path.exists());
+        let mut g2 = GaussianGraphStore::load_from_dir(&dir).unwrap();
+        assert!(
+            g2.add_document("3-d", &[1.0, 0.0, 0.0]).is_err(),
+            "after a reload the 4-d invariant was forgotten"
+        );
+        assert!(
+            g2.hybrid_search(&[1.0, 0.0], 5).is_empty(),
+            "after a reload a 3-d query ranked the 4-d graph"
+        );
+        g2.add_document("4-d", &f05d_doc_at(0.5)).unwrap();
+        assert_eq!(g2.n_nodes(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
