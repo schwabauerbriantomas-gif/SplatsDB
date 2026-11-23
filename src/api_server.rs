@@ -843,7 +843,7 @@ async fn search_memories(
     {
         if !rescore_gaussian {
             if let Some(mut results) = gpu_fast_path_results(fast, &embedding, k) {
-                enrich_topics(&state, &mut results, true);
+                enrich_topics(&state, &mut results, Some(true));
                 return Ok(Json(SearchResponse {
                     results,
                     backend: Some("gpu".into()),
@@ -889,7 +889,7 @@ async fn search_memories(
     // 87d5d91, gpu_batch_path desde el fix 17-nov): squared=true para que
     // confidence use d=√score. Con false la confidence quedaba inflada
     // (1−d²/R en vez de 1−√d²/R) en el batch (17-nov EGM audit).
-    enrich_topics(&state, &mut results, true);
+    enrich_topics(&state, &mut results, (!rescore_gaussian).then_some(true));
 
     Ok(Json(SearchResponse {
         results,
@@ -899,7 +899,10 @@ async fn search_memories(
 
 /// Enriquece resultados con tópico (splat) y confianza espacial
 /// (1 − d/R del tópico). Solo llamado con scores de distancia L2 reales
-/// (no con gaussian rescore ni texto-hash). `squared` = score es d² (todas las rutas L2 de hoy).
+/// (no con texto-hash). `squared`: `Some(true)` cuando el score es d² (filas
+/// L2 de cualquier ruta); `None` para `rescore=gaussian`, cuyo score es
+/// alpha·exp(−kappa·d²) y no es una distancia — esas filas llevan tópico y
+/// ninguna confianza.
 ///
 /// Los ids de `/search` son SIEMPRE ids de splat —el espacio de la referencia
 /// CPU (`find_neighbors_fused`), del batch worker y de `/store`—, nunca ids
@@ -907,13 +910,16 @@ async fn search_memories(
 /// espacio se infería de `corpus_n`, que con field/ era siempre el del corpus
 /// de chunks: un id de splat se buscaba en `chunk_cluster` como si fuera un
 /// chunk y el tópico (y el radio de la confianza) eran los de OTRO splat.
-fn enrich_topics(state: &AppState, results: &mut [SearchResult], squared: bool) {
+fn enrich_topics(state: &AppState, results: &mut [SearchResult], squared: Option<bool>) {
     let Some(field) = &state.field else {
         return;
     };
     for r in results.iter_mut() {
         let radius = field.radii.get(r.index).copied().unwrap_or(0.0);
         r.topic = Some(r.index as u32);
+        let Some(squared) = squared else {
+            continue;
+        };
         if radius > 0.0 {
             let dist = if squared {
                 r.score.max(0.0).sqrt()

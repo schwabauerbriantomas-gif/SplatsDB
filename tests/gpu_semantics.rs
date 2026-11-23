@@ -559,6 +559,54 @@ fn cpu_search_with_a_field_corpus_returns_splat_ids_with_their_own_topic() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// `rescore=gaussian` with a field/ corpus: splat ids, the splat's own topic
+/// and NO confidence — its score is alpha·exp(−kappa·d²), not a distance.
+/// Before F02d the confidence was `1 − sqrt(score)/R`: a score of 0.0 (very
+/// far) came out as a perfect 1.0.
+#[test]
+fn gaussian_rescore_with_a_field_corpus_has_the_splat_topic_and_no_distance_confidence() {
+    let dir = scratch("gauss");
+    let port = probe_port();
+    let mu = write_field_corpus(&dir);
+    let (q, v) = (query(), stored());
+    let exact = exact_topk(&mu, &q, TOP_K);
+
+    let mut server = spawn_serve(&dir, port, false);
+    wait_healthy(port, &mut server);
+
+    let before = rows(&search(port, true, &q, TOP_K));
+    assert_gaussian_ranking(&before, &exact, "gaussian before /store");
+    for (index, _, topic, confidence) in &before {
+        assert_eq!(
+            *topic,
+            Some(*index as u32),
+            "topic must be the splat the result is: {before:?}"
+        );
+        assert_eq!(
+            *confidence, None,
+            "a gaussian score is not a distance: no confidence may be derived from it: {before:?}"
+        );
+    }
+
+    store(port, &v);
+    let after = rows(&search(port, true, &q, TOP_K));
+    assert_rows_eq(
+        &before,
+        &after,
+        "gaussian before vs after an unrelated /store",
+    );
+    assert_gaussian_ranking(&after, &exact, "gaussian after /store");
+
+    let code = shutdown(&mut server);
+    assert_eq!(
+        code,
+        Some(0),
+        "serve must exit 0 after SIGTERM: {}",
+        stderr_of(&server)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // ─── GPU fast path vs batch worker vs CPU (real CUDA) ──────────────────
 
 /// `serve --gpu` on a field/ corpus. Before the first `/store` the startup
