@@ -242,3 +242,92 @@ fn qjl_sketch_schema_v1_roundtrip_and_byte_cost() {
         assert!(serde_json::from_value::<QjlSketch>(bad).is_err());
     }
 }
+
+// ---------------------------------------------------------------------------
+// A02-F04: memory metrics reflect the real (unpacked) layout, not dim*bits/8.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn memory_metrics_report_the_real_unpacked_layout_for_bits_2_4_8() {
+    use splatsdb::quant::{PolarCode, QjlSketch, TurboCode};
+    const DIM: usize = 640;
+    const N: usize = 1000;
+    let vectors = uniform_matrix(N, DIM, 21);
+    let mut report = Vec::new();
+    for bits in [2u8, 4, 8] {
+        for algorithm in [QuantAlgorithm::TurboQuant, QuantAlgorithm::PolarQuant] {
+            let turbo = matches!(algorithm, QuantAlgorithm::TurboQuant);
+            let config = QuantConfig {
+                bits,
+                projections: if turbo { DIM / 8 } else { 0 },
+                seed: 42,
+                algorithm,
+            };
+            let mut store = QuantizedStore::new(DIM, config).unwrap();
+            store.add_batch(&vectors, 0).unwrap();
+            let n = store.len();
+            assert_eq!(n, N);
+
+            // Independent count of the current layout: f32 radius + u16 angle index per
+            // pair, i8 per QJL sign, f32 residual norm (TurboQuant only).
+            let per_code = DIM / 2 * (4 + 2) + if turbo { DIM / 8 + 4 } else { 0 };
+            let nominal = 32.0 / bits as f32;
+            let raw = n * DIM * 4;
+            let real = n * per_code;
+
+            assert_eq!(PolarCode::layout_bytes(DIM), DIM / 2 * 6);
+            assert_eq!(QjlSketch::layout_bytes(DIM / 8), DIM / 8 + 4);
+            assert_eq!(store.code_layout_bytes(), per_code);
+            assert_eq!(store.encoded_bytes(), real, "count must match the layout");
+            assert!(!store.is_bit_packed());
+            let ratio = store.compression_ratio();
+            assert!(
+                (ratio - raw as f32 / real as f32).abs() < 1e-5,
+                "ratio={ratio}"
+            );
+            assert!(
+                ratio < nominal,
+                "bits={bits} {algorithm:?}: nominal {nominal}x is not what the layout delivers ({ratio}x)"
+            );
+            let inline = if turbo {
+                std::mem::size_of::<TurboCode>()
+            } else {
+                std::mem::size_of::<PolarCode>()
+            };
+            assert_eq!(
+                store.memory_usage(),
+                real + n * (inline + std::mem::size_of::<u64>())
+            );
+            report.push(format!(
+                "bits={bits} {algorithm:?}: raw={raw} B, encoded={real} B ({per_code} B/code), ratio={ratio:.4} (nominal {nominal}), memory_usage={} B",
+                store.memory_usage()
+            ));
+        }
+    }
+    println!("\n{}", report.join("\n"));
+}
+
+#[test]
+fn memory_usage_on_a_10k_code_store_matches_the_declared_overhead() {
+    use splatsdb::quant::TurboCode;
+    const DIM: usize = 640;
+    const N: usize = 10_000;
+    let mut store = QuantizedStore::new(DIM, QuantConfig::for_search(DIM)).unwrap();
+    store.add_batch(&uniform_matrix(N, DIM, 22), 0).unwrap();
+    assert_eq!(store.len(), N);
+    let per_code = store.code_layout_bytes();
+    assert_eq!(per_code, DIM / 2 * 6 + DIM / 8 + 4);
+    assert_eq!(store.encoded_bytes(), N * per_code);
+    let declared =
+        store.encoded_bytes() + N * (std::mem::size_of::<TurboCode>() + std::mem::size_of::<u64>());
+    assert_eq!(store.memory_usage(), declared);
+    let raw = N * DIM * 4;
+    println!(
+        "10k x 640-D 4-bit TurboQuant: raw={raw} B, encoded={} B, memory_usage={declared} B, ratio={} (nominal 8.0)",
+        store.encoded_bytes(),
+        raw as f32 / store.encoded_bytes() as f32
+    );
+    // 2004 B payload + 112 B struct + 8 B id = 2124 B per vector vs 2560 B raw.
+    assert!(store.memory_usage() < raw);
+    assert!(store.memory_usage() > raw / 2);
+}

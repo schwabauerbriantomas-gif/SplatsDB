@@ -36,8 +36,15 @@ impl PolarCode {
         (self.angle_indices[i] as f32 / levels as f32) * (2.0 * PI) - PI
     }
 
+    /// Payload bytes of one code in the current unpacked layout: an f32 radius and a
+    /// u16 angle index per pair (6 B per pair) — independent of `bits`. Bit-packing is
+    /// not implemented; until it is, this is what a code really costs.
+    pub const fn layout_bytes(dim: usize) -> usize {
+        dim / 2 * (std::mem::size_of::<f32>() + std::mem::size_of::<u16>())
+    }
+
     pub fn encoded_bytes(&self) -> usize {
-        self.pair_count() * 4 + self.pair_count() * 2
+        Self::layout_bytes(self.dim)
     }
 }
 

@@ -94,8 +94,14 @@ impl<'de> Deserialize<'de> for QjlSketch {
 }
 
 impl QjlSketch {
+    /// Payload bytes of one sketch in the current unpacked layout: one i8 per sign plus
+    /// the f32 norm — independent of `bits` (bit-packing is not implemented).
+    pub const fn layout_bytes(projections: usize) -> usize {
+        projections * std::mem::size_of::<i8>() + std::mem::size_of::<f32>()
+    }
+
     pub fn encoded_bytes(&self) -> usize {
-        self.projections + std::mem::size_of::<f32>()
+        Self::layout_bytes(self.projections)
     }
 }
 
