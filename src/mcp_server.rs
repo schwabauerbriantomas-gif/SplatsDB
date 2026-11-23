@@ -47,25 +47,159 @@ fn embedding_service_url() -> String {
         .unwrap_or_else(|_| EMBEDDING_SERVICE_URL_DEFAULT.to_string())
 }
 
-/// SIGINT and SIGTERM (A03-F15). The handler only sets the flag; the read
-/// blocked on stdin is what carries it out — see `install_shutdown_handlers`
-/// and `read_line_capped`.
+/// SIGINT and SIGTERM (A03-F15). The handler records the request in the two
+/// ways the request loop could miss it (F05e): the flag AND one byte on the
+/// wake pipe.
+///
+/// The flag alone was not enough: a signal that lands between the loop's
+/// flag check and its `read()` — or that the kernel delivers on another
+/// thread (HTTP client, SQLite, dispatcher) — leaves the loop blocked on an
+/// idle stdin with nothing left to wake it. The loop therefore only ever
+/// waits in `poll()` on stdin + the wake pipe (see `StdinReader`).
+///
+/// The SECOND signal forces the exit (`_exit`, async-signal-safe): whatever
+/// is in flight is abandoned and never acknowledged; the durable state is
+/// whatever the atomic writes already committed.
 #[cfg(unix)]
-extern "C" fn handle_sigint(_: i32) {
-    SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+extern "C" fn handle_sigint(sig: i32) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    if SIGNALS_SEEN.fetch_add(1, Ordering::SeqCst) >= 1 {
+        // SAFETY: `_exit` is async-signal-safe.
+        unsafe { libc::_exit(128 + sig) };
+    }
+    wake_loop();
+}
+
+#[cfg(unix)]
+static SIGNALS_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Read / write ends of the wake pipe (`-1` until `install_shutdown_handlers`).
+#[cfg(unix)]
+static WAKE_READ_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+#[cfg(unix)]
+static WAKE_WRITE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// One byte on the wake pipe. Both ends are non-blocking: a full pipe means
+/// the loop already holds a pending wakeup. Async-signal-safe (`write`).
+#[cfg(unix)]
+fn wake_loop() {
+    let fd = WAKE_WRITE_FD.load(Ordering::SeqCst);
+    if fd >= 0 {
+        let byte = 1u8;
+        // SAFETY: `write` on a valid, non-blocking fd; a failed write can
+        // only mean the wakeup is already pending.
+        unsafe {
+            libc::write(fd, std::ptr::from_ref(&byte).cast(), 1);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn wake_loop() {}
+
+/// Empty the wake pipe without blocking: a stale byte would make the next
+/// `poll` return at once.
+#[cfg(unix)]
+fn drain_wake_pipe() {
+    let fd = WAKE_READ_FD.load(Ordering::SeqCst);
+    if fd < 0 {
+        return;
+    }
+    let mut sink = [0u8; 64];
+    // SAFETY: `read` on a valid, non-blocking fd.
+    while unsafe { libc::read(fd, sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
+}
+
+/// `poll()` on the wake pipe for at most `timeout` (`None` = forever).
+/// Returns as soon as a wakeup byte lands, the deadline passes or a signal
+/// lands on this thread — the caller decides; nothing sleeps through a
+/// pending exit request unchecked.
+#[cfg(unix)]
+fn poll_wake(timeout: Option<std::time::Duration>) {
+    let fd = WAKE_READ_FD.load(Ordering::SeqCst);
+    if fd < 0 {
+        if let Some(t) = timeout {
+            std::thread::sleep(t.min(std::time::Duration::from_millis(50)));
+        }
+        return;
+    }
+    let mut fds = [libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    let ms = match timeout {
+        None => -1,
+        Some(t) => (t.as_millis() as i32).max(0),
+    };
+    // SAFETY: `fds` is valid for exactly one entry.
+    let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) };
+    if ready < 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            if let Some(t) = timeout {
+                std::thread::sleep(t.min(std::time::Duration::from_millis(50)));
+            }
+            return;
+        }
+    }
+    drain_wake_pipe();
+}
+
+#[cfg(not(unix))]
+fn poll_wake(timeout: Option<std::time::Duration>) {
+    if let Some(t) = timeout {
+        std::thread::sleep(t);
+    }
+}
+
+/// Block SIGINT/SIGTERM around `f` so a forced exit (second signal) can
+/// never cut a response line in half: the signal stays pending and is
+/// delivered — and acted on — right after the line is written.
+#[cfg(unix)]
+fn with_shutdown_signals_blocked<R>(f: impl FnOnce() -> R) -> R {
+    // SAFETY: plain sigset_t handling; the previous mask is restored.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        let mut previous: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigprocmask(libc::SIG_BLOCK, &set, &mut previous);
+        let out = f();
+        libc::sigprocmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        out
+    }
+}
+
+#[cfg(not(unix))]
+fn with_shutdown_signals_blocked<R>(f: impl FnOnce() -> R) -> R {
+    f()
 }
 
 /// First thing `run_mcp_server` does (A03-F15): from here on SIGINT and
-/// SIGTERM request a shutdown instead of killing the process — SIGTERM had
+/// SIGTERM request a clean exit instead of killing the process — SIGTERM had
 /// no handler at all and terminated the server mid-request.
 ///
 /// `sigaction` WITHOUT `SA_RESTART`, unlike the former `signal()` (BSD
-/// semantics: restart): the read blocked on an idle stdin now returns EINTR
-/// instead of silently going back to sleep, so the flag is seen while the
-/// server is idle — not only when the next complete line arrives.
+/// semantics: restart): a read blocked on an idle stdin returns EINTR instead
+/// of silently going back to sleep. That alone cannot close the check-then-
+/// read window, so the wake pipe is created first: a signal landing before
+/// the loop polls still leaves its byte there.
 #[cfg(unix)]
 fn install_shutdown_handlers() {
+    // SAFETY: raw fd handling through libc only. A failed `pipe` leaves
+    // `-1` in the statics and the EINTR path keeps working on its own.
     unsafe {
+        let mut fds = [0i32; 2];
+        if libc::pipe(fds.as_mut_ptr()) == 0 {
+            for fd in fds {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            WAKE_READ_FD.store(fds[0], Ordering::SeqCst);
+            WAKE_WRITE_FD.store(fds[1], Ordering::SeqCst);
+        }
         let mut sa: libc::sigaction = std::mem::zeroed();
         // The handler slot of the union (`sighandler_t`).
         sa.sa_sigaction = handle_sigint as *const () as usize;
@@ -2427,18 +2561,26 @@ pub fn run_mcp_server() {
     // cannot be loaded is reported here and fail-closes the graph mutators.
     live_state.init_graph_persistence(graph_dir_for(&doc_db_path, doc_store_persistent));
     live_state.report_graph_persistence();
-    let state = Mutex::new(live_state);
+    let state = std::sync::Arc::new(Mutex::new(live_state));
 
-    register_warm_start_spatial(
-        &state,
-        &outcome.spatial,
-        spatial_warmstart_enabled,
-        warm_start_t0,
-    );
+    if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+        // F05e: leaving — registering what an interrupted warm start managed
+        // to load only delays the exit.
+        eprintln!("[splatsdb] Warm start: spatial registration skipped (exit requested)");
+    } else {
+        register_warm_start_spatial(
+            &state,
+            &outcome.spatial,
+            spatial_warmstart_enabled,
+            warm_start_t0,
+        );
+    }
 
-    let stdin = io::stdin();
+    #[cfg(unix)]
+    let mut reader = StdinReader::new();
+    #[cfg(not(unix))]
+    let mut reader = io::stdin().lock();
     let mut stdout = io::stdout();
-    let mut reader = stdin.lock();
 
     eprintln!("[splatsdb] MCP server ready. Waiting for JSON-RPC on stdin...");
     eprintln!(
@@ -2450,25 +2592,73 @@ pub fn run_mcp_server() {
 
     // Bounded line reader (fix: `reader.lines()` buffers the ENTIRE line in
     // memory before the 10MB check below could reject it — one huge line
-    // could OOM the server). read_until under a take() cap bounds the buffer
-    // at MAX+1 bytes; the remainder of an oversized line is drained in 8KB
-    // chunks and skipped, never buffered whole.
+    // could OOM the server). `read_request_line` caps a line at MAX+1 bytes
+    // and drains the remainder of an oversized line in 8KB chunks.
     let mut raw_line: Vec<u8> = Vec::with_capacity(4096);
     // Bytes that followed an oversized line's '\n' inside a drained chunk:
     // they are the START of the next (valid) request and must NOT be thrown
-    // away, or the JSON-RPC stream desynchronizes and the next message is
-    // corrupted. They are seeded into the next line read instead.
+    // away, or the JSON-RPC stream desynchronizes. They are seeded into the
+    // next line read instead.
     let mut pending: Vec<u8> = Vec::new();
-    loop {
-        if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
-            eprintln!("[splatsdb] Shutdown requested, exiting main loop.");
-            break;
-        }
 
+    // F05e: requests run on a dispatcher thread, so an exit can bound how
+    // long a request in flight may hold the exit. Nothing else changes for
+    // the client: one request at a time, answered in order, a panic inside a
+    // handler is answered as an internal error instead of killing the stream.
+    let (request_tx, request_rx) = std::sync::mpsc::channel::<JsonRpcRequest>();
+    let (response_tx, response_rx) = std::sync::mpsc::channel::<Option<JsonRpcResponse>>();
+    let dispatch_state = state;
+    std::thread::Builder::new()
+        .name("mcp-dispatch".into())
+        .spawn(move || {
+            for req in request_rx {
+                // Defense-in-depth: a panic inside any tool handler must not
+                // kill the whole MCP stdio process — the client would lose
+                // the stream. `state` is a `&Mutex` (not UnwindSafe, by
+                // poisoning design) and `req` is not guaranteed UnwindSafe
+                // either → AssertUnwindSafe.
+                let resp = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    dispatch_request(&dispatch_state, &req)
+                })) {
+                    Ok(resp) => resp,
+                    Err(payload) => {
+                        let detail = panic_payload_detail(&payload);
+                        // Panic detail goes to server stderr only, never to
+                        // the client (same convention as api_server.rs).
+                        eprintln!(
+                            "[splatsdb] PANIC in dispatch_request (method={}): {}",
+                            req.method, detail
+                        );
+                        JsonRpcResponse {
+                            jsonrpc: "2.0".into(),
+                            id: req.id.clone(),
+                            result: None,
+                            error: Some(JsonRpcError {
+                                code: -32603,
+                                message: "Internal error".into(),
+                            }),
+                        }
+                    }
+                };
+                // The answer is queued BEFORE the wakeup byte: a loop woken
+                // by the byte always finds it.
+                if response_tx.send(Some(resp)).is_err() {
+                    break;
+                }
+                wake_loop();
+            }
+            // The dispatcher is gone: whatever waits for an answer must not hang.
+            let _ = response_tx.send(None);
+        })
+        .expect("spawn the MCP dispatcher thread");
+    let mut abandoned_in_flight = false;
+
+    while !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
         let line = match read_request_line(&mut reader, &mut raw_line, &mut pending) {
             LineRead::Eof => break,
             // A03-F15: SIGINT/SIGTERM interrupted the read — the loop head
-            // looks at the flag and leaves.
+            // looks at the flag and leaves. A partial line is never turned
+            // into a request by that.
             LineRead::Interrupted => continue,
             LineRead::Skip => {
                 // The oversized line was drained inside read_request_line.
@@ -2487,81 +2677,89 @@ pub fn run_mcp_server() {
             LineRead::Line(line) => line,
         };
 
-        {
-            if line.is_empty() {
-                continue;
+        if line.is_empty() {
+            continue;
+        }
+        if line.len() > MAX_JSONRPC_LINE_LEN {
+            eprintln!(
+                "[splatsdb] rejecting oversized JSON-RPC message ({} bytes)",
+                line.len()
+            );
+            write_rpc_error(
+                &mut stdout,
+                -32600,
+                &format!(
+                    "Invalid Request: message exceeds {} bytes",
+                    MAX_JSONRPC_LINE_LEN
+                ),
+            );
+            continue;
+        }
+
+        let req: JsonRpcRequest = match parse_jsonrpc_request(&line, &mut stdout) {
+            Ok(r) => r,
+            Err(()) => continue,
+        };
+
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            // F05e: read, but NOT run — an exit was requested while the line
+            // arrived. The client gets an explicit refusal, never a silent
+            // drop and never a success.
+            eprintln!(
+                "[splatsdb] Exit requested: '{}' (id={:?}) was read but not processed",
+                req.method, req.id
+            );
+            if req.id.is_some() {
+                let refused = JsonRpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id: req.id.clone(),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32000,
+                        message: "Server is shutting down: the request was not processed".into(),
+                    }),
+                };
+                write_response(&refused, &mut stdout);
             }
-            if line.len() > MAX_JSONRPC_LINE_LEN {
-                eprintln!(
-                    "[splatsdb] rejecting oversized JSON-RPC message ({} bytes)",
-                    line.len()
-                );
-                write_rpc_error(
-                    &mut stdout,
-                    -32600,
-                    &format!(
-                        "Invalid Request: message exceeds {} bytes",
-                        MAX_JSONRPC_LINE_LEN
-                    ),
-                );
-                continue;
-            }
+            break;
+        }
 
-            let req: JsonRpcRequest = match parse_jsonrpc_request(&line, &mut stdout) {
-                Ok(r) => r,
-                Err(()) => continue,
-            };
-
-            let is_notification = req.id.is_none() && req.method != "initialize";
-
-            // Defense-in-depth: a panic inside any tool handler must not kill
-            // the whole MCP stdio process — the client would lose the stream.
-            // `state` is a `&Mutex` (not UnwindSafe, by poisoning design) and
-            // `req` is not guaranteed UnwindSafe either → AssertUnwindSafe.
-            // dispatch_request returns JsonRpcResponse directly (handlers map
-            // their Result into error responses internally), so we only need
-            // to map the Err(panic-payload) arm. If a panic poisoned the
-            // mutex, later handlers already degrade via their
-            // `lock().map_err(...)` arms instead of panicking again.
-            let resp = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                dispatch_request(&state, &req)
-            })) {
-                Ok(resp) => resp,
-                Err(payload) => {
-                    let detail = panic_payload_detail(&payload);
-                    // Panic detail goes to server stderr only, never to the
-                    // client (same convention as api_server.rs).
-                    eprintln!(
-                        "[splatsdb] PANIC in dispatch_request (method={}): {}",
-                        req.method, detail
-                    );
-                    JsonRpcResponse {
-                        jsonrpc: "2.0".into(),
-                        id: req.id.clone(),
-                        result: None,
-                        error: Some(JsonRpcError {
-                            code: -32603,
-                            message: "Internal error".into(),
-                        }),
-                    }
+        let is_notification = req.id.is_none() && req.method != "initialize";
+        if request_tx.send(req).is_err() {
+            break; // the dispatcher is gone: nothing can be answered any more
+        }
+        match wait_for_response(&response_rx) {
+            Some(resp) => {
+                if !is_notification && resp.id.is_some() {
+                    // F05e: a forced exit (second signal) must not cut the
+                    // line in half — the signal is delivered right after it.
+                    with_shutdown_signals_blocked(|| write_response(&resp, &mut stdout));
                 }
-            };
-
-            if !is_notification && resp.id.is_some() {
-                write_response(&resp, &mut stdout);
+            }
+            None => {
+                abandoned_in_flight = true;
+                break;
             }
         }
     }
 
+    if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+        eprintln!("[splatsdb] Shutdown requested, exiting main loop.");
+    }
     let _ = stdout.flush();
     eprintln!(
         "[splatsdb] MCP server shutting down ({}).",
-        if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
-            "shutdown signal"
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            "exit signal"
         } else {
             "stdin closed"
         }
     );
+    if abandoned_in_flight {
+        // The dispatcher may still be inside the abandoned request: leave
+        // at once instead of racing it for the process exit.
+        std::process::exit(0);
+    }
 }
 
 /// (doc_id, wing, room, hall) pairs collected during warm start for spatial
@@ -2830,6 +3028,169 @@ fn warm_start_reload(
         );
     }
     outcome
+}
+
+/// How long a request in flight may keep running after the exit signal
+/// before it is abandoned (F05e). Nothing abandoned is acknowledged.
+const IN_FLIGHT_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_millis(1900);
+
+/// Wait for the dispatcher's answer to the request just handed over (F05e).
+///
+/// Without an exit request this waits as long as the request takes. Once one
+/// is pending it waits at most `IN_FLIGHT_SHUTDOWN_WAIT`: a request still
+/// running then is abandoned — `None`, no response is written, so nothing
+/// that did not finish is ever acknowledged — and the loop leaves. An answer
+/// that does arrive is truthful by construction: every mutation is persisted
+/// before its handler returns it. `None` also when the dispatcher is gone.
+fn wait_for_response(
+    responses: &std::sync::mpsc::Receiver<Option<JsonRpcResponse>>,
+) -> Option<JsonRpcResponse> {
+    let mut give_up: Option<std::time::Instant> = None;
+    loop {
+        match responses.try_recv() {
+            Ok(resp) => return resp,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            let started = std::time::Instant::now();
+            let deadline = *give_up.get_or_insert_with(|| started + IN_FLIGHT_SHUTDOWN_WAIT);
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                eprintln!(
+                    "[splatsdb] Exit requested: the request in flight did not finish within {:?}; NO response is emitted for it — whatever it did not complete is not acknowledged",
+                    IN_FLIGHT_SHUTDOWN_WAIT
+                );
+                return None;
+            }
+            poll_wake(Some(left));
+        } else {
+            poll_wake(Some(std::time::Duration::from_millis(50)));
+        }
+    }
+}
+
+/// The JSON-RPC stdin as a `BufRead` that never blocks without a wakeup
+/// path (F05e, unix): bytes come straight from fd 0 and a `read` is only
+/// issued after `poll` reports the fd readable OR the wake pipe written.
+///
+/// * An exit request arriving at ANY moment — between the loop's flag check
+///   and the read, on another thread, in the middle of a line — ends the
+///   wait: it surfaces as `ErrorKind::Interrupted`, which
+///   `read_line_capped` turns into `LineRead::Interrupted`; the partial
+///   line stays in `raw_line` and is never taken for a complete request.
+/// * Any other interruption keeps waiting and keeps the partial line.
+#[cfg(unix)]
+struct StdinReader {
+    buf: Box<[u8]>,
+    pos: usize,
+    cap: usize,
+}
+
+#[cfg(unix)]
+impl StdinReader {
+    fn new() -> Self {
+        Self {
+            buf: vec![0u8; 8 * 1024].into_boxed_slice(),
+            pos: 0,
+            cap: 0,
+        }
+    }
+
+    /// One `read` on fd 0; `Err(Interrupted)` only for a pending exit.
+    fn fill(&mut self) -> io::Result<()> {
+        loop {
+            if WAKE_READ_FD.load(Ordering::SeqCst) >= 0 && !wait_for_stdin() {
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            // SAFETY: `read` on fd 0 into `buf`; the result is ≥ 0 and ≤ len.
+            let n = unsafe {
+                libc::read(
+                    libc::STDIN_FILENO,
+                    self.buf.as_mut_ptr().cast(),
+                    self.buf.len(),
+                )
+            };
+            if n >= 0 {
+                self.pos = 0;
+                self.cap = n as usize;
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+            // Interrupted by a signal: leave only when an exit is pending.
+            if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+        }
+    }
+}
+
+/// `poll` on stdin + the wake pipe; false when an exit is pending (the
+/// caller must not read on).
+#[cfg(unix)]
+fn wait_for_stdin() -> bool {
+    let mut fds = [
+        libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: WAKE_READ_FD.load(Ordering::SeqCst),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        // SAFETY: `fds` holds two valid entries for the call.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if ready >= 0 {
+            break;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return true; // let the read report it
+        }
+        drain_wake_pipe();
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            return false;
+        }
+    }
+    drain_wake_pipe();
+    !SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
+}
+
+#[cfg(unix)]
+impl std::io::Read for StdinReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.pos == self.cap {
+            if out.is_empty() {
+                return Ok(0);
+            }
+            self.fill()?;
+        }
+        let n = out.len().min(self.cap - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+#[cfg(unix)]
+impl std::io::BufRead for StdinReader {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.pos == self.cap {
+            self.fill()?;
+        }
+        Ok(&self.buf[self.pos..self.cap])
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.pos = (self.pos + n).min(self.cap);
+    }
 }
 
 /// Outcome of one bounded line read from the JSON-RPC stdin stream.
