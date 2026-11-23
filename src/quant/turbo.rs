@@ -342,7 +342,7 @@ mod tests {
     #[test]
     fn non_finite_query_is_rejected() {
         let q = TurboQuantizer::new(16, 4, 16, 0).unwrap();
-        let code = q.encode(&vec![1.0f32; 16]).unwrap();
+        let code = q.encode(&[1.0f32; 16]).unwrap();
         let mut query = vec![0.25f32; 16];
         query[3] = f32::NEG_INFINITY;
         assert!(matches!(

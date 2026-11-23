@@ -102,14 +102,12 @@ fn rss_kb() -> (u64, u64) {
     for line in status.lines() {
         if let Some(v) = line.strip_prefix("VmRSS:") {
             rss = v
-                .trim()
                 .split_whitespace()
                 .next()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
         } else if let Some(v) = line.strip_prefix("VmHWM:") {
             hwm = v
-                .trim()
                 .split_whitespace()
                 .next()
                 .and_then(|s| s.parse().ok())

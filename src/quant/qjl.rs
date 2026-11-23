@@ -404,7 +404,7 @@ mod tests {
     fn sketch_with_wrong_projection_count_is_rejected() {
         let q = QjlQuantizer::new(8, 4, 0).unwrap();
         let other = QjlQuantizer::new(8, 8, 0).unwrap();
-        let sketch = other.sketch(&vec![1.0f32; 8]).unwrap();
+        let sketch = other.sketch(&[1.0f32; 8]).unwrap();
         assert!(q.inner_product_estimate(&sketch, &[1.0f32; 8]).is_err());
     }
 
@@ -477,7 +477,7 @@ mod tests {
     #[test]
     fn non_finite_query_is_rejected() {
         let q = QjlQuantizer::new(8, 16, 0).unwrap();
-        let sketch = q.sketch(&vec![1.0f32; 8]).unwrap();
+        let sketch = q.sketch(&[1.0f32; 8]).unwrap();
         for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let mut query = vec![0.5f32; 8];
             query[6] = value;

@@ -164,7 +164,10 @@ fn qjl_estimator_unbiased_for_non_unit_norms() {
             g.mean_estimate / g.mean_exact,
             tolerance
         );
-        if !(deviation <= tolerance) {
+        if !matches!(
+            deviation.partial_cmp(&tolerance),
+            Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal)
+        ) {
             failures.push(format!("biased: {line}"));
         }
         // Control: the pre-fix estimator equals today's estimate times sqrt(pi/2)/||x||.
