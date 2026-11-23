@@ -309,6 +309,10 @@ pub(crate) fn batch_search_cached(
 ///
 /// CUDA path: uploads dataset to GPU memory, computes distances on device.
 /// CPU fallback: ndarray-based computation (always available).
+///
+/// A query whose length is not `dim` yields an empty Vec on every path
+/// (a well-formed call returns exactly `n_rows` distances) — never a
+/// truncated or zero-padded number.
 pub fn batch_l2_distances(query: &[f32], dataset: &[f32], n_rows: usize, dim: usize) -> Vec<f32> {
     #[cfg(feature = "cuda")]
     {
@@ -322,6 +326,9 @@ pub fn batch_l2_distances(query: &[f32], dataset: &[f32], n_rows: usize, dim: us
 }
 
 /// GPU-accelerated batch cosine distance computation.
+///
+/// A query whose length is not `dim` yields an empty Vec on every path
+/// (a well-formed call returns exactly `n_rows` distances).
 pub fn batch_cosine_distances(
     query: &[f32],
     dataset: &[f32],
@@ -343,6 +350,9 @@ pub fn batch_cosine_distances(
 ///
 /// Returns (indices, distances) for top-k per query.
 /// Uses GPU when available, CPU otherwise.
+/// `queries` must hold exactly `n_queries * dim` floats; any other length
+/// yields an empty Vec on every path instead of a device out-of-bounds
+/// read or a CPU slice panic.
 pub fn batch_search(
     queries: &[f32],
     n_queries: usize,
@@ -638,9 +648,73 @@ pub fn lsh_batch_hash(
     None
 }
 
+// --- Shape contract (the CUDA and CPU paths share it) ---
+//
+// The device kernels index `query[j]` for `j < dim` and never see slice
+// lengths: a short query reads past its device allocation (an illegal memory
+// access that can poison the CUDA context for the whole process) and a long
+// one is silently truncated. The CPU fallbacks `zip`/slice, which truncates
+// or panics. Every entry point in this module gates on this before
+// uploading, launching or computing.
+
+/// `queries` must be `n_queries` rows of `dim` f32, laid out flat. Returns a
+/// description of the violated invariant, or `None` when well-formed.
+pub(crate) fn query_shape_error(len: usize, n_queries: usize, dim: usize) -> Option<String> {
+    if dim == 0 {
+        return Some("dim is 0".to_string());
+    }
+    match n_queries.checked_mul(dim) {
+        Some(expected) if len == expected => None,
+        Some(expected) => Some(format!(
+            "query buffer holds {len} floats, expected {n_queries} x {dim} = {expected}"
+        )),
+        None => Some(format!(
+            "n_queries x dim overflows usize ({n_queries} x {dim})"
+        )),
+    }
+}
+
+/// `dataset` must be `n_rows` rows of `dim` f32, laid out flat — the rule
+/// `GpuIndex::upload_dataset` enforces before any host→device copy. The CPU
+/// fallbacks slice-index the rows, so a short buffer has to be refused before
+/// indexing (it panicked) and a long one is not silently accepted either
+/// (A02-F06). Returns a description of the violated invariant, or `None`
+/// when well-formed.
+pub(crate) fn dataset_shape_error(len: usize, n_rows: usize, dim: usize) -> Option<String> {
+    if dim == 0 {
+        return Some("dim is 0".to_string());
+    }
+    match n_rows.checked_mul(dim) {
+        Some(expected) if len == expected => None,
+        Some(expected) => Some(format!(
+            "dataset buffer holds {len} floats, expected {n_rows} x {dim} = {expected}"
+        )),
+        None => Some(format!("n_rows x dim overflows usize ({n_rows} x {dim})")),
+    }
+}
+
+/// First malformed query shape seen in this process, logged exactly once
+/// (same house style as the CUDA layer: signal, never spam).
+static QUERY_SHAPE_LOG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn warn_query_shape_once(context: &str, err: &str) {
+    let msg = format!("[splatsdb] {context}: {err} — declined, no results");
+    if QUERY_SHAPE_LOG.set(msg.clone()).is_ok() {
+        eprintln!("{msg}");
+    }
+}
+
 // --- CPU implementations (always available) ---
 
 fn cpu_l2_distances(query: &[f32], dataset: &[f32], n_rows: usize, dim: usize) -> Vec<f32> {
+    if let Some(err) = query_shape_error(query.len(), 1, dim) {
+        warn_query_shape_once("batch_l2_distances", &err);
+        return Vec::new();
+    }
+    if let Some(err) = dataset_shape_error(dataset.len(), n_rows, dim) {
+        warn_query_shape_once("batch_l2_distances", &err);
+        return Vec::new();
+    }
     let mut distances = Vec::with_capacity(n_rows);
     for i in 0..n_rows {
         let row = &dataset[i * dim..(i + 1) * dim];
@@ -655,6 +729,14 @@ fn cpu_l2_distances(query: &[f32], dataset: &[f32], n_rows: usize, dim: usize) -
 }
 
 fn cpu_cosine_distances(query: &[f32], dataset: &[f32], n_rows: usize, dim: usize) -> Vec<f32> {
+    if let Some(err) = query_shape_error(query.len(), 1, dim) {
+        warn_query_shape_once("batch_cosine_distances", &err);
+        return Vec::new();
+    }
+    if let Some(err) = dataset_shape_error(dataset.len(), n_rows, dim) {
+        warn_query_shape_once("batch_cosine_distances", &err);
+        return Vec::new();
+    }
     let q_norm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-10);
     let mut distances = Vec::with_capacity(n_rows);
     for i in 0..n_rows {
@@ -675,6 +757,14 @@ fn cpu_batch_search(
     k: usize,
     metric: &str,
 ) -> Vec<(Vec<usize>, Vec<f32>)> {
+    if let Some(err) = query_shape_error(queries.len(), n_queries, dim) {
+        warn_query_shape_once("batch_search", &err);
+        return Vec::new();
+    }
+    if let Some(err) = dataset_shape_error(dataset.len(), n_vectors, dim) {
+        warn_query_shape_once("batch_search", &err);
+        return Vec::new();
+    }
     (0..n_queries)
         .map(|q| {
             let q_slice = &queries[q * dim..(q + 1) * dim];
@@ -788,6 +878,305 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A02-F06 (every build; CPU path, and the CPU fallback behind the GPU
+    /// one): a query whose length differs from `dim` used to be silently
+    /// zipped to the shorter slice — a short query returned confident wrong
+    /// distances, a long one was truncated. Both must yield NO distances.
+    #[test]
+    fn test_malformed_query_len_yields_no_distances() {
+        let dataset = [0.0f32, 0.0, 3.0, 4.0];
+        // Well-formed calls are unchanged: squared L2, one per row.
+        assert_eq!(
+            batch_l2_distances(&[1.0, 1.0], &dataset, 2, 2),
+            vec![2.0, 13.0]
+        );
+        let cos = batch_cosine_distances(&[1.0, 0.0], &dataset, 2, 2);
+        assert_eq!(cos.len(), 2);
+        assert!((cos[1] - 0.4).abs() < 1e-6);
+
+        let short = [1.0f32];
+        let long = [1.0, 1.0, 9.0];
+        for bad in [&short[..], &long[..]] {
+            assert!(
+                batch_l2_distances(bad, &dataset, 2, 2).is_empty(),
+                "query of len {} against dim 2 must yield no L2 distances",
+                bad.len()
+            );
+            assert!(
+                batch_cosine_distances(bad, &dataset, 2, 2).is_empty(),
+                "query of len {} against dim 2 must yield no cosine distances",
+                bad.len()
+            );
+        }
+    }
+
+    /// A02-F06 (every build): a flat query buffer that is not
+    /// `n_queries * dim` floats is malformed as a whole — rows cannot be
+    /// delimited. `cpu_batch_search` used to panic on the short case (slice
+    /// out of range) and mis-split the long one. It must return no results,
+    /// on the public and on the cached entry point alike.
+    #[test]
+    fn test_malformed_batch_shape_yields_no_results_without_panic() {
+        let dataset = [0.0f32, 0.0, 3.0, 4.0];
+        let good = batch_search(&[1.0, 1.0, 3.0, 3.0], 2, &dataset, 2, 2, 1, "l2");
+        assert_eq!(good.len(), 2);
+        assert_eq!(good[0].0, vec![0]);
+        assert_eq!(good[1].0, vec![1]);
+
+        let short = [1.0f32, 1.0, 3.0];
+        let long = [1.0, 1.0, 3.0, 3.0, 5.0];
+        let four = [1.0, 1.0, 3.0, 3.0];
+        for metric in ["l2", "cosine"] {
+            for (bad, n_queries) in [(&short[..], 2), (&long[..], 2), (&four[..], 3)] {
+                let results = batch_search(bad, n_queries, &dataset, 2, 2, 1, metric);
+                assert!(
+                    results.is_empty(),
+                    "{metric}: {} floats for {n_queries} queries of dim 2 must yield no results",
+                    bad.len()
+                );
+            }
+        }
+
+        let view = ndarray::ArrayView2::from_shape((2, 2), &dataset).unwrap();
+        assert!(batch_search_cached(7, &short, 2, &view, 1, "l2").is_empty());
+        let cached = batch_search_cached(7, &four, 2, &view, 1, "l2");
+        assert_eq!(cached.len(), 2);
+    }
+
+    /// A02-F06 (device path — needs a GPU with PTX; skipped elsewhere, the
+    /// orchestrator runs it on the 3090). Every GpuIndex entry point that
+    /// takes queries must decline a malformed shape BEFORE uploading or
+    /// launching: a short query is an out-of-bounds device read, a long one a
+    /// silent truncation. A valid call right afterwards must still return
+    /// exact values — the context was never poisoned.
+    /// A02-F06 (dataset side, CPU fallback): `dataset` must hold exactly
+    /// `n_rows * dim` floats — the same rule `GpuIndex::upload_dataset`
+    /// enforces before any host→device copy. A short buffer panicked on the
+    /// row slice; a long one was silently accepted. An invalid call returns
+    /// an EMPTY Vec on every path (a well-formed call returns exactly
+    /// `n_rows` distances / `n_queries` result pairs); nothing panics.
+    #[test]
+    fn test_malformed_dataset_len_yields_no_results_without_panic() {
+        let short = vec![0.0f32, 1.0, 1.0, 1.0, 1.0]; // 3 rows x dim 2 needs 6
+        let long = vec![0.0f32, 1.0, 1.0, 1.0, 1.0, 1.0, 9.9]; // trailing garbage
+        for ds in [&short, &long] {
+            assert!(cpu_l2_distances(&[0.0, 0.0], ds, 3, 2).is_empty());
+            assert!(
+                cpu_cosine_distances(&[0.0, 0.0], ds, 3, 2).is_empty(),
+                "short/long dataset must yield no cosine distances"
+            );
+            assert!(cpu_batch_search(&[0.0, 0.0], 1, ds, 3, 2, 2, "l2").is_empty());
+            assert!(cpu_batch_search(&[0.0, 0.0], 1, ds, 3, 2, 2, "cosine").is_empty());
+            // Public wrappers keep the same contract (CPU build and CUDA build).
+            assert!(batch_l2_distances(&[0.0, 0.0], ds, 3, 2).is_empty());
+            assert!(batch_cosine_distances(&[0.0, 0.0], ds, 3, 2).is_empty());
+            assert!(batch_search(&[0.0, 0.0], 1, ds, 3, 2, 2, "l2").is_empty());
+        }
+        // n_rows x dim overflows usize
+        let one = vec![0.0f32];
+        assert!(cpu_l2_distances(&[0.0, 0.0], &one, usize::MAX, 2).is_empty());
+        assert!(cpu_batch_search(&[0.0, 0.0], 1, &one, usize::MAX, 2, 2, "l2").is_empty());
+        // Well-formed: exact count, values untouched.
+        let ok = vec![0.0f32, 0.0, 3.0, 4.0, 0.0, 2.0];
+        assert_eq!(
+            cpu_l2_distances(&[0.0, 0.0], &ok, 3, 2),
+            vec![0.0, 25.0, 4.0]
+        );
+        assert_eq!(batch_l2_distances(&[0.0, 0.0], &ok, 3, 2).len(), 3);
+        assert_eq!(batch_search(&[0.0, 0.0], 1, &ok, 3, 2, 2, "l2").len(), 1);
+    }
+
+    /// A02-F01 on the device: the distance module is loaded/JIT-compiled at
+    /// most once per process however many `GpuIndex` values are built —
+    /// before the latch every construction re-loaded it (the run of this
+    /// suite at d225012 printed one "PTX module loaded" line per index). The
+    /// latch answer is stable and an index built under it still computes.
+    #[test]
+    #[cfg(feature = "cuda")]
+    fn test_cuda_distance_module_loaded_once_per_process() {
+        if !is_cuda_available() || !super::cuda_kernel::ptx_usable() {
+            eprintln!("[latch test] CUDA/PTX unavailable on this machine -> skip");
+            return;
+        }
+        let before = super::cuda_kernel::module_load_attempts();
+        let first = super::cuda_kernel::dist_module().expect("ptx_usable but no module");
+        let mut idx =
+            super::cuda_kernel::GpuIndex::new().expect("PTX usable but GpuIndex::new declined");
+        let again = super::cuda_kernel::GpuIndex::new().expect("second GpuIndex::new declined");
+        assert!(
+            super::cuda_kernel::ptx_usable(),
+            "latch answer changed within one process"
+        );
+        let after = super::cuda_kernel::module_load_attempts();
+        // Either this test triggered the single load of the process or an
+        // earlier test did: never more than one.
+        assert_eq!(
+            after,
+            before + u64::from(before == 0),
+            "distance module loaded more than once per process ({before} -> {after})"
+        );
+        assert!(
+            after <= 1,
+            "distance module loaded {after} times in one process"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &super::cuda_kernel::dist_module().unwrap()),
+            "dist_module() is not the process-wide handle"
+        );
+        drop(again);
+        // The index built under the latch still runs a PTX kernel.
+        let data = [0.0f32, 0.0, 3.0, 4.0];
+        assert!(idx.upload_dataset(&data, 2, 2));
+        let d = idx.l2_distances(&[0.0, 0.0]).expect("PTX kernel declined");
+        assert_eq!(d.len(), 2);
+        assert!(
+            d[0].is_finite() && d[1].is_finite() && d[0] <= d[1],
+            "{d:?}"
+        );
+    }
+
+    /// A02-F01 on a host WITH a GPU but WITHOUT a usable distance PTX (the
+    /// file this build compiled is missing on disk): `GpuIndex::new` must
+    /// decline BEFORE a CUDA context, a stream, an upload or a JIT, the latch
+    /// answer is final, and the CPU fallback still computes exact values. The
+    /// orchestrator runs it in its own process (`--exact`) with the PTX moved
+    /// out of the way under `gpu.lock`; on a normal host (PTX present) it
+    /// skips — the evidence is the run with the file hidden.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_no_ptx_declines_before_context_upload_or_jit() {
+        use std::path::Path;
+
+        let ptx_missing =
+            option_env!("M2M_PTX_PATH").is_none_or(|p| p.is_empty() || !Path::new(p).exists());
+        if !ptx_missing {
+            eprintln!(
+                "[no-ptx test] distance PTX present on this host -> skip (evidence is the run with the file hidden)"
+            );
+            return;
+        }
+        eprintln!(
+            "[no-ptx test] M2M_PTX_PATH={:?} missing on disk -> asserting the decline",
+            option_env!("M2M_PTX_PATH")
+        );
+        let declined = || {
+            assert!(
+                super::cuda_kernel::GpuIndex::new().is_none(),
+                "GpuIndex::new must decline without usable PTX"
+            );
+            assert_eq!(
+                super::cuda_kernel::module_load_attempts(),
+                0,
+                "no load/JIT attempt without PTX"
+            );
+            assert!(
+                !super::cuda_kernel::cuda_context_initialized(),
+                "no CUDA context without PTX"
+            );
+        };
+        declined();
+        // The latch answer is final: no retry reaches the driver either.
+        declined();
+        declined();
+        // CPU fallback usable with exact values (the CPU dataset test's
+        // fixture): the public wrappers return what the CPU path computes.
+        let ok = vec![0.0f32, 0.0, 3.0, 4.0, 0.0, 2.0];
+        assert_eq!(
+            batch_l2_distances(&[0.0, 0.0], &ok, 3, 2),
+            vec![0.0, 25.0, 4.0]
+        );
+        assert_eq!(
+            batch_l2_distances(&[0.0, 0.0], &ok, 3, 2),
+            cpu_l2_distances(&[0.0, 0.0], &ok, 3, 2)
+        );
+        assert_eq!(
+            batch_cosine_distances(&[1.0, 0.0], &ok, 3, 2),
+            cpu_cosine_distances(&[1.0, 0.0], &ok, 3, 2)
+        );
+        let top = batch_search(&[0.0, 0.0], 1, &ok, 3, 2, 2, "l2");
+        assert_eq!(top, cpu_batch_search(&[0.0, 0.0], 1, &ok, 3, 2, 2, "l2"));
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].0.len(), 2);
+        assert_eq!(top[0].0[0], 0);
+        // The public path with a GPU present: still no context, no JIT.
+        assert_eq!(super::cuda_kernel::module_load_attempts(), 0);
+        assert!(!super::cuda_kernel::cuda_context_initialized());
+        declined();
+        eprintln!(
+            "[no-ptx test] PASS: GpuIndex::new declined, load attempts 0, no CUDA context, CPU fallback exact"
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_malformed_query_shape_declined_before_launch() {
+        use cuda_kernel::GpuIndex;
+
+        if !is_cuda_available() || option_env!("M2M_PTX_PATH").is_none_or(|p| p.is_empty()) {
+            eprintln!("[shape test] CUDA/PTX unavailable on this machine -> skip GPU checks");
+            return;
+        }
+
+        let dim = 4;
+        let n = 8;
+        let dataset: Vec<f32> = (0..n * dim).map(|i| (i % 7) as f32).collect();
+        let query: Vec<f32> = (0..dim).map(|i| i as f32).collect();
+        let mut pair = query.clone();
+        pair.extend(vec![1.0f32; dim]);
+        let mut over = pair.clone();
+        over.push(0.0);
+
+        let mut idx = GpuIndex::new().expect("CUDA context");
+        assert!(idx.upload_dataset(&dataset, n, dim));
+
+        let short = &query[..dim - 1];
+        let mut long = query.clone();
+        long.push(f32::INFINITY);
+        assert!(idx.l2_distances(short).is_none());
+        assert!(idx.l2_distances(&long).is_none());
+        assert!(idx.cosine_distances(short).is_none());
+        assert!(idx.cosine_distances(&long).is_none());
+
+        for buf in [&pair[..2 * dim - 1], over.as_slice()] {
+            assert!(
+                idx.batch_l2_distances(buf, 2).is_none(),
+                "len={}",
+                buf.len()
+            );
+            for metric in ["l2", "cosine"] {
+                assert!(
+                    idx.topk_search(buf, 2, 2, metric).is_none(),
+                    "{metric}, len={}",
+                    buf.len()
+                );
+            }
+        }
+        assert!(idx.batch_l2_distances(&pair, 3).is_none());
+        assert!(idx.topk_search(&pair, 1, 2, "l2").is_none());
+        assert!(idx.cosine_distances(&pair).is_none());
+
+        // The context survived: a well-formed call is exact.
+        let gpu_l2 = idx
+            .l2_distances(&query)
+            .expect("valid query right after the malformed ones");
+        assert_eq!(gpu_l2.len(), n);
+        for i in 0..n {
+            let row = &dataset[i * dim..(i + 1) * dim];
+            let expected: f32 = query.iter().zip(row).map(|(a, b)| (a - b) * (a - b)).sum();
+            assert!(
+                (gpu_l2[i] - expected).abs() <= 1e-3 * (1.0 + expected),
+                "row {i}: gpu={} cpu={expected}",
+                gpu_l2[i]
+            );
+        }
+        let top = idx
+            .topk_search(&pair, 2, 2, "l2")
+            .expect("valid batch right after the malformed ones");
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].0.len(), 2);
+        assert!(idx.is_loaded());
     }
 
     /// Test that CUDA pipeline actually works on this machine (GPU upload/download/verify).
