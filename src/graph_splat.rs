@@ -160,6 +160,25 @@ pub struct GaussianGraphStore {
     synced_len: AtomicU64,
     synced_hash: AtomicU64,
     synced_set: AtomicBool,
+    /// Nodes of the loaded state file refused per node (F05e), with the
+    /// refusal reason; never serialized — they live on in the byte-exact
+    /// copy of the original file (`GRAPH_LEGACY_BACKUP_FILENAME`).
+    quarantined: Vec<QuarantinedNode>,
+    /// Edges dropped at load because an endpoint was quarantined.
+    quarantined_edges: usize,
+}
+
+/// Byte-exact copy of a state file that was loaded WITH quarantined nodes
+/// (F05e): written atomically before anything may overwrite the live file,
+/// never replaced afterwards — it is always the FIRST original of that dir.
+pub const GRAPH_LEGACY_BACKUP_FILENAME: &str = "graph_state.json.pre-quarantine";
+
+/// A node of a state file refused at load (F05e).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantinedNode {
+    pub id: usize,
+    /// `GraphError` text of the refusal (empty / non-finite embedding).
+    pub reason: String,
 }
 
 impl GaussianGraphStore {
@@ -177,6 +196,8 @@ impl GaussianGraphStore {
             synced_len: AtomicU64::new(0),
             synced_hash: AtomicU64::new(0),
             synced_set: AtomicBool::new(false),
+            quarantined: Vec::new(),
+            quarantined_edges: 0,
         }
     }
 
@@ -337,16 +358,7 @@ impl GaussianGraphStore {
         relation_type: &str,
         weight: f64,
     ) -> Result<bool, GraphError> {
-        if !weight.is_finite() {
-            return Err(GraphError::InvalidWeight);
-        }
-        if !self.nodes.contains_key(&source_id) {
-            return Err(GraphError::NodeNotFound { id: source_id });
-        }
-        if !self.nodes.contains_key(&target_id) {
-            return Err(GraphError::NodeNotFound { id: target_id });
-        }
-        if self.has_relation(source_id, target_id, relation_type) {
+        if self.check_relation(source_id, target_id, relation_type, weight)? {
             return Ok(false);
         }
 
@@ -360,6 +372,29 @@ impl GaussianGraphStore {
         self.outgoing.entry(source_id).or_default().push(edge_idx);
         self.incoming.entry(target_id).or_default().push(edge_idx);
         Ok(true)
+    }
+
+    /// Whether `(source, target, relation_type)` exists — after the same
+    /// validations `add_relation` does, so a repeat answers exactly like the
+    /// mutation would (`NodeNotFound` / `InvalidWeight` first, never a
+    /// hidden "already there").
+    pub fn check_relation(
+        &self,
+        source_id: usize,
+        target_id: usize,
+        relation_type: &str,
+        weight: f64,
+    ) -> Result<bool, GraphError> {
+        if !weight.is_finite() {
+            return Err(GraphError::InvalidWeight);
+        }
+        if !self.nodes.contains_key(&source_id) {
+            return Err(GraphError::NodeNotFound { id: source_id });
+        }
+        if !self.nodes.contains_key(&target_id) {
+            return Err(GraphError::NodeNotFound { id: target_id });
+        }
+        Ok(self.has_relation(source_id, target_id, relation_type))
     }
 
     /// Whether the exact relation `(source, target, relation_type)` exists.
@@ -638,6 +673,16 @@ impl GaussianGraphStore {
         }
     }
 
+    /// Nodes of the loaded state file that were refused (F05e).
+    pub fn quarantined_nodes(&self) -> &[QuarantinedNode] {
+        &self.quarantined
+    }
+
+    /// Edges dropped at load because an endpoint was quarantined (F05e).
+    pub fn n_quarantined_edges(&self) -> usize {
+        self.quarantined_edges
+    }
+
     /// Persist nodes + edges to `<dir>/graph_state.json`, crash-safe (A04-F10).
     ///
     /// * Atomic: unique temp file in the same directory → `write_all` +
@@ -703,6 +748,24 @@ impl GaussianGraphStore {
         let data = std::fs::read(&path)
             .map_err(|e| GraphError::Io(format!("read {}: {}", path.display(), e)))?;
         let store = Self::decode(&data, &path)?;
+        if !store.quarantined.is_empty() {
+            // F05e: the original bytes survive the quarantine. The copy is
+            // written (atomically) BEFORE anything may overwrite the live
+            // file; if it cannot be written, loading fails closed and the
+            // mutators stay refused. An existing copy is never replaced.
+            let backup = dir.as_ref().join(GRAPH_LEGACY_BACKUP_FILENAME);
+            match backup.try_exists() {
+                Ok(false) => replace_file_atomically(&backup, &data).map_err(|e| {
+                    GraphError::Io(format!(
+                        "preserve the original state {} as {}: {e} (the file was left untouched; graph mutations stay refused until it can be written)",
+                        path.display(),
+                        backup.display()
+                    ))
+                })?,
+                Ok(true) => {}
+                Err(e) => return Err(GraphError::Io(format!("access {}: {e}", backup.display()))),
+            }
+        }
         store.set_synced(Some(fingerprint(&data)));
         Ok(store)
     }
@@ -736,10 +799,32 @@ impl GaussianGraphStore {
         // a node of another dimension, empty or non-finite, is a corrupt
         // state: refused here, never searched as "similarity 0.0".
         store.dim = doc.dim;
+        let mut refused: Vec<usize> = Vec::new();
         for node in doc.nodes {
-            Self::validate_embedding(&node.embedding, "state file")
-                .and_then(|()| store.check_dim(&node.embedding, "state file"))
-                .map_err(|e| GraphError::Io(format!("parse {}: {e}", path.display())))?;
+            let checked = Self::validate_embedding(&node.embedding, "state file")
+                .and_then(|()| store.check_dim(&node.embedding, "state file"));
+            match checked {
+                Ok(()) => {}
+                // F05e: a node whose vector is EMPTY or NON-FINITE is a
+                // defect of that node alone (a pre-F05d build accepted and
+                // persisted `[]`): quarantine it and keep the rest of the
+                // graph usable. Everything else — another dimension, a
+                // vector over the bound — still fails the WHOLE file closed
+                // (A04-F12).
+                Err(
+                    e @ (GraphError::EmptyEmbedding { .. } | GraphError::NonFiniteEmbedding { .. }),
+                ) => {
+                    store.quarantined.push(QuarantinedNode {
+                        id: node.id,
+                        reason: e.to_string(),
+                    });
+                    refused.push(node.id);
+                    continue;
+                }
+                Err(e) => {
+                    return Err(GraphError::Io(format!("parse {}: {e}", path.display())));
+                }
+            }
             store.dim.get_or_insert(node.embedding.len());
             let id = node.id;
             if store.nodes.insert(id, node).is_some() {
@@ -772,6 +857,11 @@ impl GaussianGraphStore {
         // F05d may repeat a relation (add_relation did not dedupe) — the
         // first occurrence wins, so a loaded degree is never inflated.
         for edge in doc.edges {
+            // An edge of a quarantined node goes with it (counted, reported).
+            if refused.contains(&edge.source_id) || refused.contains(&edge.target_id) {
+                store.quarantined_edges += 1;
+                continue;
+            }
             if !store.nodes.contains_key(&edge.source_id) {
                 return Err(GraphError::NodeNotFound { id: edge.source_id });
             }
@@ -913,6 +1003,8 @@ impl Clone for GaussianGraphStore {
         copy.next_id = self.next_id;
         copy.dim = self.dim;
         copy.set_synced(self.synced());
+        copy.quarantined = self.quarantined.clone();
+        copy.quarantined_edges = self.quarantined_edges;
         copy
     }
 }

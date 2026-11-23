@@ -698,6 +698,17 @@ impl McpState {
             ),
             (Some(dir), None) => {
                 let path = dir.join(crate::graph_splat::GRAPH_STATE_FILENAME);
+                let quarantined = self.graph.quarantined_nodes();
+                if !quarantined.is_empty() {
+                    let ids: Vec<usize> = quarantined.iter().map(|q| q.id).collect();
+                    eprintln!(
+                        "[splatsdb] graph state: QUARANTINED {} node(s) of the state file (embedding empty or non-finite — a defect of those nodes alone; the rest of the graph is loaded and mutable): ids={ids:?} reasons={:?}; {} edge(s) pointing at them were dropped with them. The original file is preserved byte-for-byte as {} and the next save writes the graph without the refused nodes",
+                        quarantined.len(),
+                        quarantined.iter().map(|q| q.reason.as_str()).collect::<Vec<_>>(),
+                        self.graph.n_quarantined_edges(),
+                        dir.join(crate::graph_splat::GRAPH_LEGACY_BACKUP_FILENAME).display()
+                    );
+                }
                 if path.exists() {
                     eprintln!(
                         "[splatsdb] graph state: {} (loaded {} nodes / {} edges; durable: every graph mutation is saved here before it is answered)",
@@ -722,6 +733,8 @@ impl McpState {
     /// live graph: a failed save leaves the live graph equal to the last
     /// persisted state (the failed node is invisible and its id unused) and
     /// answers with an error instead of a node id that nobody stored.
+    const GRAPH_UNREADABLE: &str = "graph state file is unreadable ({err}): the mutation was NOT applied — the file was left untouched and is never overwritten; fix or remove it and restart the server";
+
     fn graph_mutate<T>(
         &mut self,
         mutation: impl FnOnce(
@@ -729,15 +742,56 @@ impl McpState {
         ) -> Result<T, crate::graph_splat::GraphError>,
     ) -> Result<T, String> {
         if let Some(err) = &self.graph_load_error {
-            return Err(format!(
-                "graph state file is unreadable ({err}): the mutation was NOT applied — the file was left untouched and is never overwritten; fix or remove it and restart the server"
-            ));
+            return Err(Self::GRAPH_UNREADABLE.replace("{err}", err));
         }
         let Some(dir) = self.graph_dir.clone() else {
             return mutation(&mut self.graph).map_err(|e| e.to_string());
         };
         let mut next = self.graph.clone();
         let outcome = mutation(&mut next).map_err(|e| e.to_string())?;
+        self.persist_graph(next, dir)?;
+        Ok(outcome)
+    }
+
+    /// `graph_mutate` for a mutation that may be a NO-OP (F05e). `probe`
+    /// runs against the LIVE graph and returns `Some(value)` when the
+    /// mutation would change nothing: that value is answered at once — no
+    /// clone, no file write. (A repeated `add_relation` used to clone and
+    /// rewrite the whole state file: O(file) per no-op, and a spurious
+    /// OutOfSync refusal whenever another writer had touched the file.)
+    /// `None` → apply `mutation` exactly like `graph_mutate`.
+    fn graph_mutate_probed<T>(
+        &mut self,
+        probe: impl FnOnce(
+            &crate::graph_splat::GaussianGraphStore,
+        ) -> Result<Option<T>, crate::graph_splat::GraphError>,
+        mutation: impl FnOnce(
+            &mut crate::graph_splat::GaussianGraphStore,
+        ) -> Result<T, crate::graph_splat::GraphError>,
+    ) -> Result<T, String> {
+        if let Some(err) = &self.graph_load_error {
+            return Err(Self::GRAPH_UNREADABLE.replace("{err}", err));
+        }
+        let Some(dir) = self.graph_dir.clone() else {
+            return mutation(&mut self.graph).map_err(|e| e.to_string());
+        };
+        if let Some(value) = probe(&self.graph).map_err(|e| e.to_string())? {
+            return Ok(value);
+        }
+        let mut next = self.graph.clone();
+        let outcome = mutation(&mut next).map_err(|e| e.to_string())?;
+        self.persist_graph(next, dir)?;
+        Ok(outcome)
+    }
+
+    /// Save `next` atomically and only then make it the live graph (see
+    /// `graph_mutate`): a failed save leaves the live graph equal to the
+    /// last persisted state.
+    fn persist_graph(
+        &mut self,
+        next: crate::graph_splat::GaussianGraphStore,
+        dir: std::path::PathBuf,
+    ) -> Result<(), String> {
         match next.save_to_dir(dir.as_path()) {
             Ok(path) => {
                 eprintln!(
@@ -757,7 +811,7 @@ impl McpState {
             }
         }
         self.graph = next;
-        Ok(outcome)
+        Ok(())
     }
 
     /// Whether graph mutations are persisted before they are answered.
@@ -783,6 +837,8 @@ impl McpState {
                     .to_string()
             }),
             "error": self.graph_load_error,
+            "quarantined_nodes": self.graph.quarantined_nodes().iter().map(|q| q.id).collect::<Vec<_>>(),
+            "quarantined_edges": self.graph.n_quarantined_edges(),
         })
     }
 
@@ -1735,9 +1791,16 @@ fn handle_graph_add_relation(state: &Mutex<McpState>, params: &Value) -> Result<
         eprintln!("[mcp] mutex poisoned: {}", e);
         "internal server error".to_string()
     })?;
-    // Idempotent: a relation that already exists is not inserted again.
-    let created =
-        s.graph_mutate(|g| g.add_relation(source_id, target_id, relation_type, weight))?;
+    // Idempotent: a relation that already exists is not inserted again —
+    // and (F05e) not SAVED again either: the repeat is answered from the
+    // live graph without cloning or rewriting the state file.
+    let created = s.graph_mutate_probed(
+        |g| {
+            g.check_relation(source_id, target_id, relation_type, weight)
+                .map(|exists| exists.then_some(false))
+        },
+        |g| g.add_relation(source_id, target_id, relation_type, weight),
+    )?;
 
     eprintln!(
         "[mcp] graph_add_relation: {} --{}--> {} (w={}, created={})",
