@@ -300,6 +300,9 @@ struct WarmStartStats {
     unindexed: usize,
     /// Rows whose stored vector was refused (left untouched on disk).
     quarantined: usize,
+    /// Legacy rows whose vector came from a real embed call but could not
+    /// be written back to SQLite (indexed for this session only, F05e).
+    backfill_failed: usize,
 }
 
 /// Everything `run_mcp_server` builds its state from after a warm start.
@@ -632,6 +635,7 @@ impl McpState {
                 "stored_simcos": self.warm_start.stored_simcos,
                 "stored_provided": self.warm_start.stored_provided,
                 "reembedded": self.warm_start.reembedded,
+                "backfill_failed": self.warm_start.backfill_failed,
                 "unindexed": self.warm_start.unindexed,
                 "quarantined": self.warm_start.quarantined,
             }
@@ -2879,6 +2883,8 @@ fn warm_start_reload(
     };
     let stats = &mut outcome.stats;
     let mut quarantined: Vec<String> = Vec::new();
+    // Legacy rows no real embed call could index (reported with their ids).
+    let mut unindexed_ids: Vec<String> = Vec::new();
     let dim = store.get_statistics().embedding_dim;
     let total = doc_store.count(false).unwrap_or(0);
     stats.documents = total;
@@ -2931,23 +2937,31 @@ fn warm_start_reload(
                         quarantined.push(format!("{doc_id}: {why}"));
                         continue;
                     }
-                    (None, None) => match get_embedding_labeled(&text, dim) {
-                        Ok((vector, src)) => {
-                            // Backfill the legacy row so the next restart
-                            // needs no service. A write that cannot happen is
-                            // reported, not hidden.
-                            if let Err(e) =
-                                doc_store.set_embedding(doc_id, &vector, provenance_of(src))
-                            {
-                                eprintln!(
-                                    "[splatsdb] WARNING: Warm start: could not persist the embedding of legacy doc {doc_id}: {e}"
-                                );
+                    // F05e: a legacy row is re-embedded by the REAL service
+                    // or not at all — the SimCos text-hash is never written
+                    // into a stored vector behind the operator's back, and
+                    // `reembedded` only counts a vector that a real call
+                    // computed AND that was written back.
+                    (None, None) => match get_embedding_strict(&text, dim) {
+                        Some(vector) => {
+                            match doc_store.set_embedding(
+                                doc_id,
+                                &vector,
+                                provenance_of(EmbeddingSource::Real),
+                            ) {
+                                Ok(_) => stats.reembedded += 1,
+                                Err(e) => {
+                                    eprintln!(
+                                        "[splatsdb] WARNING: Warm start: could not persist the embedding of legacy doc {doc_id}: {e}"
+                                    );
+                                    stats.backfill_failed += 1;
+                                }
                             }
-                            stats.reembedded += 1;
-                            (vector, provenance_of(src))
+                            (vector, provenance_of(EmbeddingSource::Real))
                         }
-                        Err(_) => {
+                        None => {
                             stats.unindexed += 1;
+                            unindexed_ids.push(doc_id.to_string());
                             continue;
                         }
                     },
@@ -2983,7 +2997,9 @@ fn warm_start_reload(
                     );
                 }
             }
-            if !docs.is_empty() {
+            // F05e: leaving — indexing what an interrupted warm start loaded
+            // only delays the exit.
+            if !docs.is_empty() && !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
                 store.hnsw_sync_incremental();
             }
             if total > 0 {
@@ -3005,8 +3021,14 @@ fn warm_start_reload(
     }
     if stats.unindexed > 0 {
         eprintln!(
-            "[splatsdb] WARNING: Warm start: {} documents were NOT indexed (no stored vector — legacy rows — and no usable embedding now: embed service down and the SimCos fallback is not authorized). They stay in SQLite but are invisible to search until a restart with the embed service up, with SPLATSDB_ALLOW_SIMCOS=1, or until they are re-stored.",
-            stats.unindexed
+            "[splatsdb] WARNING: Warm start: {} documents were NOT indexed — QUARANTINED legacy rows without a stored vector: the embed service did not answer, and a warm start never stores the SimCos text-hash as their vector (a restart with the service up makes one real call per row and stores it; until then they are invisible to search). Left untouched in SQLite. ids: {}",
+            stats.unindexed,
+            unindexed_ids
+                .iter()
+                .take(50)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     if stats.quarantined > 0 {
