@@ -499,16 +499,15 @@ fn c2_append_does_not_report_success_when_the_shard_cannot_be_written() {
     let before = std::fs::read(shard_path(&dir)).unwrap();
     let shard = shard_path(&dir);
     let vectors_dir = shard.parent().unwrap();
-    let mut perms = std::fs::metadata(vectors_dir).unwrap().permissions();
+    let original_perms = std::fs::metadata(vectors_dir).unwrap().permissions();
+    let mut perms = original_perms.clone();
     perms.set_readonly(true);
     std::fs::set_permissions(vectors_dir, perms).unwrap();
 
     let result = cli(&dir, DIM, &["append", "--input", input.to_str().unwrap()]);
 
     // restaurar primero: el cleanup tiene que funcionar aunque falle un assert
-    let mut perms = std::fs::metadata(vectors_dir).unwrap().permissions();
-    perms.set_readonly(false);
-    std::fs::set_permissions(vectors_dir, perms).unwrap();
+    std::fs::set_permissions(vectors_dir, original_perms).unwrap();
 
     let (status, out, err) = result;
     assert_eq!(

@@ -135,6 +135,7 @@ impl DataDirLock {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)?;
         match file.try_lock() {
             Ok(()) => {}
