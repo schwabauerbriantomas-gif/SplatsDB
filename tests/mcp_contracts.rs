@@ -582,7 +582,7 @@ fn f13_ephemeral_doc_store_is_reported_as_not_persisted() {
 fn f11_doc_del_and_re_store_leave_no_orphans_before_and_after_restart() {
     let tmp = scratch("f11");
     let doc_db = tmp.join("docs.db");
-    let mut dim: usize = 0;
+    let mut dim: usize;
 
     let doc_emb = |dim: usize, i: f64| emb(dim, 1.0, 0.3 * i);
 
@@ -788,7 +788,7 @@ fn f11_doc_del_and_re_store_leave_no_orphans_before_and_after_restart() {
 fn f10_warm_start_without_service_indexes_nothing_and_warns() {
     let tmp = scratch("f10_warm");
     let doc_db = tmp.join("docs.db");
-    let mut dim: usize = 0;
+    let mut dim: usize;
     {
         let mut srv = spawn_server(&doc_db, &[]);
         dim = srv.status(1)["dimension"].as_u64().expect("dimension") as usize;

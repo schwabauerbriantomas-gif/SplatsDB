@@ -948,7 +948,6 @@ fn handle_search(state: &Mutex<McpState>, params: &Value) -> Result<Value, Strin
         return Ok(json!({ "results": [] }));
     }
 
-    let k = top_k.min(n_active);
     let embedding_opt = params["embedding"].as_array().map(|arr| {
         arr.iter()
             .filter_map(|v| v.as_f64().map(|f| f as f32))
@@ -1732,7 +1731,6 @@ fn handle_verbatim_search(state: &Mutex<McpState>, params: &Value) -> Result<Val
         return Ok(json!({ "results": [], "message": "No documents in store" }));
     }
 
-    let k = top_k.min(n_active);
     let (embedding, embedding_src) = match parse_embedding_param(params) {
         Some(e) => (e, EmbeddingSource::Provided),
         None => get_embedding_labeled(query, dim)?,
