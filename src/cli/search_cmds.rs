@@ -196,7 +196,10 @@ pub fn cmd_quant_search(
     let dim = vectors.ncols();
     let qcfg = QuantConfig::for_search(dim);
     let mut qstore = QuantizedStore::new(dim, qcfg).unwrap();
-    qstore.add_batch(&vectors, 0);
+    if let Err(e) = qstore.add_batch(&vectors, 0) {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
 
     let t0 = std::time::Instant::now();
     let results = qstore.search(&q_vec.view(), top_k);

@@ -248,7 +248,12 @@ impl SplatStore {
 
         // Quantized store
         if let Some(ref mut qs) = self.quant_store {
-            qs.add_batch(&embeddings, 0);
+            if let Err(e) = qs.add_batch(&embeddings, 0) {
+                eprintln!(
+                    "[splatsdb] Warning: quantized store add_batch failed: {}",
+                    e
+                );
+            }
         }
 
         // Candidate backend (HNSW today) — secondary index
@@ -287,7 +292,12 @@ impl SplatStore {
             let embeddings = self.mu.slice(ndarray::s![..self.n_active, ..]).to_owned();
             self.engine.index(Some(embeddings.clone()));
             if let Some(ref mut qs) = self.quant_store {
-                qs.add_batch(&embeddings, 0);
+                if let Err(e) = qs.add_batch(&embeddings, 0) {
+                    eprintln!(
+                        "[splatsdb] Warning: quantized store add_batch failed: {}",
+                        e
+                    );
+                }
             }
             if let Some(ref mut lsh) = self.lsh {
                 lsh.index(embeddings);

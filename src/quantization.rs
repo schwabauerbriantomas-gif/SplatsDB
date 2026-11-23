@@ -108,33 +108,69 @@ impl QuantizedStore {
         })
     }
 
-    /// Encode and store a batch of vectors in parallel.
-    pub fn add_batch(&mut self, vectors: &Array2<f32>, start_id: u64) -> usize {
+    /// Encode and store a batch of vectors in parallel; row `i` gets id `start_id + i`.
+    ///
+    /// Atomic: the batch is validated and encoded into temporary buffers first. A batch
+    /// whose column count differs from the store dimension, that contains any NaN/±Inf,
+    /// or with any row that fails to encode returns `Err` and leaves ids, codes and
+    /// `len()` exactly as they were. Ids are pushed only together with the codes that
+    /// were actually encoded.
+    pub fn add_batch(&mut self, vectors: &Array2<f32>, start_id: u64) -> Result<usize, String> {
         let n = vectors.nrows();
+        if vectors.ncols() != self.dim {
+            return Err(format!(
+                "add_batch: batch has {} columns, store dimension is {}",
+                vectors.ncols(),
+                self.dim
+            ));
+        }
+        // Validate before touching any state: a non-finite value must never become a code.
+        if let Some(row) = (0..n)
+            .into_par_iter()
+            .find_any(|&i| vectors.row(i).iter().any(|v| !v.is_finite()))
+        {
+            let col = vectors
+                .row(row)
+                .iter()
+                .position(|v| !v.is_finite())
+                .unwrap_or(0);
+            return Err(format!(
+                "add_batch: non-finite value (NaN/Inf) at row {row}, col {col}"
+            ));
+        }
+        let new_ids = (0..n)
+            .map(|i| start_id.checked_add(i as u64))
+            .collect::<Option<Vec<u64>>>()
+            .ok_or_else(|| format!("add_batch: id overflow with start_id={start_id}"))?;
+
         if let Some(ref turbo) = self.turbo {
-            let new_codes: Vec<TurboCode> = (0..n)
+            let new_codes = (0..n)
                 .into_par_iter()
-                .filter_map(|i| {
+                .map(|i| {
                     let v: Vec<f32> = vectors.row(i).to_vec();
-                    turbo.encode(&v).ok()
+                    turbo
+                        .encode(&v)
+                        .map_err(|e| format!("add_batch: row {i}: {e}"))
                 })
-                .collect();
+                .collect::<Result<Vec<TurboCode>, String>>()?;
             self.codes_turbo.extend(new_codes);
         } else if let Some(ref polar) = self.polar {
-            let new_codes: Vec<PolarCode> = (0..n)
+            let new_codes = (0..n)
                 .into_par_iter()
-                .filter_map(|i| {
+                .map(|i| {
                     let v: Vec<f32> = vectors.row(i).to_vec();
-                    polar.encode(&v).ok()
+                    polar
+                        .encode(&v)
+                        .map_err(|e| format!("add_batch: row {i}: {e}"))
                 })
-                .collect();
+                .collect::<Result<Vec<PolarCode>, String>>()?;
             self.codes_polar.extend(new_codes);
+        } else {
+            return Err("add_batch: store has no quantizer".to_string());
         }
 
-        for i in 0..n {
-            self.ids.push(start_id + i as u64);
-        }
-        n
+        self.ids.extend(new_ids);
+        Ok(n)
     }
 
     /// Encode a single vector.
@@ -154,6 +190,9 @@ impl QuantizedStore {
                 }
                 Err(_) => return false,
             }
+        } else {
+            // No quantizer: never push an id without a code.
+            return false;
         }
         self.ids.push(id);
         true
@@ -300,7 +339,7 @@ mod tests {
         let mut store = QuantizedStore::new(dim, config).unwrap();
 
         let vectors = random_vectors(100, dim, 42);
-        store.add_batch(&vectors, 0);
+        store.add_batch(&vectors, 0).unwrap();
         assert_eq!(store.len(), 100);
         assert!(!store.is_empty());
     }
@@ -312,7 +351,7 @@ mod tests {
         let mut store = QuantizedStore::new(dim, config).unwrap();
 
         let vectors = random_vectors(100, dim, 42);
-        store.add_batch(&vectors, 0);
+        store.add_batch(&vectors, 0).unwrap();
 
         // Search with the first vector — should find itself near the top
         let results = store.search(&vectors.row(0), 5);
@@ -334,7 +373,7 @@ mod tests {
         let mut store = QuantizedStore::new(dim, config).unwrap();
 
         let vectors = random_vectors(100, dim, 42);
-        store.add_batch(&vectors, 0);
+        store.add_batch(&vectors, 0).unwrap();
 
         let results = store.search(&vectors.row(0), 5);
         assert_eq!(results.len(), 5);
@@ -360,7 +399,7 @@ mod tests {
         let mut store = QuantizedStore::new(dim, config).unwrap();
 
         let vectors = random_vectors(50, dim, 42);
-        store.add_batch(&vectors, 0);
+        store.add_batch(&vectors, 0).unwrap();
 
         let mem = store.memory_usage();
         let raw = 50 * dim * 4; // f32

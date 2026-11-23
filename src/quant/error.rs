@@ -2,13 +2,24 @@
 
 #[derive(Debug)]
 pub enum QuantError {
-    DimensionMismatch { expected: usize, got: usize },
-    OddDimension { got: usize },
+    DimensionMismatch {
+        expected: usize,
+        got: usize,
+    },
+    OddDimension {
+        got: usize,
+    },
     ZeroDimension,
-    InvalidBitWidth { got: u8 },
+    InvalidBitWidth {
+        got: u8,
+    },
     ZeroProjectionCount,
     RotationFailed(String),
     MalformedCode(String),
+    /// Input vector holds NaN or +/-Inf at `index`; it can never become a valid code.
+    NonFiniteValue {
+        index: usize,
+    },
 }
 
 impl std::fmt::Display for QuantError {
@@ -23,6 +34,9 @@ impl std::fmt::Display for QuantError {
             Self::ZeroProjectionCount => write!(f, "projection count must be non-zero"),
             Self::RotationFailed(r) => write!(f, "rotation failed: {}", r),
             Self::MalformedCode(r) => write!(f, "malformed code: {}", r),
+            Self::NonFiniteValue { index } => {
+                write!(f, "non-finite value (NaN/Inf) at index {index}")
+            }
         }
     }
 }

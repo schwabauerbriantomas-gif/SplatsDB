@@ -251,7 +251,13 @@ pub fn cmd_quant_index(input: PathBuf, bits: u8, algorithm: String, seed: u64) {
         }
     };
     let t0 = std::time::Instant::now();
-    let indexed = qstore.add_batch(&vectors, 0);
+    let indexed = match qstore.add_batch(&vectors, 0) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Error: quantization failed: {}", e);
+            std::process::exit(1);
+        }
+    };
     let elapsed = t0.elapsed();
 
     let ratio = qstore.compression_ratio();

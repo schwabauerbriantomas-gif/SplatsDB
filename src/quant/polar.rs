@@ -82,6 +82,10 @@ impl PolarQuantizer {
                 got: vector.len(),
             });
         }
+        // NaN/Inf would otherwise become a NaN radius and a "valid" angle index 0.
+        if let Some(index) = vector.iter().position(|v| !v.is_finite()) {
+            return Err(QuantError::NonFiniteValue { index });
+        }
         let mut rotated = vec![0.0f32; self.dim];
         self.rotation.apply(vector, &mut rotated)?;
 

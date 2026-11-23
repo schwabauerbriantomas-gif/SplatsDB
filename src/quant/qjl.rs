@@ -62,6 +62,10 @@ impl QjlQuantizer {
                 got: vector.len(),
             });
         }
+        // A non-finite vector has no meaningful projection signs.
+        if let Some(index) = vector.iter().position(|v| !v.is_finite()) {
+            return Err(QuantError::NonFiniteValue { index });
+        }
         let g = self.projection_matrix();
         let signs: Vec<i8> = g
             .iter()
