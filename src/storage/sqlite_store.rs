@@ -481,19 +481,54 @@ pub struct StoredDoc {
 }
 
 impl MetadataStore for SqliteMetadataStore {
-    /// Insert or replace a document record — WITHOUT a vector: the whole
-    /// row is replaced, so a re-upsert by a writer that does not know about
-    /// embeddings (CLI / HTTP) drops the previous vector rather than keeping
-    /// one that may describe another text. Use `upsert_with_embedding` to
-    /// persist document and vector together.
+    /// Insert or replace a document record — WITHOUT a vector: this is the
+    /// CLI / HTTP writer, which does not know about embeddings.
+    ///
+    /// F05c: the document columns are replaced as before, but a vector that
+    /// is already stored is no longer collateral damage. When the row exists
+    /// and keeps its text, `embedding` and `embedding_source` stay untouched
+    /// (byte-for-byte): a metadata-only update must not cost a re-embedding.
+    /// The vector is retired only when it would lie — the text changed — or
+    /// when the row stops being live; the next warm start re-embeds it.
+    /// `upsert_with_embedding` replaces a vector explicitly and `soft_delete`
+    /// retires it. One statement, one transaction.
     fn upsert(
         &self,
         record: &DocumentRecord,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.connection()?;
-        conn.execute(
+        // Ask the schema, not only the cached flag: on a database whose
+        // in-place migration could not run the columns may be absent (nothing
+        // to keep) or already there (a startup race lost the flag).
+        let keeps_vectors = self.embedding_schema.load(Ordering::Relaxed)
+            || (has_column(&conn, EMBEDDING_COL)? && has_column(&conn, EMBEDDING_SOURCE_COL)?);
+        let sql = if keeps_vectors {
+            "INSERT INTO documents (id, shard_idx, vector_idx, metadata, document, deleted, created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(id) DO UPDATE SET
+                 shard_idx=excluded.shard_idx,
+                 vector_idx=excluded.vector_idx,
+                 metadata=excluded.metadata,
+                 document=excluded.document,
+                 deleted=excluded.deleted,
+                 created_at=excluded.created_at,
+                 updated_at=excluded.updated_at,
+                 embedding=CASE
+                     WHEN documents.document IS excluded.document AND excluded.deleted=0
+                     THEN documents.embedding
+                     ELSE NULL
+                 END,
+                 embedding_source=CASE
+                     WHEN documents.document IS excluded.document AND excluded.deleted=0
+                     THEN documents.embedding_source
+                     ELSE NULL
+                 END"
+        } else {
             "INSERT OR REPLACE INTO documents (id, shard_idx, vector_idx, metadata, document, deleted, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"
+        };
+        conn.execute(
+            sql,
             params![
                 record.id,
                 record.shard_idx,
