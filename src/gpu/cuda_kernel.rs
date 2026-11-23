@@ -90,6 +90,12 @@ pub(crate) fn module_load_attempts() -> u64 {
     MODULE_LOAD_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// True once this process asked the driver for a CUDA context (read-only
+/// receipt for the without-PTX test: it must stay `false` there).
+pub(crate) fn cuda_context_initialized() -> bool {
+    CUDA_CONTEXT.get().is_some()
+}
+
 /// The process-wide distance module, or `None` when PTX is unusable.
 pub(crate) fn dist_module() -> Option<Arc<CudaModule>> {
     DIST_MODULE

@@ -1037,6 +1037,78 @@ mod tests {
         );
     }
 
+    /// A02-F01 on a host WITH a GPU but WITHOUT a usable distance PTX (the
+    /// file this build compiled is missing on disk): `GpuIndex::new` must
+    /// decline BEFORE a CUDA context, a stream, an upload or a JIT, the latch
+    /// answer is final, and the CPU fallback still computes exact values. The
+    /// orchestrator runs it in its own process (`--exact`) with the PTX moved
+    /// out of the way under `gpu.lock`; on a normal host (PTX present) it
+    /// skips — the evidence is the run with the file hidden.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn test_cuda_no_ptx_declines_before_context_upload_or_jit() {
+        use std::path::Path;
+
+        let ptx_missing =
+            option_env!("M2M_PTX_PATH").is_none_or(|p| p.is_empty() || !Path::new(p).exists());
+        if !ptx_missing {
+            eprintln!(
+                "[no-ptx test] distance PTX present on this host -> skip (evidence is the run with the file hidden)"
+            );
+            return;
+        }
+        eprintln!(
+            "[no-ptx test] M2M_PTX_PATH={:?} missing on disk -> asserting the decline",
+            option_env!("M2M_PTX_PATH")
+        );
+        let declined = || {
+            assert!(
+                super::cuda_kernel::GpuIndex::new().is_none(),
+                "GpuIndex::new must decline without usable PTX"
+            );
+            assert_eq!(
+                super::cuda_kernel::module_load_attempts(),
+                0,
+                "no load/JIT attempt without PTX"
+            );
+            assert!(
+                !super::cuda_kernel::cuda_context_initialized(),
+                "no CUDA context without PTX"
+            );
+        };
+        declined();
+        // The latch answer is final: no retry reaches the driver either.
+        declined();
+        declined();
+        // CPU fallback usable with exact values (the CPU dataset test's
+        // fixture): the public wrappers return what the CPU path computes.
+        let ok = vec![0.0f32, 0.0, 3.0, 4.0, 0.0, 2.0];
+        assert_eq!(
+            batch_l2_distances(&[0.0, 0.0], &ok, 3, 2),
+            vec![0.0, 25.0, 4.0]
+        );
+        assert_eq!(
+            batch_l2_distances(&[0.0, 0.0], &ok, 3, 2),
+            cpu_l2_distances(&[0.0, 0.0], &ok, 3, 2)
+        );
+        assert_eq!(
+            batch_cosine_distances(&[1.0, 0.0], &ok, 3, 2),
+            cpu_cosine_distances(&[1.0, 0.0], &ok, 3, 2)
+        );
+        let top = batch_search(&[0.0, 0.0], 1, &ok, 3, 2, 2, "l2");
+        assert_eq!(top, cpu_batch_search(&[0.0, 0.0], 1, &ok, 3, 2, 2, "l2"));
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].0.len(), 2);
+        assert_eq!(top[0].0[0], 0);
+        // The public path with a GPU present: still no context, no JIT.
+        assert_eq!(super::cuda_kernel::module_load_attempts(), 0);
+        assert!(!super::cuda_kernel::cuda_context_initialized());
+        declined();
+        eprintln!(
+            "[no-ptx test] PASS: GpuIndex::new declined, load attempts 0, no CUDA context, CPU fallback exact"
+        );
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn test_cuda_malformed_query_shape_declined_before_launch() {
