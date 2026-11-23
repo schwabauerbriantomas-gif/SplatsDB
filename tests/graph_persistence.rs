@@ -30,7 +30,10 @@ use serde_json::json;
 const NO_SERVICE_URL: &str = "http://127.0.0.1:9/embed";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 const RESP_TIMEOUT: Duration = Duration::from_secs(120);
-const LOG_TIMEOUT: Duration = Duration::from_secs(30);
+// Startup lines are expected before "MCP server ready": on a loaded box (other
+// builds sharing 2 cores) the server can take well over 30 s to print them,
+// so they get the same budget as readiness itself.
+const LOG_TIMEOUT: Duration = STARTUP_TIMEOUT;
 /// File the graph is persisted to inside the data dir.
 const STATE_FILE: &str = "graph_state.json";
 /// Prefix of the transient file a save writes before its atomic rename.
