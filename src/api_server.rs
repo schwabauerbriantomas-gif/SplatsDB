@@ -26,7 +26,10 @@
 //!     dimensions from a SplitMix64 PRNG (O(1) hashes instead of O(D)).
 //!
 //! Security:
-//!   - API key authentication via SPLATSDB_API_KEY env var (optional)
+//!   - API key authentication via SPLATSDB_API_KEY env var (optional): the
+//!     variable present but EMPTY or not UTF-8 aborts the startup (never
+//!     "auth off"); a non-loopback bind without a key is refused unless the
+//!     operator opts in with SPLATSDB_ALLOW_UNAUTHENTICATED=1
 //!   - CORS restricted to localhost by default
 //!   - Input size limits enforced
 
@@ -107,6 +110,11 @@ pub struct AppState {
     /// /store se loggea al WAL y cada COMPACT_EVERY se persiste el shard.
     /// None en tests sin data-dir (comportamiento in-memory clásico).
     pub durability: Option<Arc<Durability>>,
+    /// Authentication resolved ONCE at startup from `SPLATSDB_API_KEY`
+    /// (A05-F10). The middleware reads it from here and never from the
+    /// environment, so an empty/non-UTF-8 key cannot turn into "auth off"
+    /// per request.
+    pub auth: AuthConfig,
 }
 
 /// Durabilidad del `serve` con --data-dir: cada /store aceptado se escribe
@@ -2180,7 +2188,91 @@ fn simple_hash_embedding(text: &str, dim: usize) -> Vec<f32> {
 }
 
 // ─── API Key Authentication Middleware ────────────────────
+
+/// Authentication of a `serve` process, resolved ONCE at startup from
+/// `SPLATSDB_API_KEY` (A05-F10) and carried in [`AppState::auth`]. The
+/// middleware never re-reads the environment, so a request can never be
+/// judged against a different key than the one the server booted with.
+#[derive(Clone, PartialEq, Eq)]
+pub enum AuthConfig {
+    /// `SPLATSDB_API_KEY` is absent: loopback dev mode, requests pass
+    /// through (a non-loopback bind in this mode needs the explicit opt-in,
+    /// see [`check_bind_policy`]).
+    Unauthenticated,
+    /// A non-empty, non-blank UTF-8 key: every request except `GET /health`
+    /// and CORS preflight must carry `Authorization: Bearer <key>`.
+    Required(String),
+}
+
+/// Never print the key: `Debug` is needed by tests/assertions only.
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthConfig::Unauthenticated => f.write_str("Unauthenticated"),
+            AuthConfig::Required(_) => f.write_str("Required(<redacted>)"),
+        }
+    }
+}
+
+/// Environment variable holding the API key.
+pub const API_KEY_ENV: &str = "SPLATSDB_API_KEY";
+
+/// Explicit operator opt-in that allows a non-loopback bind WITHOUT an API
+/// key. Only the exact value `1` opts in — `true`, `yes`, `0`, a typo or a
+/// padded value do NOT (fail-closed).
+pub const ALLOW_UNAUTHENTICATED_ENV: &str = "SPLATSDB_ALLOW_UNAUTHENTICATED";
+
+/// Resolve `SPLATSDB_API_KEY` from the raw environment value (read with
+/// `var_os`, so a non-UTF-8 value is observable instead of collapsing into
+/// "absent").
+///
+/// Fail-closed (A05-F10): the variable PRESENT but empty, blank or not
+/// UTF-8 is a misconfiguration → `Err`, and the caller must abort startup.
+/// Before this, `env::var` mapped non-UTF-8 to "no key" (authentication
+/// silently off) and an empty key authenticated every `Authorization:
+/// Bearer ` header (`"" == ""`).
+pub(crate) fn resolve_api_key(value: Option<std::ffi::OsString>) -> Result<AuthConfig, String> {
+    let Some(raw) = value else {
+        return Ok(AuthConfig::Unauthenticated);
+    };
+    match raw.into_string() {
+        Ok(key) if key.trim().is_empty() => Err(format!(
+            "{API_KEY_ENV} is set but EMPTY/blank: an empty key authenticates every \
+             `Authorization: Bearer ` request (authentication effectively disabled). Unset it \
+             to serve without authentication on loopback, or set a non-empty key."
+        )),
+        Ok(key) => Ok(AuthConfig::Required(key)),
+        Err(_) => Err(format!(
+            "{API_KEY_ENV} is set but is not valid UTF-8: it cannot be compared with a Bearer \
+             token, and treating it as absent would silently disable authentication. Set a \
+             UTF-8 key or unset the variable."
+        )),
+    }
+}
+
+/// Whether the operator opted in explicitly (value exactly `1`).
+pub(crate) fn unauthenticated_opt_in(value: Option<std::ffi::OsString>) -> bool {
+    value.as_deref() == Some(std::ffi::OsStr::new("1"))
+}
+
+/// Bind policy (A05-F10), fail-closed: a bind address that is NOT loopback
+/// without an API key is refused unless the operator opted in explicitly
+/// (`SPLATSDB_ALLOW_UNAUTHENTICATED=1`). Loopback without a key keeps
+/// serving (localhost dev mode) and any bind WITH a key is allowed.
+pub(crate) fn check_bind_policy(addr: &str, auth: &AuthConfig, opt_in: bool) -> anyhow::Result<()> {
+    if is_loopback_addr(addr) || matches!(auth, AuthConfig::Required(_)) || opt_in {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to serve on {addr:?} without authentication: {API_KEY_ENV} is not set, so \
+         anyone who can reach this address could read and write the entire store. Bind to \
+         loopback (127.0.0.1 / ::1 / localhost), set {API_KEY_ENV}, or opt in explicitly with \
+         {ALLOW_UNAUTHENTICATED_ENV}=1. Nothing was bound."
+    );
+}
+
 async fn api_key_auth(
+    State(state): State<AppState>,
     headers: HeaderMap,
     request: Request,
     next: Next,
@@ -2197,29 +2289,43 @@ async fn api_key_auth(
         return Ok(next.run(request).await);
     }
 
-    // If no SPLATSDB_API_KEY env var set, skip auth (localhost dev mode)
-    let Ok(expected_key) = std::env::var("SPLATSDB_API_KEY") else {
-        return Ok(next.run(request).await);
-    };
-
-    let provided = headers
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-
-    match provided {
-        Some(key) if constant_time_eq(key, &expected_key) => Ok(next.run(request).await),
-        _ => Err(StatusCode::UNAUTHORIZED),
+    // The key was resolved once at startup — fail-closed on empty/non-UTF-8
+    // (A05-F10). An absent key is the ONLY way to pass without a credential;
+    // a wrong, empty or malformed bearer NEVER authenticates.
+    match &state.auth {
+        AuthConfig::Unauthenticated => Ok(next.run(request).await),
+        AuthConfig::Required(expected) => match bearer_token(&headers) {
+            Some(provided) if constant_time_eq(provided.as_bytes(), expected.as_bytes()) => {
+                Ok(next.run(request).await)
+            }
+            _ => Err(StatusCode::UNAUTHORIZED),
+        },
     }
 }
 
-/// Constant-time string comparison to prevent timing attacks on API keys.
-fn constant_time_eq(a: &str, b: &str) -> bool {
+/// Token of an `Authorization: Bearer <token>` header, parsed strictly:
+/// nothing is trimmed or normalised, so a malformed header can never be
+/// massaged into a match.
+///
+/// `None` for a missing/non-ASCII header, any other scheme (also a
+/// lowercase `bearer`), a missing token (`Bearer `) and a token with
+/// surrounding or inner whitespace (`Bearer  k`, `Bearer k `, `Bearer k x`).
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let token = value.strip_prefix("Bearer ")?;
+    (!token.is_empty() && !token.bytes().any(|b| b.is_ascii_whitespace())).then_some(token)
+}
+
+/// Constant-time byte comparison to prevent timing attacks on API keys.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
     let mut result: u8 = 0;
-    for (x, y) in a.as_bytes().iter().zip(b.as_bytes().iter()) {
+    for (x, y) in a.iter().zip(b.iter()) {
         result |= x ^ y;
     }
     result == 0
@@ -2253,12 +2359,24 @@ fn load_default_shard(store: &mut SplatStore, data_dir: &str) -> anyhow::Result<
     }
 }
 
-/// Loopback bind check for the no-API-key warning: `localhost`, `::1` and
-/// any `127.x.x.x` address are private; everything else (including
-/// `0.0.0.0`/`::`) is treated as externally reachable.
+/// Loopback bind check for the bind policy ([`check_bind_policy`]):
+/// `localhost`, `::1` and any `127.x.x.x` address are private; everything
+/// else (including `0.0.0.0`/`::`) is treated as externally reachable.
 fn is_loopback_addr(addr: &str) -> bool {
     let a = addr.trim().to_ascii_lowercase();
-    matches!(a.as_str(), "localhost" | "::1" | "[::1]") || a.starts_with("127.")
+    // Bracketed IPv6 literal (`[::1]`) → parse the inner literal.
+    let literal = a
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(&a);
+    match literal.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        // Only the literal name `localhost` counts. Any other hostname —
+        // even one that resolves to 127.0.0.1, or `127.0.0.1.example.com`,
+        // which passed the old `starts_with("127.")` prefix test — is
+        // treated as externally reachable (fail-closed).
+        Err(_) => a == "localhost",
+    }
 }
 
 /// Auto-load the on-disk inputs for `serve`: the `default` shard from
@@ -2301,6 +2419,16 @@ pub async fn run_server(
     data_dir: &str,
     gpu_enabled: bool,
 ) -> anyhow::Result<()> {
+    // Auth is resolved BEFORE anything is created on disk or bound (A05-F10):
+    // a misconfigured key (empty / non-UTF-8) or an unauthenticated
+    // non-loopback bind without the explicit opt-in aborts the startup with
+    // a diagnosis and no listener.
+    let auth = resolve_api_key(std::env::var_os(API_KEY_ENV)).map_err(anyhow::Error::msg)?;
+    check_bind_policy(
+        addr,
+        &auth,
+        unauthenticated_opt_in(std::env::var_os(ALLOW_UNAUTHENTICATED_ENV)),
+    )?;
     let config = server_config(config);
     let hnsw_on = config.enable_hnsw;
     let mut store = SplatStore::new(config);
@@ -2414,6 +2542,7 @@ pub async fn run_server(
         corpus_n,
         data_dir: Some(data_dir.to_string()),
         durability: durability.clone(),
+        auth: auth.clone(),
     };
 
     let app = build_router(state);
@@ -2421,10 +2550,15 @@ pub async fn run_server(
     let bind_addr = format!("{addr}:{port}");
     // Loud warning: bound beyond loopback with no API key → everything (store,
     // search, field-search) is open to anyone who can reach this address.
-    if !is_loopback_addr(addr) && std::env::var("SPLATSDB_API_KEY").is_err() {
+    // The policy above already refused this configuration unless the
+    // operator opted in explicitly; the opt-in stays loud.
+    if !is_loopback_addr(addr) && auth == AuthConfig::Unauthenticated {
         eprintln!(
-            "[splatsdb] ⚠  WARNING: serving on {bind_addr} with NO SPLATSDB_API_KEY set.\n\
-             ⚠  Authentication is DISABLED — anyone who can reach this address can read\n\
+            "[splatsdb] ⚠  WARNING: serving on {bind_addr} with NO SPLATSDB_API_KEY set \
+             (explicit opt-in: {ALLOW_UNAUTHENTICATED_ENV}=1).
+\
+             ⚠  Authentication is DISABLED — anyone who can reach this address can read
+\
              ⚠  and write the entire store. Set SPLATSDB_API_KEY to require Bearer auth."
         );
     }
@@ -2612,7 +2746,7 @@ fn build_router(state: AppState) -> Router {
         // so the LAST layer is the OUTERMOST. cors must be outermost so a
         // preflight OPTIONS is answered (with CORS headers) without going
         // through auth; auth then guards the actual requests inside.
-        .layer(middleware::from_fn(api_key_auth))
+        .layer(middleware::from_fn_with_state(state.clone(), api_key_auth))
         .layer(cors)
         .with_state(state)
 }
@@ -2663,6 +2797,7 @@ mod tests {
             corpus_n: 0,
             data_dir: None,
             durability: None,
+            auth: AuthConfig::Unauthenticated,
         };
         (build_router(state), batches_served)
     }
@@ -2735,6 +2870,7 @@ mod tests {
             corpus_n: 0,
             data_dir: Some(dir.to_string_lossy().into_owned()),
             durability: Some(d.clone()),
+            auth: AuthConfig::Unauthenticated,
         };
         (build_router(state), d)
     }
@@ -3490,6 +3626,7 @@ mod tests {
             corpus_n: 2,
             data_dir: None,
             durability: None,
+            auth: AuthConfig::Unauthenticated,
         };
         let app = build_router(state);
 
@@ -3616,6 +3753,251 @@ mod tests {
         for a in ["0.0.0.0", "192.168.1.10", "::", "10.0.0.1", "", "127"] {
             assert!(!is_loopback_addr(a), "{a:?} must NOT be loopback");
         }
+    }
+
+    // ─── Auth (A05-F10) ───────────────────────────────────────────────────
+
+    #[test]
+    fn api_key_absent_is_unauthenticated_and_a_real_key_is_required() {
+        assert_eq!(resolve_api_key(None), Ok(AuthConfig::Unauthenticated));
+        assert_eq!(
+            resolve_api_key(Some("k".into())),
+            Ok(AuthConfig::Required("k".into()))
+        );
+        // Debug never leaks the key
+        assert_eq!(
+            format!("{:?}", AuthConfig::Required("secret".into())),
+            "Required(<redacted>)"
+        );
+    }
+
+    #[test]
+    fn api_key_present_but_empty_or_blank_is_an_error_not_auth_off() {
+        for blank in ["", " ", "\t", "  \n"] {
+            let err = resolve_api_key(Some(blank.into())).expect_err("blank key must be rejected");
+            assert!(err.contains("SPLATSDB_API_KEY"), "{err}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_key_present_but_not_utf8_is_an_error_not_auth_off() {
+        use std::os::unix::ffi::OsStringExt;
+        let err = resolve_api_key(Some(std::ffi::OsString::from_vec(vec![0xC3, 0x28, 0x41])))
+            .expect_err("non-UTF-8 key must be rejected");
+        assert!(err.contains("UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn bind_policy_is_fail_closed_off_loopback_without_a_key() {
+        let unauth = AuthConfig::Unauthenticated;
+        let key = AuthConfig::Required("k".into());
+        // loopback without a key: dev mode preserved
+        for a in ["127.0.0.1", "localhost", "::1", "[::1]"] {
+            assert!(check_bind_policy(a, &unauth, false).is_ok(), "{a}");
+        }
+        // non-loopback without a key and without opt-in: refused
+        for a in ["0.0.0.0", "::", "192.168.1.10", "127.0.0.1.example.com"] {
+            let err = check_bind_policy(a, &unauth, false).expect_err(a);
+            assert!(
+                err.to_string().contains("SPLATSDB_ALLOW_UNAUTHENTICATED"),
+                "{err}"
+            );
+        }
+        // explicit opt-in, or a key: allowed
+        assert!(check_bind_policy("0.0.0.0", &unauth, true).is_ok());
+        assert!(check_bind_policy("0.0.0.0", &key, false).is_ok());
+    }
+
+    #[test]
+    fn unauthenticated_opt_in_requires_exactly_one() {
+        assert!(unauthenticated_opt_in(Some("1".into())));
+        for v in ["0", "true", "yes", " 1", "1 ", ""] {
+            assert!(
+                !unauthenticated_opt_in(Some(v.into())),
+                "{v:?} must NOT opt in"
+            );
+        }
+        assert!(!unauthenticated_opt_in(None));
+    }
+
+    #[test]
+    fn loopback_check_parses_addresses_instead_of_matching_a_prefix() {
+        assert!(is_loopback_addr("127.0.0.1"));
+        assert!(is_loopback_addr("[::1]"));
+        // a hostname that merely starts with "127." is not loopback
+        assert!(!is_loopback_addr("127.0.0.1.example.com"));
+        assert!(!is_loopback_addr("127.0.0.1:8080"));
+    }
+
+    fn bearer_headers(value: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(v) = value {
+            h.insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn bearer_token_is_parsed_strictly() {
+        assert_eq!(bearer_token(&bearer_headers(Some("Bearer k"))), Some("k"));
+        for bad in [
+            None,
+            Some("Bearer"),
+            Some("Bearer "),
+            Some("Bearer  "),
+            Some("Bearer  k"),
+            Some("Bearer k "),
+            Some("Bearer k x"),
+            Some("bearer k"),
+            Some("BEARER k"),
+            Some("Basic k"),
+            Some("Bearerk"),
+        ] {
+            assert_eq!(
+                bearer_token(&bearer_headers(bad)),
+                None,
+                "{bad:?} must not yield a token"
+            );
+        }
+    }
+
+    #[test]
+    fn constant_time_eq_compares_bytes() {
+        assert!(constant_time_eq(b"k", b"k"));
+        assert!(!constant_time_eq(b"", b"k"));
+        assert!(!constant_time_eq(b"K", b"k"));
+        assert!(!constant_time_eq(b"kk", b"k"));
+    }
+
+    /// App whose auth is `auth` (everything else as in `test_app`).
+    async fn test_app_with_auth(auth: AuthConfig) -> Router {
+        let store = Arc::new(Mutex::new(SplatStore::new(test_config())));
+        let (batch_tx, batch_rx) = mpsc::channel(BATCH_CHANNEL_CAP);
+        let batches_served = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(batch_worker(
+            batch_rx,
+            store.clone(),
+            batches_served.clone(),
+            false,
+        ));
+        let state = AppState {
+            store,
+            next_id: Arc::new(AtomicUsize::new(0)),
+            batch_tx,
+            batches_served,
+            #[cfg(feature = "cuda")]
+            gpu: None,
+            field: None,
+            corpus_n: 0,
+            data_dir: None,
+            durability: None,
+            auth,
+        };
+        build_router(state)
+    }
+
+    async fn send_auth(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Value,
+        authorization: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut req = HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        if let Some(v) = authorization {
+            req.headers_mut().insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        let resp = app
+            .clone()
+            .oneshot(req)
+            .await
+            .expect("oneshot request failed");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body failed");
+        let json: Value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
+        };
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn with_a_key_configured_wrong_or_malformed_authorization_never_authenticates() {
+        let app = test_app_with_auth(AuthConfig::Required("k".into())).await;
+        for bad in [
+            None,
+            Some("Bearer "),
+            Some("Bearer  "),
+            Some("Bearer  k"),
+            Some("Bearer k "),
+            Some("bearer k"),
+            Some("Bearer K"),
+            Some("Bearer wrong"),
+            Some("Bearer k extra"),
+            Some("Basic k"),
+        ] {
+            let (status, body) = send_auth(&app, "POST", "/status", json!({}), bad).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "authorization {bad:?} must be rejected ({body})"
+            );
+        }
+        let (status, _) = send_auth(&app, "POST", "/status", json!({}), Some("Bearer k")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // A rejected /store does not mutate the store.
+        let (status, _) = send_auth(
+            &app,
+            "POST",
+            "/store",
+            json!({"text": "x"}),
+            Some("Bearer nope"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, body) = send_auth(&app, "POST", "/status", json!({}), Some("Bearer k")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["n_active"], 0, "{body}");
+
+        // /health stays open (liveness probe).
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn without_a_key_loopback_dev_mode_passes_through() {
+        let app = test_app_with_auth(AuthConfig::Unauthenticated).await;
+        let (status, _) = send_auth(&app, "POST", "/status", json!({}), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) =
+            send_auth(&app, "POST", "/status", json!({}), Some("Bearer anything")).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     // ─── /recall ──────────────────────────────────────────────────────────
@@ -3940,6 +4322,7 @@ mod tests {
             corpus_n: 0,
             data_dir: Some(dir.to_str().unwrap().to_string()),
             durability: Some(d.clone()),
+            auth: AuthConfig::Unauthenticated,
         });
         (app, d)
     }
