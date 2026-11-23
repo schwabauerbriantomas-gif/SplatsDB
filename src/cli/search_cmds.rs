@@ -257,6 +257,11 @@ pub fn cmd_bench_hnsw(
     ef_construction_override: Option<usize>,
     over_fetch: usize,
 ) {
+    // F02f: it writes `hnsw_index.bin` into the data-dir: writer lock.
+    let _data_dir_lock = data_dir
+        .as_deref()
+        .map(|dir| crate::cli::helpers::exit_if_data_dir_locked(dir, "bench-hnsw"));
+
     use super::helpers::load_vectors_bin;
     use std::time::Instant;
 

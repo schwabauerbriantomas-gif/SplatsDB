@@ -23,6 +23,116 @@ pub struct NeighborResult {
     pub score: f32,
 }
 
+/// Largest K the PTX top-k kernels accept (`l2_topk_kernel` /
+/// `gaussian_topk_kernel` keep 32 thread-local pairs; `cuda_kernel` declines
+/// beyond it and answers from the host).
+pub(crate) const GPU_TOPK_MAX_K: usize = 32;
+
+/// Outcome of [`contractual_topk`].
+#[derive(Debug, PartialEq)]
+pub(crate) enum Contract {
+    /// The contractual top-k: at most `k` `(id, score)` pairs in (score, id)
+    /// order, membership proven (or the whole dataset in hand).
+    Exact(Vec<(usize, f32)>),
+    /// A tie at the k-th score reaches the end of the largest window the
+    /// kernel can return: which tied rows belong to the answer cannot be
+    /// decided from GPU output — the caller computes it on the host.
+    Saturated(Vec<(usize, f32)>),
+    /// The fetch itself answered nothing (kernel/wrapper declined).
+    NoFetch,
+}
+
+/// Contractual row order of a search (F02e1): by `score` — ascending for L2
+/// rows (d², lower is better), descending when `descending` (gaussian splat
+/// score) — and, among exactly equal scores, by ascending splat id.
+pub(crate) fn sort_score_then_id(pairs: &mut [(usize, f32)], descending: bool) {
+    pairs.sort_by(|a, b| {
+        let by_score = a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal);
+        let by_score = if descending {
+            by_score.reverse()
+        } else {
+            by_score
+        };
+        by_score.then(a.0.cmp(&b.0))
+    });
+}
+
+/// Contractual top-k from kernel-ordered windows (F02e1).
+///
+/// The PTX top-k kernels order EXACT ties by scan position — thread-major:
+/// the ids `t, t+256, t+512…` of thread 0 first, then thread 1's — not by
+/// id, and their strict comparisons keep at the k-th slot whichever tied row
+/// the scan met first. With N ≤ 256 every thread holds a single id and that
+/// order IS the id order; beyond it, rows of the same distance/score come
+/// back in another order and even as another SET (k=5 over the tied ids
+/// {1,2,3,256,257,258} returns {0,258,3,2,1}-style rows where the contract
+/// wants {0,1,2,3,256}).
+///
+/// `fetch(w)` returns the kernel's (or its host fallback's) top-`w` row in
+/// its own order. One extra pair proves the k-set: when the last fetched
+/// pair is strictly worse than the k-th, no unfetched row can tie with it.
+/// Otherwise the window grows to the kernel maximum; a tie that still
+/// reaches the end of that window is `Saturated`. Untied answers are the
+/// kernel's own first k pairs, bit for bit.
+pub(crate) fn contractual_topk(
+    n: usize,
+    k: usize,
+    descending: bool,
+    mut fetch: impl FnMut(usize) -> Option<Vec<(usize, f32)>>,
+) -> Contract {
+    if k == 0 {
+        return Contract::Exact(Vec::new());
+    }
+    if k > GPU_TOPK_MAX_K {
+        // Never reaches the kernel: the wrapper's host fallback answers
+        // (stable sort over ascending ids → ties already by id).
+        let Some(mut row) = fetch(k) else {
+            return Contract::NoFetch;
+        };
+        sort_score_then_id(&mut row, descending);
+        row.truncate(k);
+        return Contract::Exact(row);
+    }
+    let ceiling = n.min(GPU_TOPK_MAX_K);
+    let mut window = (k + 1).min(ceiling);
+    loop {
+        let Some(mut row) = fetch(window) else {
+            return Contract::NoFetch;
+        };
+        sort_score_then_id(&mut row, descending);
+        let len = row.len();
+        if len >= n || len < window {
+            // Every row of the dataset is in hand, or the answer is shorter
+            // than asked: nothing left to prove the k-set with.
+            row.truncate(k);
+            return Contract::Exact(row);
+        }
+        if len > k {
+            let (kth, last) = (row[k - 1].1, row[len - 1].1);
+            let strictly_worse = if descending { last < kth } else { last > kth };
+            if strictly_worse {
+                row.truncate(k);
+                return Contract::Exact(row);
+            }
+            if window < ceiling {
+                window = ceiling;
+                continue;
+            }
+            return Contract::Saturated(row);
+        }
+        // len == k == window: only k == GPU_TOPK_MAX_K lands here — no proof
+        // pair fits the kernel. A tie between the last two pairs is visible;
+        // one between the last pair and an unfetched row is not (documented
+        // limit of the 32-wide kernel).
+        let tail_tied = k >= 2 && row[k - 1].1 == row[k - 2].1;
+        return if tail_tied {
+            Contract::Saturated(row)
+        } else {
+            Contract::Exact(row)
+        };
+    }
+}
+
 /// Epoch source for `SplatStore::data_version`: every store claims a
 /// disjoint 2^32-wide range (`epoch << 32`) and bumps +1 per mutation, so
 /// versions are globally unique across ALL stores in the process — required
@@ -244,9 +354,27 @@ impl SplatStore {
     }
 
     /// Build the search index and optionally auto-save HNSW to `data_dir`.
+    ///
+    /// A failed HNSW persist is only a warning here: for a reader the index
+    /// built in memory is what answers. A writer that must not report
+    /// success with a missing/stale index on disk calls
+    /// [`Self::try_build_index_with_save`] instead.
     pub fn build_index_with_save(&mut self, data_dir: Option<&str>) {
+        if let Err(e) = self.try_build_index_with_save(data_dir) {
+            eprintln!("[splatsdb] Warning: failed to save HNSW index: {}", e);
+        }
+    }
+
+    /// Result-returning core of [`Self::build_index_with_save`]: builds
+    /// every enabled index, then persists the HNSW index to `data_dir`.
+    ///
+    /// `Err` means the index was built in memory but could NOT be written:
+    /// `data_dir/hnsw_index.bin` is missing or stale, and the caller must
+    /// not report the operation as persisted (F02f). `Ok(())` also when
+    /// there is no candidate backend or no `data_dir`: nothing to persist.
+    pub fn try_build_index_with_save(&mut self, data_dir: Option<&str>) -> Result<(), String> {
         if self.n_active == 0 {
-            return;
+            return Ok(());
         }
         let embeddings = self.mu.slice(ndarray::s![..self.n_active, ..]).to_owned();
 
@@ -269,13 +397,13 @@ impl SplatStore {
             lsh.index(embeddings);
         }
 
-        // Auto-save HNSW if data_dir provided
-        if let Some(dir) = data_dir {
-            if let Err(e) = self.save_hnsw(dir) {
-                eprintln!("[splatsdb] Warning: failed to save HNSW index: {}", e);
-            }
+        // Persist HNSW when a data_dir is given: the error is the caller's
+        match data_dir {
+            Some(dir) => self.save_hnsw(dir),
+            None => Ok(()),
         }
     }
+
 
     /// Build index only if not already built. Tries to load persisted HNSW first.
     ///
@@ -361,7 +489,9 @@ impl SplatStore {
             let dir = std::path::Path::new(data_dir);
             std::fs::create_dir_all(dir).map_err(|e| format!("create dir {}: {}", data_dir, e))?;
             let path = dir.join("hnsw_index.bin");
-            backend.save(&path)?;
+            backend
+                .save(&path)
+                .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
             eprintln!(
                 "[splatsdb] Saved HNSW index ({} vectors) to {}",
                 backend.len(),
@@ -531,22 +661,55 @@ impl SplatStore {
     /// Add a batch of vectors and incrementally insert them into HNSW.
     ///
     /// More efficient than calling `insert_with_hnsw` in a loop because
-    /// it only saves to disk once after all insertions.
+    /// it only saves to disk once after all insertions. Returns false when
+    /// the batch does not fit the store. A failed HNSW persist is only a
+    /// warning here; a writer that must not report success with a stale
+    /// index on disk calls [`Self::try_add_batch_with_hnsw`] instead.
     ///
-    /// Backlog-safe: rows added since the last build/sync are inserted too,
-    /// in positional order — this routes through `hnsw_sync_incremental`.
+    /// Backlog-safe (A01-F02): rows added since the last build/sync are
+    /// inserted too, in positional order — like `insert_with_hnsw`.
     pub fn add_batch_with_hnsw(&mut self, vectors: &Array2<f32>, data_dir: Option<&str>) -> bool {
-        if !self.add_splat(vectors) {
-            return false;
+        match self.try_add_batch_with_hnsw(vectors, data_dir) {
+            Ok(added) => added,
+            Err(e) => {
+                eprintln!("[splatsdb] Warning: failed to save HNSW after batch: {}", e);
+                true
+            }
         }
-        // Same alignment rule as `insert_with_hnsw` (see the note there).
-        if let Some(dir) = data_dir {
-            self.hnsw_sync_and_save(dir);
-        } else {
-            self.hnsw_sync_incremental();
-        }
-        true
     }
+
+    /// Result-returning core of [`Self::add_batch_with_hnsw`]:
+    /// `Ok(false)` — the batch does not fit the store (nothing was added);
+    /// `Ok(true)` — added, and the HNSW index persisted when a `data_dir`
+    /// and a candidate backend are given;
+    /// `Err(e)` — the vectors were added in memory but the HNSW index could
+    /// not be written to `data_dir`: the index on disk is stale, so the
+    /// caller must not report the operation as persisted (F02f).
+    ///
+    /// Backlog-safe (A01-F02), same alignment rule as `insert_with_hnsw`
+    /// (see the note there): backend positions are store indices, so the
+    /// whole range `[hnsw_indexed_count, n_active)` goes in positional
+    /// order through `hnsw_sync_incremental` — not only the rows this batch
+    /// appended, which would land ahead of rows still in the backlog.
+    pub fn try_add_batch_with_hnsw(
+        &mut self,
+        vectors: &Array2<f32>,
+        data_dir: Option<&str>,
+    ) -> Result<bool, String> {
+        if !self.add_splat(vectors) {
+            return Ok(false);
+        }
+        self.hnsw_sync_incremental();
+
+        // F02f: persist whenever a `data_dir` and a candidate backend are
+        // given — also when nothing was inserted — and let the failure
+        // reach the caller: a stale index on disk is never a success.
+        if let Some(dir) = data_dir.filter(|_| self.candidates.is_some()) {
+            self.save_hnsw(dir)?;
+        }
+        Ok(true)
+    }
+
 
     /// Find k nearest neighbors for a single query.
     ///
@@ -576,14 +739,22 @@ impl SplatStore {
             .collect();
 
         // Partial sort top-k
+        // Partial sort top-k. F02e1: exactly equal distances order by
+        // ascending id — a total order, so both WHICH k rows survive a tie at
+        // the k-th distance and their order are contractual (before, the id
+        // was ignored and `select_nth_unstable_by` left the tied rows in an
+        // arbitrary permutation that the stable sort then kept).
+        let by_distance = |a: &(f32, usize), b: &(f32, usize)| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        };
         let mut indexed: Vec<(f32, usize)> =
             dists_sq.iter().enumerate().map(|(i, &d)| (d, i)).collect();
         if k < indexed.len() {
-            indexed.select_nth_unstable_by(k, |a, b| {
-                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            indexed.select_nth_unstable_by(k, by_distance);
         }
-        indexed[..k].sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        indexed[..k].sort_by(by_distance);
 
         indexed[..k]
             .iter()
@@ -642,7 +813,11 @@ impl SplatStore {
                     .map(|(idx, _)| (idx, exact_dist(idx)))
                     .collect();
 
-                ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                ranked.sort_by(|a, b| {
+                    a.1.partial_cmp(&b.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.0.cmp(&b.0))
+                });
 
                 // The backend may return fewer than `fetch_k` candidates
                 // (early termination, removals); clamp so the slice below
@@ -671,7 +846,11 @@ impl SplatStore {
                 .into_iter()
                 .map(|idx| (idx, exact_dist(idx)))
                 .collect();
-            ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            ranked.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.0.cmp(&b.0))
+            });
             if ranked.len() > k {
                 ranked.truncate(k);
             }
@@ -773,34 +952,44 @@ impl SplatStore {
                 let alpha = self.alpha.slice(ndarray::s![..n]);
                 let kappa = self.kappa.slice(ndarray::s![..n]);
                 let q: Vec<f32> = query.to_vec();
-                if let Some(results) = crate::gpu::gaussian_topk_scores_cached(
-                    self.data_version,
-                    &q,
-                    &dataset,
-                    alpha.as_slice().unwrap_or(&[]),
-                    kappa.as_slice().unwrap_or(&[]),
-                    1,
-                    k,
-                ) {
-                    if let Some(top) = results.into_iter().next() {
-                        return top
-                            .into_iter()
-                            .take(k)
-                            .map(|(idx, score)| {
-                                let row = self.mu.row(idx);
-                                let diff = &row - &query.to_owned();
-                                let dist = diff.dot(&diff).sqrt();
-                                NeighborResult {
-                                    mu: self.mu.row(idx).to_vec(),
-                                    alpha: self.alpha[idx],
-                                    kappa: self.kappa[idx],
-                                    index: idx,
-                                    distance: dist,
-                                    score,
-                                }
-                            })
-                            .collect();
-                    }
+                // F02e1: the kernel orders exact ties by scan position, not
+                // by id — `contractual_topk` proves the k-set against ties
+                // (k+1 window, escalated to the kernel maximum) and returns
+                // the canonical (score, id) order. Untied answers are the
+                // kernel's own k pairs, bit for bit. A tie the kernel cannot
+                // resolve falls through to the exact CPU path below.
+                let version = self.data_version;
+                let fetch = |window: usize| -> Option<Vec<(usize, f32)>> {
+                    crate::gpu::gaussian_topk_scores_cached(
+                        version,
+                        &q,
+                        &dataset,
+                        alpha.as_slice().unwrap_or(&[]),
+                        kappa.as_slice().unwrap_or(&[]),
+                        1,
+                        window,
+                    )?
+                    .into_iter()
+                    .next()
+                };
+                if let Contract::Exact(top) = contractual_topk(dataset.nrows(), k, true, fetch) {
+                    return top
+                        .into_iter()
+                        .take(k)
+                        .map(|(idx, score)| {
+                            let row = self.mu.row(idx);
+                            let diff = &row - &query.to_owned();
+                            let dist = diff.dot(&diff).sqrt();
+                            NeighborResult {
+                                mu: self.mu.row(idx).to_vec(),
+                                alpha: self.alpha[idx],
+                                kappa: self.kappa[idx],
+                                index: idx,
+                                distance: dist,
+                                score,
+                            }
+                        })
+                        .collect();
                 }
             }
         }
@@ -824,12 +1013,15 @@ impl SplatStore {
         // The candidate pipeline can return fewer than k results (backend
         // under-delivery), so clamp before slicing.
         let k = k.min(scored.len());
+        let by_score = |a: &(f32, usize, f32), b: &(f32, usize, f32)| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        };
         if k < scored.len() {
-            scored.select_nth_unstable_by(k, |a, b| {
-                b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            scored.select_nth_unstable_by(k, by_score);
         }
-        scored[..k].sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored[..k].sort_by(by_score);
 
         scored[..k]
             .iter()
@@ -1010,6 +1202,47 @@ impl SplatStore {
         // built over the previous content are stale.
         self.invalidate_positional_indexes();
         Ok(())
+    }
+
+    /// Load the persisted energy state — alpha and kappa of the FIRST
+    /// `alpha.len()` active splats — over vectors that are already in the
+    /// store (F02e1).
+    ///
+    /// `serve` loads mu through `add_splat` (init alpha/kappa) and then the
+    /// alpha/kappa `ingest` persisted; the rows a later `/store` appended
+    /// (beyond `alpha.len()`) keep their init values, exactly as they had in
+    /// memory before the restart. Fails without touching anything when the
+    /// arrays disagree or hold a non-finite / negative value: a corrupted
+    /// state must never be half-applied. Mutation → the VRAM-cache key
+    /// (`data_version`) moves, like on every other load.
+    pub fn load_energy(&mut self, alpha: &[f32], kappa: &[f32]) -> Result<usize, String> {
+        let n = alpha.len();
+        if kappa.len() != n {
+            return Err(format!(
+                "energy state: {} alpha values for {} kappa values",
+                n,
+                kappa.len()
+            ));
+        }
+        if n > self.n_active {
+            return Err(format!(
+                "energy state holds {n} splats but the store has {} active",
+                self.n_active
+            ));
+        }
+        if alpha
+            .iter()
+            .chain(kappa)
+            .any(|v| !v.is_finite() || *v < 0.0)
+        {
+            return Err("energy state holds a non-finite or negative alpha/kappa".into());
+        }
+        for i in 0..n {
+            self.alpha[i] = alpha[i];
+            self.kappa[i] = kappa[i];
+        }
+        self.data_version += 1;
+        Ok(n)
     }
 
     /// Update frequency for accessed splats (SOC boost).
@@ -2139,6 +2372,319 @@ mod tests {
                 assert!((r.distance - dist).abs() < 1e-6);
             }
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod f02e1_contract_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    const N: usize = 300;
+    /// The six ids of the tie corpus sharing one score, and the row every
+    /// other id takes (strictly worse, all distinct).
+    const TIED: [usize; 6] = [1, 2, 3, 256, 257, 258];
+
+    fn l2_scores() -> Vec<f32> {
+        (0..N)
+            .map(|i| match i {
+                0 => 1.0,
+                i if TIED.contains(&i) => 4.0,
+                i => 16.0 + i as f32,
+            })
+            .collect()
+    }
+
+    /// Gaussian scores of the tie corpus: `alpha[257] = 1000` lifts that
+    /// tied row above everything (the fixture of `tests/gpu_semantics.rs`).
+    fn gaussian_scores() -> Vec<f32> {
+        (0..N)
+            .map(|i| {
+                let d2 = match i {
+                    0 => 1.25,
+                    i if TIED.contains(&i) => 4.25,
+                    i => 16.25 + i as f32,
+                };
+                let alpha = if i == 257 { 1000.0 } else { 1.0 };
+                alpha * (-d2).exp()
+            })
+            .collect()
+    }
+
+    /// The kernel's thread-major selection for a 256-thread block: among
+    /// equal scores the row of the smaller `id % 256` wins, then the smaller
+    /// `id / 256` (== the smaller id).
+    fn kernel_topk(scores: &[f32], descending: bool, w: usize) -> Vec<(usize, f32)> {
+        let mut all: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
+        all.sort_by(|a, b| {
+            let s = a.1.partial_cmp(&b.1).unwrap();
+            let s = if descending { s.reverse() } else { s };
+            s.then((a.0 % 256).cmp(&(b.0 % 256))).then(a.0.cmp(&b.0))
+        });
+        all.truncate(w);
+        all
+    }
+
+    fn run(scores: &[f32], descending: bool, k: usize, n: usize) -> (Contract, Vec<usize>) {
+        let windows = RefCell::new(Vec::new());
+        let out = contractual_topk(n, k, descending, |w| {
+            windows.borrow_mut().push(w);
+            Some(kernel_topk(scores, descending, w))
+        });
+        (out, windows.into_inner())
+    }
+
+    fn ids(pairs: &[(usize, f32)]) -> Vec<usize> {
+        pairs.iter().map(|p| p.0).collect()
+    }
+
+    #[test]
+    fn a_tie_at_the_kth_score_is_proven_by_the_extra_pair_and_escalated() {
+        for (scores, descending, want) in [
+            (l2_scores(), false, vec![0, 1, 2, 3, 256]),
+            (gaussian_scores(), true, vec![257, 0, 1, 2, 3]),
+        ] {
+            let (out, windows) = run(&scores, descending, 5, N);
+            let Contract::Exact(row) = out else {
+                panic!("expected Exact, got {out:?}");
+            };
+            assert_eq!(ids(&row), want, "ties resolve by ascending id");
+            // k+1 cannot prove the set (the 6th pair ties with the 5th) →
+            // the kernel maximum; its last pair is strictly worse → proven.
+            assert_eq!(windows, vec![6, 32]);
+            // canonical order is a sort of the proven set
+            let mut set = row.clone();
+            sort_score_then_id(&mut set, descending);
+            assert_eq!(row, set);
+        }
+    }
+
+    #[test]
+    fn an_untied_answer_is_the_kernels_own_k_pairs_bitness() {
+        let scores: Vec<f32> = (0..N).map(|i| 1000.0 - i as f32).collect();
+        for descending in [false, true] {
+            let (out, windows) = run(&scores, descending, 5, N);
+            let Contract::Exact(row) = out else {
+                panic!("expected Exact, got {out:?}");
+            };
+            assert_eq!(row, kernel_topk(&scores, descending, 5));
+            assert_eq!(
+                windows,
+                vec![6],
+                "one fetch: the 6th pair is strictly worse"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tie_reaching_the_kernel_maximum_is_saturated() {
+        // Every score identical (the all-underflow answer).
+        let scores = vec![0.0f32; N];
+        for descending in [false, true] {
+            let (out, windows) = run(&scores, descending, 5, N);
+            assert!(matches!(out, Contract::Saturated(_)), "{out:?}");
+            assert_eq!(windows, vec![6, 32]);
+        }
+        // k == GPU_TOPK_MAX_K leaves no room for a proof pair.
+        let mut scores = l2_scores();
+        for s in scores[1..=40].iter_mut() {
+            *s = 4.0; // the tie now reaches the 32nd row of the window
+        }
+        let (out, windows) = run(&scores, false, GPU_TOPK_MAX_K, N);
+        assert!(matches!(out, Contract::Saturated(_)), "{out:?}");
+        assert_eq!(windows, vec![32]);
+    }
+
+    #[test]
+    fn a_short_dataset_k_over_the_kernel_maximum_and_no_fetch() {
+        // n == k+1: the window holds every row → Exact, one fetch.
+        let (out, windows) = run(&l2_scores()[..6], false, 5, 6);
+        assert_eq!(
+            out,
+            Contract::Exact(kernel_topk(&l2_scores()[..6], false, 6)[..5].to_vec())
+        );
+        assert_eq!(windows, vec![6]);
+        // k == GPU_TOPK_MAX_K without a tail tie → Exact on the single window.
+        let scores: Vec<f32> = (0..N).map(|i| i as f32).collect();
+        let (out, windows) = run(&scores, false, GPU_TOPK_MAX_K, N);
+        assert!(
+            matches!(out, Contract::Exact(ref r) if r.len() == GPU_TOPK_MAX_K),
+            "{out:?}"
+        );
+        assert_eq!(windows, vec![32]);
+        // k beyond the kernel: the host fallback answers k rows directly.
+        let (out, windows) = run(&scores, false, 40, N);
+        assert!(
+            matches!(out, Contract::Exact(ref r) if r.len() == 40),
+            "{out:?}"
+        );
+        assert_eq!(windows, vec![40]);
+        // fetch declined.
+        assert_eq!(contractual_topk(N, 5, false, |_| None), Contract::NoFetch);
+        assert_eq!(
+            contractual_topk(N, 0, false, |_| panic!("k=0 never fetches")),
+            Contract::Exact(vec![])
+        );
+    }
+
+    #[test]
+    fn store_routes_resolve_ties_by_id_and_load_energy_replays_the_state() {
+        let config = SplatsDBConfig {
+            latent_dim: 32,
+            max_splats: 512,
+            ..Default::default()
+        };
+        let mut store = SplatStore::new(config);
+        // id 0 nearest (d² = 1.25), TIED at 4.25 (axis pairs), others far.
+        let mut rows: Vec<[f32; 3]> = Vec::new();
+        for i in 0..N {
+            rows.push(match i {
+                0 => [0.0, 0.0, 1.0],
+                1 | 2 => [if i == 1 { 2.0 } else { -2.0 }, 0.0, 0.0],
+                3 | 256 => [0.0, if i == 3 { 2.0 } else { -2.0 }, 0.0],
+                257 | 258 => [0.0, 0.0, if i == 257 { 2.0 } else { -2.0 }],
+                _ => {
+                    let v = 4.0 + 0.03125 * i as f32;
+                    let axis = 7 + i % 24;
+                    let mut r = [0.0f32; 3];
+                    if axis < 3 {
+                        r[axis] = v;
+                    }
+                    r
+                }
+            });
+        }
+        // ids with axis >= 3 need the full 32-dim row: build them directly.
+        let mut mu = Array2::zeros((N, 32));
+        for (i, r) in rows.iter().enumerate() {
+            for j in 0..3 {
+                mu[[i, j]] = r[j];
+            }
+            if !TIED.contains(&i) && i != 0 && (7 + i % 24) >= 3 {
+                mu[[i, 7 + i % 24]] = 4.0 + 0.03125 * i as f32;
+            }
+        }
+        assert!(store.add_splat(&mu));
+        let q = tie_query();
+        let l2: Vec<usize> = store
+            .find_neighbors(&q.view(), 5)
+            .iter()
+            .map(|n| n.index)
+            .collect();
+        assert_eq!(l2, vec![0, 1, 2, 3, 256], "L2 ties → ascending id");
+
+        let mut alpha = vec![1.0f32; N];
+        alpha[257] = 1000.0;
+        let kappa = vec![1.0f32; N];
+        assert_eq!(store.load_energy(&alpha, &kappa).unwrap(), N);
+        assert_eq!(store.get_alpha().unwrap().as_slice().unwrap(), &alpha[..]);
+        let gaussian: Vec<usize> = store
+            .find_neighbors_gaussian(&q.view(), 5)
+            .iter()
+            .map(|n| n.index)
+            .collect();
+        assert_eq!(
+            gaussian,
+            vec![257, 0, 1, 2, 3],
+            "gaussian ties → ascending id"
+        );
+        for n in &store.find_neighbors_gaussian(&q.view(), 5) {
+            let want = alpha[n.index] * (-kappa[n.index] * n.distance * n.distance).exp();
+            assert!((n.score - want).abs() <= 1e-6 * want.abs(), "{n:?}");
+        }
+
+        // load_energy validates before touching anything.
+        let version = store.data_version;
+        assert!(store.load_energy(&alpha[..3], &kappa).is_err());
+        assert!(store
+            .load_energy(&vec![1.0; N + 1], &vec![1.0; N + 1])
+            .is_err());
+        let mut bad = alpha.clone();
+        bad[4] = f32::NAN;
+        assert!(store.load_energy(&bad, &kappa).is_err());
+        let mut bad = kappa.clone();
+        bad[4] = -1.0;
+        assert!(store.load_energy(&alpha, &bad).is_err());
+        assert_eq!(
+            store.data_version, version,
+            "a rejected state must not bump the version"
+        );
+        assert_eq!(store.get_alpha().unwrap().as_slice().unwrap(), &alpha[..]);
+        // a prefix loads over the leading rows only
+        assert_eq!(store.load_energy(&[0.5, 0.25], &[2.0, 4.0]).unwrap(), 2);
+        assert_eq!(
+            &store.get_alpha().unwrap().as_slice().unwrap()[..3],
+            &[0.5, 0.25, 1.0]
+        );
+    }
+
+    fn tie_query() -> Array1<f32> {
+        let mut q = Array1::zeros(32);
+        q[31] = 0.5;
+        q
+    }
+
+    // ── F02f: a failed HNSW persistence is reported, never a success ──────
+
+    #[test]
+    fn f02f_try_build_index_with_save_reports_a_failed_hnsw_persist() {
+        // A DIRECTORY where the index file goes: `File::create` fails for
+        // every user, root included — no chmod needed.
+        let dir = std::env::temp_dir().join(format!(
+            "splatdb-f02f-hnsw-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("hnsw_index.bin")).unwrap();
+        let mut cfg = SplatsDBConfig {
+            latent_dim: 8,
+            max_splats: 16,
+            enable_hnsw: true,
+            device: "cpu".to_string(),
+            enable_cuda: false,
+            enable_gpu_search: false,
+            ..Default::default()
+        };
+        cfg.finalize();
+        let vectors = Array2::from_shape_fn((4, 8), |(i, j)| (i * 8 + j) as f32);
+        let mut store = SplatStore::new(cfg.clone());
+        assert!(store.add_splat(&vectors));
+
+        let err = store
+            .try_build_index_with_save(Some(dir.to_str().unwrap()))
+            .expect_err("the failed HNSW persist must be reported");
+        assert!(err.contains("hnsw_index.bin"), "{err}");
+        // Only the persistence failed: the index is built and searchable.
+        assert!(store.candidates.as_ref().unwrap().is_built());
+        assert_eq!(store.hnsw_indexed_count(), 4);
+        assert!(!store.find_neighbors_fused(&vectors.row(0), 2).is_empty());
+
+        // Legacy API: same work, a warning instead of an error, still `()`.
+        let mut legacy = SplatStore::new(cfg);
+        assert!(legacy.add_splat(&vectors));
+        legacy.build_index_with_save(Some(dir.to_str().unwrap()));
+        assert!(legacy.candidates.as_ref().unwrap().is_built());
+
+        // Nothing to persist: no candidate backend, or an empty store.
+        let mut plain = SplatStore::new(SplatsDBConfig {
+            latent_dim: 8,
+            max_splats: 16,
+            ..Default::default()
+        });
+        assert!(plain.add_splat(&vectors));
+        assert!(plain.try_build_index_with_save(Some(dir.to_str().unwrap())).is_ok());
+        let mut empty = SplatStore::new(SplatsDBConfig {
+            latent_dim: 8,
+            max_splats: 16,
+            enable_hnsw: true,
+            ..Default::default()
+        });
+        assert!(empty.try_build_index_with_save(Some(dir.to_str().unwrap())).is_ok());
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -13,6 +13,10 @@ pub fn cmd_index(
     input: PathBuf,
     shard: String,
 ) {
+    // F02f: a writer holds the data-dir lock (the same `serve` holds) for
+    // its whole read→write window, or exits 3 before touching anything.
+    let _data_dir_lock = crate::cli::helpers::exit_if_data_dir_locked(&data_dir, "index");
+
     let vectors = match load_vectors_bin(&input) {
         Ok(v) => v,
         Err(e) => {
@@ -38,8 +42,33 @@ pub fn cmd_index(
     });
 
     let mut store = SplatStore::new(config);
-    store.add_splat(&vectors);
-    store.build_index_with_save(Some(&data_dir));
+    // A03-F17: `add_splat` rejects a dimension/capacity mismatch by returning
+    // false. Indexing on would build an empty index and still print "indexed".
+    if !store.add_splat(&vectors) {
+        eprintln!(
+            "Error: index: {}x{} vectors do not fit a store with --dim {} / --max-splats {}",
+            vectors.nrows(),
+            vectors.ncols(),
+            store.get_statistics().embedding_dim,
+            store.max_splats()
+        );
+        std::process::exit(1);
+    }
+    // F02f: a failed HNSW persist is an error, never "indexed" + exit 0
+    // with a missing/stale index on disk.
+    if let Err(e) = store.try_build_index_with_save(Some(&data_dir)) {
+        super::helpers::exit_on_hnsw_persist_error(
+            "index",
+            &data_dir,
+            e,
+            &format!(
+                "shard '{}' was written ({} vectors) but its index was not — the next process \
+                 that uses the HNSW index rebuilds it; re-run once the data-dir is writable",
+                shard,
+                vectors.nrows()
+            ),
+        );
+    }
 
     println!(
         "{}",
@@ -66,6 +95,10 @@ pub fn cmd_append(
     input: PathBuf,
     shard: String,
 ) {
+    // F02f: a writer holds the data-dir lock (the same `serve` holds) for
+    // its whole read→write window, or exits 3 before touching anything.
+    let _data_dir_lock = crate::cli::helpers::exit_if_data_dir_locked(&data_dir, "append");
+
     let vectors = match load_vectors_bin(&input) {
         Ok(v) => v,
         Err(e) => {
@@ -111,7 +144,21 @@ pub fn cmd_append(
 
     // Add new vectors
     let t0 = std::time::Instant::now();
-    let added = store.add_batch_with_hnsw(&vectors, Some(&data_dir));
+    // F02f: the HNSW index is persisted BEFORE the shard, so a failed index
+    // write leaves the data-dir untouched instead of "appended" + stale index.
+    let added = match store.try_add_batch_with_hnsw(&vectors, Some(&data_dir)) {
+        Ok(added) => added,
+        Err(e) => super::helpers::exit_on_hnsw_persist_error(
+            "append",
+            &data_dir,
+            e,
+            &format!(
+                "shard '{}' is unchanged on disk ({} vectors were not written)",
+                shard,
+                vectors.nrows()
+            ),
+        ),
+    };
     let elapsed = t0.elapsed();
 
     if !added {
@@ -119,13 +166,27 @@ pub fn cmd_append(
         std::process::exit(1);
     }
 
-    // Persist vectors to storage backend
-    if let Some(p) = persist {
-        if let Some(vectors) = store.get_mu() {
-            if let Err(e) = p.save_vectors(&vectors, &shard) {
-                eprintln!("Warning: save failed: {}", e);
-            }
-        }
+    // Persist vectors to storage backend. A03-F17: "appended" (exit 0)
+    // requires the shard to have been written — a failed save is an error,
+    // not a warning.
+    let saved = match persist {
+        Some(p) => match store.get_mu() {
+            Some(all) => p.save_vectors(&all, &shard),
+            None => Err(std::io::Error::other("store has no vectors to save")),
+        },
+        None => Err(std::io::Error::other(
+            "no storage backend: the data-dir could not be opened",
+        )),
+    };
+    if let Err(e) = saved {
+        eprintln!(
+            "Save error: append NOT persisted, shard '{}' is unchanged on disk ({} vectors were \
+             not written): {}",
+            shard,
+            vectors.nrows(),
+            e
+        );
+        std::process::exit(1);
     }
 
     println!(
@@ -150,6 +211,10 @@ pub fn cmd_ingest(
     n_clusters: Option<usize>,
     seed: u64,
 ) {
+    // F02f: a writer holds the data-dir lock (the same `serve` holds) for
+    // its whole read→write window, or exits 3 before touching anything.
+    let _data_dir_lock = crate::cli::helpers::exit_if_data_dir_locked(&data_dir, "ingest");
+
     let vectors = match load_vectors_bin(&input) {
         Ok(v) => v,
         Err(e) => {
@@ -174,7 +239,17 @@ pub fn cmd_ingest(
             // HNSW to data_dir) and write the splat centroids to the store,
             // otherwise the ingest result is lost when the process exits and
             // status/search see an empty store (issue #1).
-            store.build_index_with_save(Some(&data_dir));
+            // F02f: no "saved": true while the HNSW index is stale on disk.
+            if let Err(e) = store.try_build_index_with_save(Some(&data_dir)) {
+                super::helpers::exit_on_hnsw_persist_error(
+                    "ingest",
+                    &data_dir,
+                    e,
+                    "the ingested splats and energy state were written but the HNSW index was \
+                     not — the next process that uses it rebuilds the index; re-run once the \
+                     data-dir is writable",
+                );
+            }
 
             let persist = make_persistence(&data_dir, &backend, true).unwrap_or_else(|e| {
                 eprintln!("Storage error: {}", e);
@@ -236,6 +311,10 @@ pub fn cmd_ingest_hierarchical(
     min_cluster_size: usize,
     seed: u64,
 ) {
+    // F02f: a writer holds the data-dir lock (the same `serve` holds) for
+    // its whole read→write window, or exits 3 before touching anything.
+    let _data_dir_lock = crate::cli::helpers::exit_if_data_dir_locked(&data_dir, "ingest-hierarchical");
+
     let vectors = match load_vectors_bin(&input) {
         Ok(v) => v,
         Err(e) => {
@@ -259,7 +338,17 @@ pub fn cmd_ingest_hierarchical(
             // HNSW to data_dir) and write splat centroids + energy state,
             // otherwise the ingest result is lost when the process exits and
             // status/search see an empty store.
-            store.build_index_with_save(Some(&data_dir));
+            // F02f: no "saved": true while the HNSW index is stale on disk.
+            if let Err(e) = store.try_build_index_with_save(Some(&data_dir)) {
+                super::helpers::exit_on_hnsw_persist_error(
+                    "ingest-hierarchical",
+                    &data_dir,
+                    e,
+                    "the ingested splats and energy state were written but the HNSW index was \
+                     not — the next process that uses it rebuilds the index; re-run once the \
+                     data-dir is writable",
+                );
+            }
 
             let persist = make_persistence(&data_dir, &backend, true).unwrap_or_else(|e| {
                 eprintln!("Storage error: {}", e);

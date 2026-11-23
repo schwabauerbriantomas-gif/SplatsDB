@@ -37,6 +37,10 @@ pub fn cmd_status(data_dir: String, max_splats: usize, config: SplatsDBConfig, v
 }
 
 pub fn cmd_save(data_dir: String, config: SplatsDBConfig, shard: String) {
+    // F02f: a writer holds the data-dir lock (the same `serve` holds) for
+    // its whole read→write window, or exits 3 before touching anything.
+    let _data_dir_lock = crate::cli::helpers::exit_if_data_dir_locked(&data_dir, "save");
+
     let (store, persist) = load_or_create_store(&data_dir, &config);
     let persist = match persist {
         Some(p) => p,
@@ -124,6 +128,10 @@ pub fn cmd_doc_add(
     text: String,
     metadata: Option<String>,
 ) {
+    // F02f: a writer holds the data-dir lock (the same `serve` holds) for
+    // its whole read→write window, or exits 3 before touching anything.
+    let _data_dir_lock = crate::cli::helpers::exit_if_data_dir_locked(&data_dir, "doc-add");
+
     let persist = make_persistence(&data_dir, &backend, true).unwrap_or_else(|e| {
         eprintln!("Storage error: {}", e);
         std::process::exit(1);
@@ -170,6 +178,10 @@ pub fn cmd_doc_get(data_dir: String, backend: String, id: String) {
 }
 
 pub fn cmd_doc_del(data_dir: String, backend: String, id: String) {
+    // F02f: a writer holds the data-dir lock (the same `serve` holds) for
+    // its whole read→write window, or exits 3 before touching anything.
+    let _data_dir_lock = crate::cli::helpers::exit_if_data_dir_locked(&data_dir, "doc-del");
+
     let persist = make_persistence(&data_dir, &backend, true).unwrap_or_else(|e| {
         eprintln!("Storage error: {}", e);
         std::process::exit(1);

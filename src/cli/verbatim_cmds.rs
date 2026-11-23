@@ -15,6 +15,10 @@ pub fn cmd_verbatim_store(
     text: String,
     category: Option<String>,
 ) {
+    // F02f: a writer holds the data-dir lock (the same `serve` holds) for
+    // its whole read→write window, or exits 3 before touching anything.
+    let _data_dir_lock = crate::cli::helpers::exit_if_data_dir_locked(&data_dir, "verbatim-store");
+
     let config = SplatsDBConfig::default();
     let (mut store, persist) = load_or_create_store(&data_dir, &config);
 

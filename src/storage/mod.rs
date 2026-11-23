@@ -1,6 +1,7 @@
 pub mod json_store;
 pub mod metadata_store;
 pub mod persistence;
+pub mod shard_guard;
 pub mod sqlite_store;
 pub mod wal;
 
