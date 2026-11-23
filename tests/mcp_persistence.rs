@@ -1407,3 +1407,171 @@ fn p05_store_wing_room_hall_survives_restart() {
     }
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+// ---------------------------------------------------------------------------
+// (8) F05c — a writer that does not know about vectors no longer drops them
+// ---------------------------------------------------------------------------
+
+/// The CLI / HTTP write path over the SAME SQLite file the MCP server uses:
+/// `MetadataStore::upsert` — the trait method, no vector in its signature.
+fn legacy_writer_upsert(
+    doc_db: &Path,
+    id: &str,
+    edit: impl FnOnce(&mut splatsdb::storage::DocumentRecord),
+) {
+    use splatsdb::storage::sqlite_store::SqliteMetadataStore;
+    use splatsdb::storage::MetadataStore;
+    let store = SqliteMetadataStore::new(doc_db.to_path_buf())
+        .expect("open the doc store as a legacy writer");
+    let mut rec = store
+        .get(id)
+        .expect("read")
+        .unwrap_or_else(|| panic!("row {id} is missing"));
+    edit(&mut rec);
+    store.upsert(&rec).expect("legacy upsert");
+}
+
+/// A metadata-only update by a writer that does not know about embeddings
+/// keeps the stored vector and its provenance byte-for-byte, and a restart
+/// with the embed service DOWN searches from that vector: zero re-embeddings.
+#[test]
+fn p06_legacy_upsert_keeps_the_stored_vector_and_the_restart_needs_no_embed_service() {
+    let tmp = scratch("p06_legacy_kept");
+    let doc_db = tmp.join("docs.db");
+    let dim_cell = Arc::new(AtomicUsize::new(0));
+    let (url, hits) = spawn_counting_embed_server(Arc::clone(&dim_cell));
+    let text = "document whose vector survives a metadata-only legacy upsert";
+    let dim;
+    {
+        let mut srv = spawn_server(&doc_db, &url, &[]);
+        dim = probe_dim(&mut srv, 1);
+        let r = srv.ok(
+            2,
+            "splatsdb_store",
+            serde_json::json!({ "id": "legacy_kept", "text": text, "embedding": emb(dim, 1.0, 0.0) }),
+        );
+        assert_eq!(r["embedding"], serde_json::json!("provided"), "{r}");
+        assert_eq!(r["persisted"], serde_json::json!(true), "{r}");
+        srv.shutdown();
+    }
+    let requests_after_store = hits.load(Ordering::SeqCst);
+
+    legacy_writer_upsert(&doc_db, "legacy_kept", |rec| {
+        rec.metadata = Some(serde_json::json!({
+            "text": text, "wing": "W1", "room": "R7", "updated_by": "legacy-upsert"
+        }));
+        rec.updated_at += 100.0;
+    });
+
+    // On disk: the vector and its provenance are exactly what was stored,
+    // and the legacy writer's metadata is the one on the row.
+    {
+        use splatsdb::storage::MetadataStore;
+        let db = open_db(&doc_db);
+        let row = stored_row(&db, "legacy_kept");
+        let want = f32_bytes(&provided(dim, 1.0, 0.0));
+        assert_eq!(
+            row.blob.as_deref(),
+            Some(want.as_slice()),
+            "the generic upsert dropped or changed the stored vector: {row:?}"
+        );
+        assert_eq!(row.source.as_deref(), Some("provided"), "{row:?}");
+        drop(db);
+        let reader = splatsdb::storage::sqlite_store::SqliteMetadataStore::new(doc_db.clone())
+            .expect("open doc store");
+        let rec = reader.get("legacy_kept").expect("read").expect("row");
+        assert_eq!(
+            rec.metadata.as_ref().and_then(|m| m["updated_by"].as_str()),
+            Some("legacy-upsert"),
+            "{rec:?}"
+        );
+    }
+
+    // Restart with the embed service DOWN, strict mode.
+    let mut srv = spawn_server(&doc_db, NO_SERVICE_URL, &[]);
+    srv.expect_log("reloaded 1/1 documents");
+    srv.expect_log("stored vectors loaded: 1");
+    srv.expect_log("re-embedded: 0");
+    let res = srv.ok(
+        1,
+        "splatsdb_search",
+        serde_json::json!({
+            "query": "irrelevant: the embedding is provided",
+            "embedding": emb(dim, 1.0, 0.0),
+            "top_k": 5
+        }),
+    );
+    assert_eq!(ids(&res), vec!["legacy_kept".to_string()], "{res}");
+    let label = res["results"][0]["embedding_source"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        label.ends_with("provided"),
+        "the provenance must survive the legacy upsert: {label}"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        requests_after_store,
+        "the restart must not re-embed anything"
+    );
+    srv.shutdown();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// The vector is retired only when it would lie: a legacy upsert that
+/// changes the text leaves NO vector behind (never the old text's vector),
+/// and the next warm start reports the document as not indexed instead of
+/// searching with a stale vector.
+#[test]
+fn p06b_legacy_upsert_with_a_new_text_retires_the_vector_instead_of_serving_a_stale_one() {
+    let tmp = scratch("p06b_legacy_text");
+    let doc_db = tmp.join("docs.db");
+    let dim_cell = Arc::new(AtomicUsize::new(0));
+    let (url, _hits) = spawn_counting_embed_server(Arc::clone(&dim_cell));
+    let dim;
+    {
+        let mut srv = spawn_server(&doc_db, &url, &[]);
+        dim = probe_dim(&mut srv, 1);
+        let r = srv.ok(
+            2,
+            "splatsdb_store",
+            serde_json::json!({
+                "id": "legacy_text", "text": "the ORIGINAL text", "embedding": emb(dim, 1.0, 0.0)
+            }),
+        );
+        assert_eq!(r["persisted"], serde_json::json!(true), "{r}");
+        srv.shutdown();
+    }
+
+    legacy_writer_upsert(&doc_db, "legacy_text", |rec| {
+        rec.document = Some("a DIFFERENT text".into());
+        rec.metadata = Some(serde_json::json!({ "text": "a DIFFERENT text" }));
+    });
+    {
+        let db = open_db(&doc_db);
+        let row = stored_row(&db, "legacy_text");
+        assert!(
+            row.blob.is_none() && row.source.is_none(),
+            "a vector of the old text must not be inherited by the new one: {row:?}"
+        );
+    }
+
+    let mut srv = spawn_server(&doc_db, NO_SERVICE_URL, &[]);
+    srv.expect_log("re-embedded: 0");
+    srv.expect_log("not indexed: 1");
+    let res = srv.ok(
+        1,
+        "splatsdb_search",
+        serde_json::json!({
+            "query": "irrelevant: the embedding is provided",
+            "embedding": emb(dim, 1.0, 0.0),
+            "top_k": 5
+        }),
+    );
+    assert!(
+        ids(&res).is_empty(),
+        "a retired vector must not be searched: {res}"
+    );
+    srv.shutdown();
+    let _ = std::fs::remove_dir_all(&tmp);
+}

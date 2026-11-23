@@ -808,4 +808,198 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // -----------------------------------------------------------------------
+    // F05c (A04-F10) — crash-safe, fail-closed persistence of the graph
+    // -----------------------------------------------------------------------
+
+    fn f05c_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "splatsdb-graph-f05c-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn f05c_state(dir: &Path) -> std::path::PathBuf {
+        dir.join(GRAPH_STATE_FILENAME)
+    }
+
+    /// Transient files a save left behind (none outside a crash).
+    fn f05c_tmp_files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("graph_state.json.tmp."))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Make `dir` unwritable for this process. False (permissions restored)
+    /// when they are ignored — root, or a filesystem without modes.
+    #[cfg(unix)]
+    fn f05c_make_unwritable(dir: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(dir).expect("metadata").permissions();
+        perms.set_mode(0o500);
+        std::fs::set_permissions(dir, perms).expect("chmod read-only");
+        match std::fs::File::create(dir.join(".write_probe")) {
+            Ok(probe) => {
+                drop(probe);
+                f05c_restore_writable(dir);
+                let _ = std::fs::remove_file(dir.join(".write_probe"));
+                false
+            }
+            Err(_) => true,
+        }
+    }
+
+    #[cfg(unix)]
+    fn f05c_restore_writable(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(dir).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(dir, perms).expect("chmod writable");
+    }
+
+    /// A process killed after writing (part of) the temp file but before
+    /// the rename leaves an orphan temp file behind. It is never read, never
+    /// promoted and does not block the next save.
+    #[test]
+    fn f05c_crash_between_write_and_rename_keeps_the_previous_state() {
+        let dir = f05c_dir("crash");
+        let mut g = GaussianGraphStore::new();
+        let a = g.add_document("acknowledged", &[1.0, 0.0]).unwrap();
+        g.save_to_dir(&dir).unwrap();
+        let acknowledged = std::fs::read(f05c_state(&dir)).unwrap();
+        let half = acknowledged[..acknowledged.len() / 2].to_vec();
+
+        let orphan = dir.join(format!("{GRAPH_STATE_FILENAME}.tmp.4711.17"));
+        std::fs::write(&orphan, &half).unwrap();
+
+        let mut reloaded = GaussianGraphStore::load_from_dir(&dir).unwrap();
+        assert_eq!(
+            reloaded.n_nodes(),
+            1,
+            "the orphan must not be read as state"
+        );
+        assert!(reloaded.get_node(a).is_some());
+
+        let b = reloaded
+            .add_entity("after the crash", &[0.0, 1.0], "x")
+            .unwrap();
+        reloaded.save_to_dir(&dir).unwrap();
+        let after = GaussianGraphStore::load_from_dir(&dir).unwrap();
+        assert_eq!(after.n_nodes(), 2);
+        assert!(after.get_node(b).is_some());
+        assert_eq!(
+            std::fs::read(&orphan).unwrap(),
+            half,
+            "the orphan is never promoted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f05c_foreign_version_is_refused_not_silently_loaded() {
+        let dir = f05c_dir("version");
+        let foreign = br#"{"version":99,"next_id":5,"nodes":[],"edges":[]}"#;
+        std::fs::write(f05c_state(&dir), foreign).unwrap();
+        match GaussianGraphStore::load_from_dir(&dir) {
+            Ok(g) => panic!(
+                "a state file of another format version loaded as an empty graph ({} nodes)",
+                g.n_nodes()
+            ),
+            Err(e) => assert!(e.to_string().contains("version"), "{e}"),
+        }
+        assert_eq!(std::fs::read(f05c_state(&dir)).unwrap(), foreign.as_slice());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two processes on one directory: the one holding the older state must
+    /// not overwrite the file the other just wrote.
+    #[test]
+    fn f05c_stale_store_does_not_overwrite_the_file_it_did_not_write() {
+        let dir = f05c_dir("stale");
+        let mut w1 = GaussianGraphStore::new();
+        w1.add_document("A", &[1.0]).unwrap();
+        w1.save_to_dir(&dir).unwrap();
+        // w2 loads, then w1 writes again.
+        let mut w2 = GaussianGraphStore::load_from_dir(&dir).unwrap();
+        let b = w1.add_document("B", &[1.0]).unwrap();
+        w1.save_to_dir(&dir).unwrap();
+        let after_w1 = std::fs::read(f05c_state(&dir)).unwrap();
+
+        w2.add_document("C", &[1.0]).unwrap();
+        assert!(
+            w2.save_to_dir(&dir).is_err(),
+            "a store that did not write the current file overwrote it (B was lost)"
+        );
+        assert_eq!(std::fs::read(f05c_state(&dir)).unwrap(), after_w1);
+        let w3 = GaussianGraphStore::load_from_dir(&dir).unwrap();
+        assert!(w3.get_node(b).is_some(), "B must survive");
+        assert!(w3.get_node(3).is_none(), "C was refused");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f05c_removed_state_file_is_not_recreated_from_a_stale_memory_copy() {
+        let dir = f05c_dir("removed");
+        let mut g = GaussianGraphStore::new();
+        g.add_document("A", &[1.0]).unwrap();
+        g.save_to_dir(&dir).unwrap();
+        let mut g = GaussianGraphStore::load_from_dir(&dir).unwrap();
+        std::fs::remove_file(f05c_state(&dir)).unwrap();
+
+        g.add_document("B", &[1.0]).unwrap();
+        assert!(
+            g.save_to_dir(&dir).is_err(),
+            "a file removed on purpose was recreated from a stale in-memory copy"
+        );
+        assert!(!f05c_state(&dir).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A save that cannot write: error, previous file byte-for-byte intact,
+    /// no temp file left behind, and the next save (once writable) works.
+    #[cfg(unix)]
+    #[test]
+    fn f05c_failed_write_keeps_the_previous_file_and_leaves_no_temp_file() {
+        let dir = f05c_dir("readonly");
+        let mut g = GaussianGraphStore::new();
+        g.add_document("acknowledged", &[1.0, 0.0]).unwrap();
+        g.save_to_dir(&dir).unwrap();
+        let before = std::fs::read(f05c_state(&dir)).unwrap();
+        g.add_document("not acknowledged", &[0.0, 1.0]).unwrap();
+
+        if !f05c_make_unwritable(&dir) {
+            eprintln!("skipped: directory permissions are ignored by this user");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let result = g.save_to_dir(&dir);
+        f05c_restore_writable(&dir);
+
+        assert!(
+            result.is_err(),
+            "a save into an unwritable directory reported success"
+        );
+        assert_eq!(std::fs::read(f05c_state(&dir)).unwrap(), before);
+        assert!(
+            f05c_tmp_files(&dir).is_empty(),
+            "{:?}",
+            f05c_tmp_files(&dir)
+        );
+        g.save_to_dir(&dir).expect("writable again");
+        let reloaded = GaussianGraphStore::load_from_dir(&dir).unwrap();
+        assert_eq!(reloaded.n_nodes(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -1031,4 +1031,151 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // -----------------------------------------------------------------------
+    // F05c — the generic `upsert` (CLI / HTTP writer: no vector in its
+    // signature) must not drop a stored embedding
+    // -----------------------------------------------------------------------
+
+    /// `(embedding, embedding_source)` exactly as stored.
+    fn stored_vector(db_path: &std::path::Path, id: &str) -> (Option<Vec<u8>>, Option<String>) {
+        let db = Connection::open(db_path).expect("open db");
+        db.query_row(
+            "SELECT embedding, embedding_source FROM documents WHERE id=?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("row")
+    }
+
+    /// What the CLI / HTTP path calls: the trait method, no vector.
+    fn legacy_writer_upsert(
+        store: &SqliteMetadataStore,
+        id: &str,
+        text: &str,
+        deleted: bool,
+        vector_idx: i64,
+    ) {
+        let mut rec = record(id, text, vector_idx);
+        rec.deleted = deleted;
+        rec.updated_at = 2.0;
+        rec.metadata = Some(serde_json::json!({ "text": text, "updated_by": "legacy-writer" }));
+        store.upsert(&rec).expect("generic upsert");
+    }
+
+    #[test]
+    fn f05c_generic_upsert_keeps_vector_and_provenance_when_the_text_is_unchanged() {
+        let dir = unique_dir("f05c_keep");
+        let db_path = dir.join("meta.db");
+        let store = SqliteMetadataStore::new(db_path.clone()).unwrap();
+        let vector = [0.25f32, -0.5, 1.0, 0.125];
+        let blob = encode_stored_embedding(&vector).unwrap();
+        for (id, provenance, label) in [
+            ("keep_real", EmbeddingProvenance::Real, "real"),
+            ("keep_simcos", EmbeddingProvenance::SimCos, "simcos"),
+            ("keep_provided", EmbeddingProvenance::Provided, "provided"),
+        ] {
+            store
+                .upsert_with_embedding(&record(id, "the text stays", 0), &vector, provenance)
+                .unwrap();
+            assert_eq!(
+                stored_vector(&db_path, id).0.as_deref(),
+                Some(blob.as_slice()),
+                "{id}: precondition"
+            );
+
+            // Metadata-only update by a writer that does not know vectors.
+            legacy_writer_upsert(&store, id, "the text stays", false, 7);
+
+            let after = stored_vector(&db_path, id);
+            assert_eq!(
+                after.0.as_deref(),
+                Some(blob.as_slice()),
+                "{id}: the generic upsert dropped or changed the stored vector"
+            );
+            assert_eq!(after.1.as_deref(), Some(label), "{id}: provenance lost");
+            // ...while the document columns ARE replaced, as before.
+            let rec = store.get(id).unwrap().expect("row");
+            assert_eq!(rec.vector_idx, 7, "{id}");
+            assert_eq!(rec.updated_at, 2.0, "{id}");
+            assert_eq!(
+                rec.metadata.as_ref().and_then(|m| m["updated_by"].as_str()),
+                Some("legacy-writer"),
+                "{id}"
+            );
+            assert_eq!(rec.document.as_deref(), Some("the text stays"), "{id}");
+        }
+        let db = Connection::open(&db_path).unwrap();
+        assert_eq!(row_count(&db), 3, "an update must not duplicate rows");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f05c_generic_upsert_retires_a_vector_that_would_describe_another_text() {
+        let dir = unique_dir("f05c_text");
+        let db_path = dir.join("meta.db");
+        let store = SqliteMetadataStore::new(db_path.clone()).unwrap();
+        store
+            .upsert_with_embedding(
+                &record("t1", "old text", 0),
+                &[1.0, 0.0],
+                EmbeddingProvenance::Real,
+            )
+            .unwrap();
+        legacy_writer_upsert(&store, "t1", "a DIFFERENT text", false, 1);
+        assert_eq!(
+            stored_vector(&db_path, "t1"),
+            (None, None),
+            "a vector of the old text must not be served for the new one"
+        );
+        assert_eq!(
+            store.get("t1").unwrap().unwrap().document.as_deref(),
+            Some("a DIFFERENT text")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn f05c_generic_upsert_never_inherits_a_vector_into_a_new_revived_or_deleted_row() {
+        let dir = unique_dir("f05c_inherit");
+        let db_path = dir.join("meta.db");
+        let store = SqliteMetadataStore::new(db_path.clone()).unwrap();
+
+        // A row that never had a vector.
+        legacy_writer_upsert(&store, "brand_new", "never had a vector", false, 0);
+        assert_eq!(stored_vector(&db_path, "brand_new"), (None, None));
+
+        // A soft-deleted row re-stored by the generic path: its vector was
+        // retired by `soft_delete` and must not come back.
+        store
+            .upsert_with_embedding(
+                &record("revived", "same text", 0),
+                &[1.0, 0.0],
+                EmbeddingProvenance::Real,
+            )
+            .unwrap();
+        store.soft_delete("revived").unwrap();
+        legacy_writer_upsert(&store, "revived", "same text", false, 2);
+        assert_eq!(
+            stored_vector(&db_path, "revived"),
+            (None, None),
+            "a retired vector must not be resurrected with a revived row"
+        );
+
+        // An upsert that stops the row from being live retires the vector.
+        store
+            .upsert_with_embedding(
+                &record("flagged", "same text", 0),
+                &[1.0, 0.0],
+                EmbeddingProvenance::Real,
+            )
+            .unwrap();
+        legacy_writer_upsert(&store, "flagged", "same text", true, 3);
+        assert_eq!(
+            stored_vector(&db_path, "flagged"),
+            (None, None),
+            "a row that stops being live must not keep a stored vector behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
