@@ -429,3 +429,38 @@ fn f04_load_splats_invalidates_the_hrm2_engine() {
     );
     assert!(results[0].distance < 1e-4);
 }
+
+// ── A01-F16: `HRM2Engine::index` with an empty dataset fails closed ────────
+//
+// With 0 rows KMeans leaves `labels = None` (Lloyd) or `fit_emeans` divides by
+// a zero batch (Emeans); both reached an `.expect()`/`div_ceil` panic.
+
+use splatsdb::clustering::TrainerKind;
+use splatsdb::hrm2_engine::HRM2Engine;
+
+#[test]
+fn f16_engine_index_empty_dataset_does_not_panic() {
+    for trainer in [TrainerKind::Lloyd, TrainerKind::Emeans] {
+        let mut engine = HRM2Engine::new(4, 8, 8, 2, "cosine", trainer);
+        let empty = Array2::zeros((0, 8));
+        assert_eq!(engine.index(Some(empty.clone())), 0.0);
+        assert!(!engine.is_indexed());
+        let query = Array1::zeros(8);
+        assert!(
+            engine.query(&query.view(), 3, 2).is_err(),
+            "query on an empty index must fail closed"
+        );
+    }
+}
+
+#[test]
+fn f16_engine_index_empty_dataset_drops_the_previous_index() {
+    let mut engine = HRM2Engine::new(4, 8, 8, 2, "cosine", TrainerKind::Lloyd);
+    engine.index(Some(random_vectors(60, 8, 1)));
+    assert!(engine.is_indexed());
+    engine.index(Some(Array2::zeros((0, 8))));
+    assert!(
+        !engine.is_indexed(),
+        "indexing an empty dataset invalidates the previous index"
+    );
+}
