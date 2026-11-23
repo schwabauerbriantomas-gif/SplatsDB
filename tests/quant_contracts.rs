@@ -14,21 +14,12 @@
 //! once, A/B bench) live in `quant_contracts/ab_bench.rs`; `quant_contracts/d18_probe.rs`
 //! is the cross-commit evidence probe (default order: recall vs exact-L2 GT + hash).
 //!
-//! F04c (A02-F04): lossless bit-packing — bit-stream round trips, packed == unpacked
-//! ids/order/score bits, store vs unpacked reference on the F04b datasets, atomicity,
-//! serde goldens — in `quant_contracts/packing.rs`; `quant_contracts/ab_release.rs` is
-//! the release A/B probe (N=10000) and the source of the serde goldens.
-//!
 //! Run: `cargo test --no-default-features --test quant_contracts`
 
 #[path = "quant_contracts/ab_bench.rs"]
 mod ab_bench;
-#[path = "quant_contracts/ab_release.rs"]
-mod ab_release;
 #[path = "quant_contracts/d18_probe.rs"]
 mod d18_probe;
-#[path = "quant_contracts/packing.rs"]
-mod packing;
 #[path = "quant_contracts/properties.rs"]
 mod properties;
 #[path = "quant_contracts/ranking.rs"]
@@ -266,14 +257,12 @@ fn qjl_sketch_schema_v1_roundtrip_and_byte_cost() {
 }
 
 // ---------------------------------------------------------------------------
-// A02-F04 / F04c: memory metrics reflect the real (bit-packed) layout, not dim*bits/8.
+// A02-F04: memory metrics reflect the real (unpacked) layout, not dim*bits/8.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn memory_metrics_report_the_real_packed_layout_for_bits_2_4_8() {
-    use splatsdb::quant::polar::PackedPolarCode;
-    use splatsdb::quant::turbo::PackedTurboCode;
-    use splatsdb::quant::{PolarCode, QjlSketch};
+fn memory_metrics_report_the_real_unpacked_layout_for_bits_2_4_8() {
+    use splatsdb::quant::{PolarCode, QjlSketch, TurboCode};
     const DIM: usize = 640;
     const N: usize = 1000;
     let vectors = uniform_matrix(N, DIM, 21);
@@ -292,36 +281,18 @@ fn memory_metrics_report_the_real_packed_layout_for_bits_2_4_8() {
             let n = store.len();
             assert_eq!(n, N);
 
-            // Independent count of the packed layout: one exact f32 radius per pair, the
-            // angle index in `bits` bits (`bits - 1` for TurboQuant) in one stream, one
-            // sign bit per projection and an f32 residual norm (TurboQuant only).
-            let angle_bits = if turbo { bits - 1 } else { bits } as usize;
-            let angle_bytes = (DIM / 2 * angle_bits).div_ceil(8);
-            let per_code =
-                DIM / 2 * 4 + angle_bytes + if turbo { (DIM / 8).div_ceil(8) + 4 } else { 0 };
-            // The unpacked layout this replaced (<= 9f319b2): 6 B per pair + i8 signs.
-            let unpacked = DIM / 2 * 6 + if turbo { DIM / 8 + 4 } else { 0 };
+            // Independent count of the current layout: f32 radius + u16 angle index per
+            // pair, i8 per QJL sign, f32 residual norm (TurboQuant only).
+            let per_code = DIM / 2 * (4 + 2) + if turbo { DIM / 8 + 4 } else { 0 };
             let nominal = 32.0 / bits as f32;
             let raw = n * DIM * 4;
             let real = n * per_code;
 
-            assert_eq!(
-                PackedPolarCode::layout_bytes(DIM, angle_bits as u8),
-                DIM / 2 * 4 + angle_bytes
-            );
-            if turbo {
-                assert_eq!(PackedTurboCode::layout_bytes(DIM, bits, DIM / 8), per_code);
-            } else {
-                assert_eq!(
-                    store.code_layout_bytes(),
-                    PackedPolarCode::layout_bytes(DIM, bits)
-                );
-            }
             assert_eq!(PolarCode::layout_bytes(DIM), DIM / 2 * 6);
             assert_eq!(QjlSketch::layout_bytes(DIM / 8), DIM / 8 + 4);
             assert_eq!(store.code_layout_bytes(), per_code);
             assert_eq!(store.encoded_bytes(), real, "count must match the layout");
-            assert!(store.is_bit_packed());
+            assert!(!store.is_bit_packed());
             let ratio = store.compression_ratio();
             assert!(
                 (ratio - raw as f32 / real as f32).abs() < 1e-5,
@@ -332,12 +303,12 @@ fn memory_metrics_report_the_real_packed_layout_for_bits_2_4_8() {
                 "bits={bits} {algorithm:?}: nominal {nominal}x is not what the layout delivers ({ratio}x)"
             );
             let inline = if turbo {
-                std::mem::size_of::<PackedTurboCode>()
+                std::mem::size_of::<TurboCode>()
             } else {
-                std::mem::size_of::<PackedPolarCode>()
+                std::mem::size_of::<PolarCode>()
             };
-            // The f32 norm is inline in PackedTurboCode (already inside `inline`), so it
-            // is subtracted from the logical payload: memory_usage() = heap + struct + id.
+            // The f32 norm is inline in TurboCode (already inside `inline`), so it is
+            // subtracted from the logical payload: memory_usage() = heap + struct + id.
             let inline_norm = if turbo { std::mem::size_of::<f32>() } else { 0 };
             // Quantizer matrices held once per store: the d×d rotation and, for
             // TurboQuant, the m×d QJL projection cache (A02-F02) — never per code.
@@ -352,9 +323,7 @@ fn memory_metrics_report_the_real_packed_layout_for_bits_2_4_8() {
                 real - n * inline_norm + n * (inline + std::mem::size_of::<u64>()) + quantizer
             );
             report.push(format!(
-                "bits={bits} {algorithm:?} m={}: raw={raw} B, encoded={real} B ({per_code} B/code, was {unpacked} B unpacked: {:.3}x less payload), ratio={ratio:.4} (nominal {nominal}), memory_usage={} B",
-                if turbo { DIM / 8 } else { 0 },
-                unpacked as f64 / per_code as f64,
+                "bits={bits} {algorithm:?}: raw={raw} B, encoded={real} B ({per_code} B/code), ratio={ratio:.4} (nominal {nominal}), memory_usage={} B",
                 store.memory_usage()
             ));
         }
@@ -364,38 +333,31 @@ fn memory_metrics_report_the_real_packed_layout_for_bits_2_4_8() {
 
 #[test]
 fn memory_usage_on_a_10k_code_store_matches_the_declared_overhead() {
-    use splatsdb::quant::turbo::PackedTurboCode;
+    use splatsdb::quant::TurboCode;
     const DIM: usize = 640;
     const N: usize = 10_000;
     let mut store = QuantizedStore::new(DIM, QuantConfig::for_search(DIM)).unwrap();
     store.add_batch(&uniform_matrix(N, DIM, 22), 0).unwrap();
     assert_eq!(store.len(), N);
-    // for_search(640) = 4 bits, 80 projections: 1280 B radii + 120 B angles (3 bits *
-    // 320 pairs) + 10 B signs + 4 B norm.
     let per_code = store.code_layout_bytes();
-    assert_eq!(
-        per_code,
-        DIM / 2 * 4 + (DIM / 2 * 3).div_ceil(8) + (DIM / 8).div_ceil(8) + 4
-    );
-    assert_eq!(per_code, 1414);
-    assert!(store.is_bit_packed());
+    assert_eq!(per_code, DIM / 2 * 6 + DIM / 8 + 4);
     assert_eq!(store.encoded_bytes(), N * per_code);
-    // The f32 norm lives inline in PackedTurboCode (counted through its size_of), so
-    // memory_usage() = encoded_bytes() - 4 B/code + struct + 8 B/id: no double count.
+    // The f32 norm lives inline in TurboCode (counted through size_of::<TurboCode>()),
+    // so memory_usage() = encoded_bytes() - 4 B/code + struct + 8 B/id: no double count.
     // Plus the quantizer matrices counted once: rotation d×d + QJL projection m×d.
     let quantizer = DIM * DIM * 4 + DIM / 8 * DIM * 4;
     assert_eq!(store.quantizer_memory_usage(), quantizer);
     let declared = store.encoded_bytes() - N * std::mem::size_of::<f32>()
-        + N * (std::mem::size_of::<PackedTurboCode>() + std::mem::size_of::<u64>())
+        + N * (std::mem::size_of::<TurboCode>() + std::mem::size_of::<u64>())
         + quantizer;
     assert_eq!(store.memory_usage(), declared);
     let raw = N * DIM * 4;
     println!(
-        "10k x 640-D 4-bit TurboQuant (m=80), packed: raw={raw} B, encoded={} B, memory_usage={declared} B, ratio={} (nominal 8.0; unpacked layout was 2004 B/code, 2120 B/code with headers)",
+        "10k x 640-D 4-bit TurboQuant: raw={raw} B, encoded={} B, memory_usage={declared} B, ratio={} (nominal 8.0)",
         store.encoded_bytes(),
         raw as f32 / store.encoded_bytes() as f32
     );
-    // 1414 B payload - 4 B inline norm + struct + 8 B id per vector < 2560 B raw.
+    // 2004 B payload - 4 B inline norm + 112 B struct + 8 B id = 2120 B per vector vs 2560 B raw.
     assert!(store.memory_usage() < raw);
     assert!(store.memory_usage() > raw / 2);
 }
