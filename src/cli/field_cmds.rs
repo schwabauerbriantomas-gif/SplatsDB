@@ -119,7 +119,7 @@ pub fn persist_field(
 
     let empty = counts.iter().filter(|&&c| c == 0).count();
     let mut sorted_r = rmax.clone();
-    sorted_r.sort_by(|a, b| a.total_cmp(&b));
+    sorted_r.sort_by(|a, b| a.total_cmp(b));
     let med = if sorted_r.is_empty() {
         0.0
     } else {

@@ -686,7 +686,7 @@ fn simple_kmeans(
             let best_c = row
                 .iter()
                 .enumerate()
-                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .max_by(|a, b| a.1.total_cmp(b.1))
                 .map(|(c, _)| c)
                 .unwrap_or(0);
             if labels[i] != best_c {
