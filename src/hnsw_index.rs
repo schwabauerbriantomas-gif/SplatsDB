@@ -153,9 +153,15 @@ impl HNSWIndex {
     }
 
     /// Save the HNSW graph to a binary file.
+    ///
+    /// Atomic and buffered (A01-F09 + A05-F09): the bytes are buffered into a
+    /// uniquely named temp file next to `path`, fsynced, then renamed over
+    /// `path`, and the directory is fsynced. A crash or I/O error therefore
+    /// leaves the previous snapshot untouched instead of a truncated file; on
+    /// a reported error the temp file is removed. The byte layout of a valid
+    /// file is unchanged.
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        let mut f =
-            std::fs::File::create(path).map_err(|e| format!("create {}: {}", path.display(), e))?;
+        let mut f = AtomicWriter::create(path)?;
 
         let n_vectors = self.vectors.len() as u64;
         let dim = if self.vectors.is_empty() {
@@ -215,6 +221,7 @@ impl HNSWIndex {
                 .map_err(|e| format!("write vector data: {}", e))?;
         }
 
+        f.finish()?;
         Ok(())
     }
 
@@ -227,10 +234,12 @@ impl HNSWIndex {
         metric: &str,
         seed: u64,
     ) -> Result<Self, String> {
-        let mut f =
+        let file =
             std::fs::File::open(path).map_err(|e| format!("open {}: {}", path.display(), e))?;
+        // Buffered: the file is a long run of 8-byte fields (A01-F09).
+        let mut f = std::io::BufReader::new(file);
 
-        let read_u64 = |f: &mut std::fs::File| -> Result<u64, String> {
+        let read_u64 = |f: &mut std::io::BufReader<std::fs::File>| -> Result<u64, String> {
             let mut buf = [0u8; 8];
             f.read_exact(&mut buf)
                 .map_err(|e| format!("read u64: {}", e))?;
@@ -740,6 +749,129 @@ impl VectorIndex for HNSWIndex {
     }
 }
 
+/// Write-then-rename writer for the HNSW snapshot: the minimal local atomic
+/// write (dedupe with `storage::atomic_write` at integration — that helper
+/// takes one full in-memory buffer and a predictable temp name, neither of
+/// which fits a multi-GB snapshot).
+///
+/// The temp file is created with O_EXCL under a name unique per process and
+/// per call, in the target's own directory (same filesystem, so the rename
+/// cannot cross devices). [`AtomicWriter::finish`] flushes, fsyncs the file,
+/// renames it over the target and fsyncs the directory. A writer dropped
+/// without `finish` — an error return, a panic — removes the temp file,
+/// leaving the previous target bytes in place.
+struct AtomicWriter {
+    target: std::path::PathBuf,
+    temp: std::path::PathBuf,
+    file: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+impl AtomicWriter {
+    fn create(target: &Path) -> Result<Self, String> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let name = target
+            .file_name()
+            .ok_or_else(|| format!("invalid target path {}", target.display()))?
+            .to_string_lossy();
+        let mut last_err = String::from("no unique temp name");
+        for _ in 0..16 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let candidate = target.with_file_name(format!(
+                "{name}.{}.{nanos:x}.{}.tmp",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(f) => {
+                    return Ok(Self {
+                        target: target.to_path_buf(),
+                        temp: candidate,
+                        file: Some(std::io::BufWriter::new(f)),
+                    })
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    last_err = e.to_string();
+                }
+                Err(e) => return Err(format!("create temp for {}: {}", target.display(), e)),
+            }
+        }
+        Err(format!(
+            "create temp for {}: {}",
+            target.display(),
+            last_err
+        ))
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        let file = self
+            .file
+            .take()
+            .ok_or_else(|| format!("finish {}: writer already closed", self.target.display()))?;
+        // into_inner() flushes the buffer; on failure the file inside the
+        // error is dropped (closed) and `drop` below removes the temp file.
+        let file = file
+            .into_inner()
+            .map_err(|e| format!("flush {}: {e}", self.temp.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", self.temp.display()))?;
+        drop(file);
+        std::fs::rename(&self.temp, &self.target).map_err(|e| {
+            format!(
+                "rename {} -> {}: {e}",
+                self.temp.display(),
+                self.target.display()
+            )
+        })?;
+        // The rename itself is a directory entry: fsync the directory so the
+        // new snapshot is the one a crash leaves behind.
+        let dir = self
+            .target
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let dir_file = std::fs::File::open(dir)
+            .map_err(|e| format!("open dir {} after rename: {e}", dir.display()))?;
+        dir_file
+            .sync_all()
+            .map_err(|e| format!("fsync dir {} after rename: {e}", dir.display()))
+    }
+}
+
+impl Drop for AtomicWriter {
+    fn drop(&mut self) {
+        // Close the handle first (an OS may pin open files)...
+        self.file = None;
+        // ...then remove the temp file unless `finish` renamed it away.
+        if self.temp.exists() {
+            let _ = std::fs::remove_file(&self.temp);
+        }
+    }
+}
+
+impl Write for AtomicWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.file.as_mut() {
+            Some(f) => f.write(buf),
+            None => Err(std::io::Error::other("atomic writer is closed")),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.file.as_mut() {
+            Some(f) => f.flush(),
+            None => Err(std::io::Error::other("atomic writer is closed")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1008,5 +1140,189 @@ mod tests {
         let smallest = with_header_u64(&good, HDR_M_MAX0, 8);
         let loaded = load_bytes("m_max0_eq_m", &smallest).unwrap();
         assert_eq!(loaded.n_items(), 10);
+    }
+
+    /// The layout `save()` has always written — header, removed ids, node
+    /// adjacency, raw f32 vectors — as an independent UNBUFFERED reference,
+    /// so the buffered/atomic writer cannot change a single valid byte.
+    fn reference_bytes(idx: &HNSWIndex) -> Vec<u8> {
+        use std::io::Cursor;
+        let mut f = Cursor::new(Vec::new());
+        let dim = if idx.vectors.is_empty() {
+            idx._dim as u64
+        } else {
+            idx.vectors[0].len() as u64
+        };
+        for v in [
+            HNSW_MAGIC,
+            idx.vectors.len() as u64,
+            dim,
+            idx.m as u64,
+            idx.m_max0 as u64,
+            idx.ef_construction as u64,
+            idx.ef_search as u64,
+            idx.entry_point as u64,
+            idx.max_level as u64,
+        ] {
+            f.write_all(&v.to_le_bytes()).unwrap();
+        }
+        let removed: Vec<u64> = idx.removed.iter().map(|&x| x as u64).collect();
+        f.write_all(&(removed.len() as u64).to_le_bytes()).unwrap();
+        for r in &removed {
+            f.write_all(&r.to_le_bytes()).unwrap();
+        }
+        for node in &idx.nodes {
+            f.write_all(&(node.neighbors.len() as u64).to_le_bytes())
+                .unwrap();
+            for level in &node.neighbors {
+                f.write_all(&(level.len() as u64).to_le_bytes()).unwrap();
+                for &nb in level {
+                    f.write_all(&(nb as u64).to_le_bytes()).unwrap();
+                }
+            }
+        }
+        for v in &idx.vectors {
+            f.write_all(bytemuck::cast_slice(v.as_slice())).unwrap();
+        }
+        f.into_inner()
+    }
+
+    /// A01-F09 + A05-F09: valid files stay byte-identical to the layout the
+    /// unbuffered writer produced, and a buffered load round-trips them
+    /// (ids AND distances, both metrics, with removed ids).
+    #[test]
+    fn test_save_is_byte_identical_and_buffered_load_roundtrips() {
+        for (metric, seed) in [("l2", 555u64), ("cosine", 777)] {
+            let mut idx = HNSWIndex::new(4, 8, 100, 50, metric, 42);
+            idx.build(small_random_vectors(2_000, 16, seed));
+            idx.remove(&[3, 17, 999]);
+            let bytes = saved_bytes(&idx, &format!("layout_{metric}"));
+            assert!(
+                bytes == reference_bytes(&idx),
+                "{metric}: save() bytes differ from the on-disk layout"
+            );
+            let path = temp_file(&format!("layout_load_{metric}"));
+            std::fs::write(&path, &bytes).unwrap();
+            let loaded = HNSWIndex::load(&path, 8, 100, 50, metric, 42).unwrap();
+            std::fs::remove_file(&path).ok();
+            assert_eq!(loaded.n_items(), idx.n_items());
+            for i in [0usize, 1, 500, 1999] {
+                let q = ndarray::arr1(&idx.vectors[i]);
+                let a = idx.search(q.view(), 10);
+                let b = loaded.search(q.view(), 10);
+                assert_eq!(
+                    (a.indices, a.distances),
+                    (b.indices, b.distances),
+                    "{metric} query {i}"
+                );
+            }
+        }
+    }
+
+    /// In-memory index with `n` zero-neighbor nodes — no graph build, so the
+    /// child process of the crash test spends its time writing, not inserting.
+    fn bulk_index(n: usize, dim: usize) -> HNSWIndex {
+        let mut idx = HNSWIndex::new(4, 8, 100, 50, "l2", 42);
+        for i in 0..n {
+            idx.vectors.push(vec![(i % 7) as f32; dim]);
+            idx.norms.push(0.0);
+            idx.nodes.push(HNSWNode {
+                _level: 0,
+                neighbors: vec![Vec::new()],
+            });
+        }
+        idx
+    }
+
+    /// A01-F09 + A05-F09: a save that is killed mid-write (SIGKILL — the
+    /// crash case) must leave the previous snapshot byte-identical and
+    /// loadable. The writer used to truncate the live file first, so an
+    /// interrupted save replaced it with a short, unreadable one.
+    #[test]
+    fn test_save_killed_midway_preserves_previous_file() {
+        let dir = std::env::temp_dir().join(format!("hnsw_atomic_crash_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hnsw_index.bin");
+        let mut prev = HNSWIndex::new(4, 8, 100, 50, "l2", 42);
+        prev.build(small_random_vectors(300, 8, 555));
+        prev.save(&path).unwrap();
+        let prev_bytes = std::fs::read(&path).unwrap();
+
+        if let Some(target) = std::env::var_os("SPLATSDB_TEST_HNSW_SAVE_CHILD") {
+            // Child: write a ~77 MB snapshot over the previous file.
+            bulk_index(150_000, 128).save(Path::new(&target)).unwrap();
+            return;
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "hnsw_index::tests::test_save_killed_midway_preserves_previous_file",
+                "--nocapture",
+            ])
+            .env("SPLATSDB_TEST_HNSW_SAVE_CHILD", &path)
+            .spawn()
+            .unwrap();
+
+        // Wait until the child's save has BEGUN, then kill it mid-write.
+        let start = std::time::Instant::now();
+        let mut observed = false;
+        while start.elapsed() < std::time::Duration::from_secs(120) {
+            let target_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let temps = std::fs::read_dir(&dir)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter(|e| e.path() != path)
+                        .count()
+                })
+                .unwrap_or(0);
+            if target_len != prev_bytes.len() as u64 || temps > 0 {
+                observed = true;
+                break;
+            }
+            if child.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(observed, "the child's save was never observed in progress");
+        let after = std::fs::read(&path).unwrap();
+        assert!(
+            after == prev_bytes,
+            "an interrupted save damaged the previous snapshot ({} -> {} bytes)",
+            prev_bytes.len(),
+            after.len()
+        );
+        assert!(HNSWIndex::load(&path, 8, 100, 50, "l2", 42).is_ok());
+        // A temp file left by the killed writer must not block the next save.
+        prev.save(&path).unwrap();
+        assert!(std::fs::read(&path).unwrap() == prev_bytes);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A save whose final step fails (here: the target is a directory, so the
+    /// rename is refused) reports the error, leaves the target untouched and
+    /// removes its temp file.
+    #[test]
+    fn test_save_error_keeps_target_and_removes_temp_file() {
+        let dir = std::env::temp_dir().join(format!("hnsw_atomic_err_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("is_a_dir.bin");
+        std::fs::create_dir_all(&target).unwrap();
+        let mut idx = HNSWIndex::new(4, 8, 100, 50, "l2", 42);
+        idx.build(small_random_vectors(20, 4, 555));
+        assert!(idx.save(&target).is_err());
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert!(
+            entries.iter().all(|p| *p == target),
+            "temp file left behind: {entries:?}"
+        );
+        assert!(target.is_dir());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
