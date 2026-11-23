@@ -101,6 +101,15 @@ pub struct SearchHit {
     pub mode: ScoreMode,
 }
 
+/// Objective of the brute-force ground truth of a recall measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroundTruth {
+    /// The `k` smallest exact squared L2 distances.
+    L2,
+    /// The `k` largest exact inner products.
+    InnerProduct,
+}
+
 /// Compressed vector store using TurboQuant.
 pub struct QuantizedStore {
     config: QuantConfig,
@@ -402,8 +411,13 @@ impl QuantizedStore {
     /// norm, which is therefore not counted a second time), 8 B per id, and the
     /// quantizer caches ([`Self::quantizer_memory_usage`]: rotation matrix and QJL
     /// projection matrix, once each). Excludes allocator slack (`Vec` capacity beyond
-    /// `len`) and the transient per-query context (`(dim + projections) * 4` B for the
-    /// duration of one search).
+    /// `len`), the transient per-query context (`(dim + projections) * 4` B for the
+    /// duration of one search) and the cos/sin table of the polar bit width: that table
+    /// is process-wide, one per bit width for every quantizer and store (`2^bits * 8` B,
+    /// [`PolarCode::trig_table_bytes`], 512 KiB at most at 16 bits), built on the first
+    /// score and owned by no store. Adding it per store would count the same table once
+    /// per store: to account for it, add `PolarCode::trig_table_bytes(bits)` once per
+    /// bit width in use, not `memory_usage() + trig_table_bytes` per store.
     pub fn memory_usage(&self) -> usize {
         // Heap payload of the codes + the inline part of each code (the struct with
         // its Vec headers and, for TurboQuant, the f32 norm) + 8 B per id. The norm
@@ -452,19 +466,60 @@ impl QuantizedStore {
     /// Given a set of query vectors and the full dataset, computes what fraction
     /// of the true top-k neighbors are recovered by quantized search.
     /// Returns recall in [0.0, 1.0] where 1.0 = perfect recall.
+    ///
+    /// The ground truth is exact L2 and row `i` of `data` must be the vector stored
+    /// with id `i` (what `add_batch(&data, 0)` produces): the search returns ids, the
+    /// ground truth is made of row indices.
     pub fn measure_recall(&self, queries: &Array2<f32>, data: &Array2<f32>, k: usize) -> f32 {
         self.measure_recall_with_mode(queries, data, k, Self::default_score_mode())
     }
 
-    /// [`Self::measure_recall`] under an explicit `mode`. The ground truth is exact L2;
-    /// for [`ScoreMode::InnerProduct`] that is a different objective, so its recall is
-    /// reported separately and never mixed with the default's (D18).
+    /// [`Self::measure_recall`] under an explicit `mode`, against the brute-force
+    /// ground truth of that mode's own objective (D18, F04e): the exact L2 neighbours
+    /// for [`ScoreMode::L2Heuristic`] (the default), the exact top-k inner products for
+    /// [`ScoreMode::InnerProduct`]. They are recalls of two different objectives and
+    /// are never mixed: the recall of the `ip` mode is the one against inner-product
+    /// ground truth. Against L2 ground truth whatever the mode, see
+    /// [`Self::measure_recall_against_l2_with_mode`] (a cross metric for `ip`).
     pub fn measure_recall_with_mode(
         &self,
         queries: &Array2<f32>,
         data: &Array2<f32>,
         k: usize,
         mode: ScoreMode,
+    ) -> f32 {
+        let ground_truth = match mode {
+            ScoreMode::L2Heuristic => GroundTruth::L2,
+            ScoreMode::InnerProduct => GroundTruth::InnerProduct,
+        };
+        self.recall_against(queries, data, k, mode, ground_truth)
+    }
+
+    /// Recall@k of `mode` against exact L2 ground truth, whatever the mode is. For
+    /// [`ScoreMode::L2Heuristic`] it is [`Self::measure_recall_with_mode`]; for
+    /// [`ScoreMode::InnerProduct`] it is a CROSS metric -- how many L2 neighbours the
+    /// inner-product ranking happens to return -- and not the recall of the `ip`
+    /// objective. Until F04e `measure_recall_with_mode(.., InnerProduct)` returned this
+    /// number.
+    pub fn measure_recall_against_l2_with_mode(
+        &self,
+        queries: &Array2<f32>,
+        data: &Array2<f32>,
+        k: usize,
+        mode: ScoreMode,
+    ) -> f32 {
+        self.recall_against(queries, data, k, mode, GroundTruth::L2)
+    }
+
+    /// Recall@k of `mode` against exact brute-force ground truth (f64 accumulations,
+    /// ties by row index): a rejected query contributes zero recall.
+    fn recall_against(
+        &self,
+        queries: &Array2<f32>,
+        data: &Array2<f32>,
+        k: usize,
+        mode: ScoreMode,
+        ground_truth: GroundTruth,
     ) -> f32 {
         if self.is_empty() || queries.nrows() == 0 {
             return 0.0;
@@ -475,29 +530,43 @@ impl QuantizedStore {
         for qi in 0..n_queries {
             let query = queries.row(qi);
 
-            // Ground truth: brute-force top-k
-            let mut gt_dists: Vec<(usize, f32)> = data
+            // Ground truth: brute-force top-k of the objective. A row without a value
+            // (NaN) has no rank.
+            let mut gt: Vec<(usize, f64)> = data
                 .outer_iter()
                 .enumerate()
                 .map(|(i, row)| {
-                    let dist: f32 = row
-                        .iter()
-                        .zip(query.iter())
-                        .map(|(a, b)| {
-                            let d = a - b;
-                            d * d
-                        })
-                        .sum();
-                    (i, dist)
+                    let value: f64 = match ground_truth {
+                        GroundTruth::L2 => row
+                            .iter()
+                            .zip(query.iter())
+                            .map(|(a, b)| {
+                                let d = f64::from(*a) - f64::from(*b);
+                                d * d
+                            })
+                            .sum(),
+                        GroundTruth::InnerProduct => row
+                            .iter()
+                            .zip(query.iter())
+                            .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                            .sum(),
+                    };
+                    (i, value)
                 })
+                .filter(|(_, value)| value.is_finite())
                 .collect();
-            let k = k.min(gt_dists.len());
+            let k = k.min(gt.len());
             if k == 0 {
                 continue;
             }
-            gt_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            // Nearest first: the smallest squared distances, the largest inner products
+            // (a stable sort over the row order: ties by row index).
+            gt.sort_by(|a, b| match ground_truth {
+                GroundTruth::L2 => a.1.total_cmp(&b.1),
+                GroundTruth::InnerProduct => b.1.total_cmp(&a.1),
+            });
             let gt_set: std::collections::HashSet<usize> =
-                gt_dists[..k].iter().map(|(i, _)| *i).collect();
+                gt[..k].iter().map(|(i, _)| *i).collect();
 
             // Quantized search top-k (a rejected query contributes zero recall)
             let qresults = self.search_scored(&query, k, mode).unwrap_or_default();

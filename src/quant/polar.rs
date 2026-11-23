@@ -126,9 +126,14 @@ impl PolarCode {
     /// The dequantized angle of `index` at `bits`: `(index / 2^bits) * 2pi - pi`, f32
     /// throughout. The only place the angle is defined: the cos/sin table of a bit width
     /// and every direct evaluation consume exactly this value.
+    ///
+    /// A width of 32 bits or more has no `2^bits` in a u32: `NaN` (no angle is defined
+    /// there and no quantizer accepts it) instead of a shift overflow.
     pub fn dequantize_index(index: u16, bits: u8) -> f32 {
-        let levels = 1u32 << bits;
-        (index as f32 / levels as f32) * (2.0 * PI) - PI
+        match 1u32.checked_shl(u32::from(bits)) {
+            Some(levels) => (index as f32 / levels as f32) * (2.0 * PI) - PI,
+            None => f32::NAN,
+        }
     }
 
     /// Heap bytes of the cos/sin table a score at `bits` goes through: `2^bits` entries of
@@ -136,8 +141,14 @@ impl PolarCode {
     /// is one table per bit width for the whole process, built on the first score and
     /// shared by every quantizer and store of that bit width: it is not owned by a store,
     /// so it is not part of `QuantizedStore::memory_usage()`.
+    ///
+    /// `0` for any other width (0, or above 16): no quantizer accepts it, so no table of
+    /// that width is ever built.
     pub const fn trig_table_bytes(bits: u8) -> usize {
-        (1usize << bits) * std::mem::size_of::<[f32; 2]>()
+        match bits {
+            1..=16 => (1usize << bits) * std::mem::size_of::<[f32; 2]>(),
+            _ => 0,
+        }
     }
 
     /// Payload bytes of one code in the current unpacked layout: an f32 radius and a

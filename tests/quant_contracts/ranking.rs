@@ -526,6 +526,8 @@ fn probe_modes() {
                 }
                 top10_per_mode.push(top10_all);
                 let measured = store.measure_recall_with_mode(&queries, &data, K, mode);
+                let measured_against_l2 =
+                    store.measure_recall_against_l2_with_mode(&queries, &data, K, mode);
                 println!(
                     "{}",
                     json!({
@@ -541,7 +543,8 @@ fn probe_modes() {
                         "gt": "exact f64 L2 (recall_vs_exact_l2) | exact f64 inner product (recall_vs_exact_ip)",
                         "recall_vs_exact_l2": recall_l2 / N_QUERIES as f64,
                         "recall_vs_exact_ip": recall_ip / N_QUERIES as f64,
-                        "measure_recall_with_mode_exact_l2": measured,
+                        "measure_recall_with_mode": measured,
+                        "measure_recall_against_l2_with_mode": measured_against_l2,
                         "ranking_hash": format!("{ranking_hash:016x}"),
                         "top10_hash": format!("{top10_hash:016x}"),
                         "nonfinite_scores": nonfinite,
