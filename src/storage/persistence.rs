@@ -43,37 +43,122 @@ fn validate_shard_name(name: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Parent directory of `path` (`.` for a bare file name).
+pub(crate) fn parent_dir(path: &Path) -> PathBuf {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Make a rename inside `dir` durable: fsync the directory itself.
+///
+/// `rename` is atomic, but the new directory entry only lives in the page
+/// cache until the directory is fsynced — without this step a power loss
+/// can bring back the pre-rename name (D4 / A03-F02).
+///
+/// Filesystems that cannot sync a directory answer `EINVAL` / `ENOTSUP`: the
+/// rename stays atomic there, it just cannot be made durable explicitly, so
+/// the condition is reported once on stderr instead of failing every write.
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(not(unix))]
+    {
+        // Directory fsync is a POSIX notion; nothing to do elsewhere.
+        let _ = dir;
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        let file = std::fs::File::open(dir)?;
+        match file.sync_all() {
+            Ok(()) => Ok(()),
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EINVAL) | Some(libc::ENOTSUP)) => {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "[storage] WARNING: directory {} cannot be fsynced ({}); renames there stay atomic but cannot be made durable explicitly",
+                        dir.display(),
+                        e
+                    );
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Create a new, uniquely named sibling of `path` and return its path plus
+/// an append-mode handle to it.
+///
+/// The name embeds the pid, a process-wide counter and a random value, and
+/// is opened with `create_new` (`O_CREAT | O_EXCL`): it can neither collide
+/// with another concurrent caller nor be pre-created by someone else — a
+/// symlink planted under a predictable name makes `create_new` fail instead
+/// of being followed (CWE-377 / CWE-59, A05-F09).
+pub(crate) fn create_unique_sibling(
+    path: &Path,
+    kind: &str,
+) -> std::io::Result<(PathBuf, std::fs::File)> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unnamed".to_string());
+    let mut last = None;
+    for _ in 0..64 {
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = path.with_file_name(format!(
+            "{file_name}.{kind}.{}.{seq}.{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        match std::fs::OpenOptions::new()
+            .append(true)
+            .create_new(true)
+            .open(&tmp_path)
+        {
+            Ok(file) => return Ok((tmp_path, file)),
+            // The name is taken: it is NOT ours, leave it alone and try another.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::other("create_unique_sibling: could not allocate a unique name")
+    }))
+}
+
 /// Atomically write `bytes` to `path`.
 ///
 /// Contract (crate-internal, used by `save_vectors`, `save_energy_state` and
 /// `json_store::persist`):
 ///
-/// 1. Writes to a unique sibling temp file `<file_name>.tmp.<pid>` in the
-///    same directory as `path` (the pid makes the name unique per process;
-///    the full original name is preserved so two different destinations
-///    never share a temp file).
+/// 1. Writes to a NEW sibling temp file `<file_name>.tmp.<pid>.<seq>.<random>`
+///    in the same directory as `path`, opened with `create_new`. The name is
+///    unique per call (not just per process), so concurrent callers never
+///    share a temp file and a planted symlink/name is never followed.
 /// 2. `write_all` + `sync_all` so the payload reaches stable storage.
 /// 3. `rename` over `path` — atomic on Unix and Windows (replaces the
 ///    destination), so readers never observe a partially written file and a
 ///    crash mid-write leaves the previous contents intact.
+/// 4. fsync of the parent directory, so the rename itself survives a power
+///    loss (without it the old name can come back).
 ///
-/// On any failure the temp file is removed and `path` is left untouched.
+/// On any failure before the rename the temp file is removed and `path` is
+/// left untouched; a failed directory fsync is reported as an error (the
+/// rename itself already happened).
 pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
-    let mut tmp_name = path
-        .file_name()
-        .map(std::ffi::OsString::from)
-        .unwrap_or_else(|| std::ffi::OsString::from("unnamed"));
-    tmp_name.push(format!(".tmp.{}", std::process::id()));
-    let tmp_path = path.with_file_name(tmp_name);
+    let (tmp_path, mut file) = create_unique_sibling(path, "tmp")?;
 
     let result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::File::create(&tmp_path)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         std::fs::rename(&tmp_path, path)?;
-        Ok(())
+        sync_dir(&parent_dir(path))
     })();
 
     if let Err(err) = result {
@@ -446,4 +531,128 @@ fn copy_dir_recursive(src: &Path, dst: &Path, depth: u32) -> std::io::Result<()>
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_target(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "splatdb-atomic-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("target.bin")
+    }
+
+    fn dir_entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A05-F09 — the temp file must never be a predictable, pre-existing
+    /// name: a symlink planted at `<file>.tmp.<pid>` must not be written
+    /// through.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_does_not_follow_a_precreated_tmp_symlink() {
+        let target = temp_target("symlink");
+        let dir = target.parent().unwrap();
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, b"victim-original").unwrap();
+        let planted = dir.join(format!("target.bin.tmp.{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        atomic_write(&target, b"payload").unwrap();
+
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"victim-original",
+            "atomic_write wrote through the planted symlink"
+        );
+        assert!(
+            !target.symlink_metadata().unwrap().file_type().is_symlink(),
+            "destination must be a regular file"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"payload");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A03-F08 / A05-F09 — concurrent callers in the same process (same pid)
+    /// must not share a temp file.
+    #[test]
+    fn atomic_write_concurrent_callers_do_not_share_a_temp_file() {
+        let target = temp_target("concurrent");
+        let dir = target.parent().unwrap().to_path_buf();
+        let payload_len = 256 * 1024;
+        std::thread::scope(|s| {
+            for t in 0..8u8 {
+                let target = &target;
+                s.spawn(move || {
+                    // 48 fsync-bound writes keep this in unit-test range; on the old
+                    // code writers already collided within their first two iterations.
+                    for i in 0..6usize {
+                        let payload = vec![t.wrapping_add(i as u8); payload_len];
+                        atomic_write(target, &payload)
+                            .unwrap_or_else(|e| panic!("writer {t} iteration {i}: {e}"));
+                    }
+                });
+            }
+        });
+        let final_bytes = std::fs::read(&target).unwrap();
+        assert_eq!(final_bytes.len(), payload_len, "torn final content");
+        assert!(
+            final_bytes.iter().all(|&b| b == final_bytes[0]),
+            "final file mixes two payloads"
+        );
+        let leftovers: Vec<String> = dir_entries(&dir)
+            .into_iter()
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A failure after the temp file was written must leave no temp behind
+    /// and must not touch the destination.
+    #[test]
+    fn atomic_write_failure_leaves_no_temp_and_keeps_the_destination() {
+        let base = temp_target("failure");
+        let dir = base.parent().unwrap();
+        let target = dir.join("subdir");
+        std::fs::create_dir(&target).unwrap();
+
+        // rename(file -> existing directory) fails after the temp was
+        // written and fsynced.
+        let err = atomic_write(&target, b"payload").unwrap_err();
+
+        assert!(target.is_dir(), "destination was replaced");
+        assert_eq!(dir_entries(dir), ["subdir"], "temp not cleaned up ({err})");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A03-F02 — traced at integration time with the LD_PRELOAD fsync
+    /// tracer: must show `fsync(temp)`, `rename`, then `fsync(parent dir)`.
+    #[test]
+    fn fsync_probe_atomic_write_syncs_file_then_parent_dir() {
+        let target = temp_target("fsync-probe");
+        let dir = target.parent().unwrap().to_path_buf();
+        atomic_write(&target, b"probe-payload").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"probe-payload");
+        assert_eq!(dir_entries(&dir), ["target.bin"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
