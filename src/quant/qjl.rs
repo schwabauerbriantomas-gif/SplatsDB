@@ -1,11 +1,8 @@
 //! Quantized Johnson-Lindenstrauss (QJL) transform for unbiased inner product estimation.
 //!
 //! Projects a d-dimensional vector x onto m random hyperplanes g_i ~ N(0, I) and records
-//! the sign of each projection. [`QjlSketch`] keeps one i8 per sign plus the f32 norm of
-//! x (unpacked: public API and serde wire format). The store holds the packed form — the
-//! signs as 1 bit each (`1` = -1, `0` = +1) plus the same f32 norm — a bijection of the
-//! sketch ([`pack_signs`] / [`unpack_signs`]); [`QjlQuantizer::score_packed`] reproduces
-//! the f32 score bits of [`QjlQuantizer::score_projected`].
+//! the sign of each projection. The current layout stores one i8 per sign plus the f32
+//! norm of x (unpacked; bit-packing is out of scope).
 //!
 //! Unbiased estimator (expectation over g, for ANY ||x||):
 //!
@@ -40,7 +37,6 @@ use std::f32::consts::PI;
 use std::sync::Arc;
 
 use super::error::{QuantError, Result};
-use super::polar::{bit_stream_bytes, read_bits, write_bits};
 
 /// Wire schema version of [`QjlSketch`]. v1 adds `norm`; v0 (<= 2.11.0: `{dim,
 /// projections, signs}` only) is rejected on deserialization and never reinterpreted.
@@ -154,9 +150,8 @@ impl<'de> Deserialize<'de> for QjlSketch {
 }
 
 impl QjlSketch {
-    /// Payload bytes of one sketch in the unpacked representation: one i8 per sign plus
-    /// the f32 norm — independent of `bits` (QJL is 1 bit per projection by design).
-    /// The packed storage layout costs [`Self::packed_layout_bytes`].
+    /// Payload bytes of one sketch in the current unpacked layout: one i8 per sign plus
+    /// the f32 norm — independent of `bits` (bit-packing is not implemented).
     pub const fn layout_bytes(projections: usize) -> usize {
         projections * std::mem::size_of::<i8>() + std::mem::size_of::<f32>()
     }
@@ -173,43 +168,6 @@ impl QjlSketch {
     pub fn heap_bytes(&self) -> usize {
         self.signs.len() * std::mem::size_of::<i8>()
     }
-
-    /// Payload bytes of one sketch in the packed storage layout: 1 bit per sign plus
-    /// the f32 norm.
-    pub const fn packed_layout_bytes(projections: usize) -> usize {
-        bit_stream_bytes(projections, 1) + std::mem::size_of::<f32>()
-    }
-}
-
-/// Bytes of the packed sign stream of a sketch with `projections` signs (1 bit each).
-pub const fn sign_stream_bytes(projections: usize) -> usize {
-    bit_stream_bytes(projections, 1)
-}
-
-/// Pack signs into their bit stream: `-1` -> `1`, `+1` -> `0`. Any other value is an
-/// error (a corrupt sketch is never packed as if it held signs).
-pub fn pack_signs(signs: &[i8]) -> Result<Vec<u8>> {
-    if let Some(index) = signs.iter().position(|&s| s != 1 && s != -1) {
-        return Err(QuantError::MalformedCode(format!(
-            "QJL sign at projection {index} is {}, not +1 or -1",
-            signs[index]
-        )));
-    }
-    let mut data = vec![0u8; sign_stream_bytes(signs.len())];
-    for (i, &sign) in signs.iter().enumerate() {
-        if sign < 0 {
-            write_bits(&mut data, i, 1, 1);
-        }
-    }
-    Ok(data)
-}
-
-/// The first `projections` signs of a packed sign stream (`1` -> -1, `0` -> +1). The
-/// padding bits of the last byte are never read.
-pub fn unpack_signs(data: &[u8], projections: usize) -> Vec<i8> {
-    (0..projections)
-        .map(|i| if read_bits(data, i, 1) == 1 { -1 } else { 1 })
-        .collect()
 }
 
 /// Projects vectors to QJL sketches and scores them against a query.
@@ -401,54 +359,6 @@ impl QjlQuantizer {
             ScoreMode::InnerProduct => (PI / 2.0).sqrt() * sketch.norm / m,
             // Legacy order (<= 2.11.0, scale pi/(2m)) = sqrt(pi/2) * estimate / ||x||;
             // no division, so ||x|| == 0 is finite.
-            ScoreMode::L2Heuristic => PI / (2.0 * m),
-        };
-        Ok(scale * estimate)
-    }
-
-    /// [`Self::score_projected`] for a packed sketch: `signs` is its sign stream of
-    /// [`sign_stream_bytes(projections)`](sign_stream_bytes) bytes and `norm` its
-    /// `||x||`. Bit-identical to the unpacked path: sign `i` against projection `i`,
-    /// sequential f32 accumulation, same scale. No unpacked copy is materialized.
-    pub fn score_packed(
-        &self,
-        signs: &[u8],
-        norm: f32,
-        projected_query: &[f32],
-        mode: ScoreMode,
-    ) -> Result<f32> {
-        if signs.len() != sign_stream_bytes(self.projections) {
-            return Err(QuantError::MalformedCode(format!(
-                "packed QJL sketch has {} sign bytes, this quantizer needs {}",
-                signs.len(),
-                sign_stream_bytes(self.projections)
-            )));
-        }
-        if projected_query.len() != self.projections {
-            return Err(QuantError::MalformedCode(format!(
-                "projected query has {} entries, this quantizer has {} projections",
-                projected_query.len(),
-                self.projections
-            )));
-        }
-        if !norm.is_finite() || norm < 0.0 {
-            return Err(QuantError::MalformedCode(
-                "QJL sketch norm must be finite and non-negative".to_string(),
-            ));
-        }
-        let m = self.projections as f32;
-        let estimate: f32 = (0..self.projections)
-            .map(|i| {
-                let sign = if read_bits(signs, i, 1) == 1 {
-                    -1.0f32
-                } else {
-                    1.0f32
-                };
-                sign * projected_query[i]
-            })
-            .sum();
-        let scale = match mode {
-            ScoreMode::InnerProduct => (PI / 2.0).sqrt() * norm / m,
             ScoreMode::L2Heuristic => PI / (2.0 * m),
         };
         Ok(scale * estimate)
