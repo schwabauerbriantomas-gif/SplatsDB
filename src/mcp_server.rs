@@ -177,6 +177,12 @@ struct McpState {
     doc_store_persistent: bool,
     /// Maps vector index → doc_id for retrieval
     vector_to_doc: HashMap<usize, String>,
+    /// Inverse index, doc_id → its ONLY live vector (A03-F11).
+    doc_to_vec: HashMap<String, usize>,
+    /// Vector indices whose doc was deleted or re-stored. The splat stays
+    /// in the store (the ANN index has no delete), so every search path
+    /// drops them and refills top-k from the next candidates.
+    tombstones: std::collections::HashSet<usize>,
     /// Maps doc_id → text content (in-memory cache with eviction)
     doc_texts: DocTextCache,
     next_id: usize,
@@ -288,11 +294,50 @@ impl McpState {
             doc_store,
             doc_store_persistent,
             vector_to_doc: HashMap::new(),
+            doc_to_vec: HashMap::new(),
+            tombstones: std::collections::HashSet::new(),
             doc_texts: DocTextCache::default(),
             next_id: 0,
             graph: crate::graph_splat::GaussianGraphStore::new(),
             spatial_index: crate::spatial::SpatialIndex::new(),
         }
+    }
+
+    /// Register `vector_idx` as THE live vector of `id`. Any previous
+    /// mapping of `id` is retired first, so a doc never has two live
+    /// vectors (re-store used to leave the old one matching).
+    fn map_vector(&mut self, vector_idx: usize, id: &str) {
+        self.unmap_doc(id);
+        self.vector_to_doc.insert(vector_idx, id.to_string());
+        self.doc_to_vec.insert(id.to_string(), vector_idx);
+    }
+
+    /// Retire the mapping of `id`, tombstoning its vector. Returns whether
+    /// `id` had a live vector.
+    fn unmap_doc(&mut self, id: &str) -> bool {
+        let Some(idx) = self.doc_to_vec.remove(id) else {
+            return false;
+        };
+        self.vector_to_doc.remove(&idx);
+        self.tombstones.insert(idx);
+        true
+    }
+
+    /// A vector is searchable iff a live doc maps to it.
+    fn is_live(&self, idx: usize) -> bool {
+        !self.tombstones.contains(&idx) && self.vector_to_doc.contains_key(&idx)
+    }
+
+    /// Live (searchable) vectors.
+    fn live_vectors(&self) -> usize {
+        self.vector_to_doc.len()
+    }
+
+    /// k to request from the ANN so that `top_k` LIVE results remain after
+    /// dropping the dead vectors (deleted / re-stored) it still returns.
+    fn fetch_k(&self, top_k: usize, n_active: usize) -> usize {
+        let dead = n_active.saturating_sub(self.live_vectors());
+        top_k.saturating_add(dead).min(n_active)
     }
 
     fn cache_doc_text(&mut self, id: String, text: String) {
@@ -777,7 +822,7 @@ fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String
         .unwrap_or_else(|| format!("mem_{}", s.next_id));
 
     // Store text and mapping
-    s.vector_to_doc.insert(vector_idx, id.clone());
+    s.map_vector(vector_idx, &id);
     s.cache_doc_text(id.clone(), text.to_string());
 
     // Persist to SQLite
@@ -820,6 +865,10 @@ fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String
     let hall = params["hall"].as_str();
     if wing.is_some() || room.is_some() || hall.is_some() {
         s.spatial_index.register_doc(&id, wing, room, hall);
+    } else {
+        // Re-store without spatial keys: the previous registration
+        // described the OLD content — drop it.
+        s.spatial_index.remove_doc(&id);
     }
 
     eprintln!(
@@ -901,18 +950,19 @@ fn handle_search(state: &Mutex<McpState>, params: &Value) -> Result<Value, Strin
         "internal server error".to_string()
     })?;
 
-    let k = k.min(s.store.n_active());
+    // Over-fetch by the number of dead vectors (deleted / re-stored),
+    // drop them, and keep `top_k` live results.
+    let k = s.fetch_k(top_k, s.store.n_active());
     let neighbors = s.store.find_neighbors_fast(&query_vec.view(), k);
 
     let results: Vec<Value> = neighbors
         .into_iter()
+        .filter(|n| s.is_live(n.index))
+        .take(top_k)
         .map(|n| {
-            // Look up doc_id from vector index
-            let doc_id = s
-                .vector_to_doc
-                .get(&n.index)
-                .cloned()
-                .unwrap_or_else(|| format!("vec_{}", n.index));
+            // is_live() guarantees a mapping: anonymous `vec_N` hits can no
+            // longer be produced.
+            let doc_id = s.vector_to_doc.get(&n.index).cloned().unwrap_or_default();
             let text = s.doc_texts.get(&doc_id).cloned().unwrap_or_default();
 
             // Try to get metadata from SQLite
@@ -953,6 +1003,8 @@ fn handle_status(state: &Mutex<McpState>) -> Result<Value, String> {
 
     Ok(json!({
         "n_active": s.store.n_active(),
+        "live_vectors": s.live_vectors(),
+        "tombstoned_vectors": s.tombstones.len(),
         "max_splats": s.store.max_splats(),
         "dimension": stats.embedding_dim,
         "doc_count": doc_count,
@@ -1004,7 +1056,7 @@ fn handle_doc_add(state: &Mutex<McpState>, params: &Value) -> Result<Value, Stri
     s.store.hnsw_sync_incremental();
 
     // Update mappings
-    s.vector_to_doc.insert(vector_idx, id.to_string());
+    s.map_vector(vector_idx, id);
     s.cache_doc_text(id.to_string(), text.to_string());
 
     // Persist to SQLite
@@ -1038,11 +1090,15 @@ fn handle_doc_add(state: &Mutex<McpState>, params: &Value) -> Result<Value, Stri
         updated_at: now,
     };
 
-    s.doc_store.upsert(&record).map_err(|e| {
+    if let Err(e) = s.doc_store.upsert(&record) {
         // Internal detail stays server-side; the client gets a generic error.
         eprintln!("[mcp] doc_add SQLite error for id={id}: {e}");
-        "internal error".to_string()
-    })?;
+        // No persisted row → the new vector must not stay searchable as an
+        // anonymous hit (A03-F11).
+        s.unmap_doc(id);
+        s.uncache_doc_text(id);
+        return Err("internal error".to_string());
+    }
 
     eprintln!(
         "[mcp] doc_add: id={}, vec_idx={}, text_len={}, has_meta={}",
@@ -1095,15 +1151,11 @@ fn handle_doc_del(state: &Mutex<McpState>, params: &Value) -> Result<Value, Stri
         Ok(true) => {
             // Remove from in-memory caches
             s.uncache_doc_text(id);
-            // Find and remove the vector_to_doc mapping for this doc id
-            if let Some(idx) = s
-                .vector_to_doc
-                .iter()
-                .find(|(_, v)| *v == id)
-                .map(|(k, _)| *k)
-            {
-                s.vector_to_doc.remove(&idx);
-            }
+            // The splat stays in the ANN index (no delete): tombstone its
+            // vector so every search path filters it and refills top-k,
+            // and drop it from the spatial index too (A03-F11).
+            s.unmap_doc(id);
+            s.spatial_index.remove_doc(id);
             eprintln!("[mcp] doc_del: id={} (soft deleted)", id);
             Ok(json!({ "ok": true, "id": id }))
         }
@@ -1412,12 +1464,8 @@ fn handle_spatial_search(state: &Mutex<McpState>, params: &Value) -> Result<Valu
         return Ok(json!({ "results": [], "total": 0, "filter": "no documents" }));
     }
 
-    // Build inverted index: doc_id → vector_idx
-    let mut doc_to_vec: HashMap<String, usize> = HashMap::new();
-    for (&vec_idx, doc_id) in &s.vector_to_doc {
-        doc_to_vec.insert(doc_id.clone(), vec_idx);
-    }
-
+    // doc_id → vector_idx comes from the persistent inverse index
+    // (`McpState::doc_to_vec`), which only ever holds live mappings.
     // Get candidate vector indices via SpatialIndex (pre-filter)
     let candidate_vec_indices: Vec<usize> = if has_filter {
         let spatial_filter = crate::spatial::SpatialFilter {
@@ -1428,7 +1476,7 @@ fn handle_spatial_search(state: &Mutex<McpState>, params: &Value) -> Result<Valu
         let candidate_ids = s.spatial_index.filter(&spatial_filter);
         candidate_ids
             .iter()
-            .filter_map(|id| doc_to_vec.get(id).copied())
+            .filter_map(|id| s.doc_to_vec.get(id).copied())
             .collect()
     } else {
         // No spatial filter — search all vectors
@@ -1472,17 +1520,16 @@ fn handle_spatial_search(state: &Mutex<McpState>, params: &Value) -> Result<Valu
         s.store
             .find_neighbors_filtered(&query_vec.view(), &candidate_vec_indices, top_k)
     } else {
-        let k = top_k.min(s.store.n_active());
+        let k = s.fetch_k(top_k, s.store.n_active());
         s.store.find_neighbors_fast(&query_vec.view(), k)
     };
 
     let mut out = Vec::new();
     for n in neighbors {
-        let doc_id = s
-            .vector_to_doc
-            .get(&n.index)
-            .cloned()
-            .unwrap_or_else(|| format!("vec_{}", n.index));
+        if !s.is_live(n.index) {
+            continue;
+        }
+        let doc_id = s.vector_to_doc.get(&n.index).cloned().unwrap_or_default();
         let text = s.doc_texts.get(&doc_id).cloned().unwrap_or_default();
         let metadata: Value = match s.doc_store.get(&doc_id) {
             Ok(Some(record)) => record.metadata.clone().unwrap_or(json!(null)),
@@ -1675,11 +1722,15 @@ fn handle_verbatim_search(state: &Mutex<McpState>, params: &Value) -> Result<Val
         "internal server error".to_string()
     })?;
 
-    let k = k.min(s.store.n_active());
+    // Over-fetch by the number of dead vectors (deleted / re-stored),
+    // drop them, and keep `top_k` live results.
+    let k = s.fetch_k(top_k, s.store.n_active());
     let neighbors = s.store.find_neighbors_fast(&query_vec.view(), k);
 
     let results: Vec<Value> = neighbors
         .into_iter()
+        .filter(|n| s.is_live(n.index))
+        .take(top_k)
         .map(|n| {
             let doc_id = s.vector_to_doc.get(&n.index).cloned().unwrap_or_default();
             let text = s.doc_texts.get(&doc_id).cloned().unwrap_or_default();
@@ -1967,6 +2018,11 @@ pub fn run_mcp_server() {
 
     let mut live = McpState::new(store, doc_store, doc_store_persistent);
     live.vector_to_doc = vector_to_doc;
+    live.doc_to_vec = live
+        .vector_to_doc
+        .iter()
+        .map(|(idx, id)| (id.clone(), *idx))
+        .collect();
     live.doc_texts = doc_texts;
     live.next_id = next_id;
     let state = Mutex::new(live);
@@ -2722,6 +2778,118 @@ mod tests {
         SIMCOS_ALLOWED.store(opt, Ordering::Relaxed);
         assert_eq!(EmbeddingSource::Real.label(), "real");
         assert_eq!(EmbeddingSource::Provided.label(), "provided");
+    }
+
+    /// Small, fast `McpState` for handler-level tests (8-dim store,
+    /// in-memory docs, non-persistent).
+    fn f05a_state() -> Mutex<McpState> {
+        let mut config = SplatsDBConfig::mcp(None);
+        config.max_splats = 256;
+        config.latent_dim = 8;
+        let store = SplatStore::new(config);
+        let docs = SqliteMetadataStore::new(std::path::PathBuf::from(":memory:"))
+            .expect("in-memory doc store");
+        Mutex::new(McpState::new(store, docs, false))
+    }
+
+    fn f05a_emb(i: f64) -> Value {
+        json!([1.0, 0.3 * i, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    }
+
+    fn f05a_ids(res: &Value) -> Vec<String> {
+        res["results"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no results array: {res}"))
+            .iter()
+            .map(|r| r["id"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    /// A03-F11 (handlers): doc_del tombstones the vector and top-k is
+    /// refilled; re-store retires the old mapping (exactly one hit, new text).
+    #[test]
+    fn f11_handlers_tombstone_delete_and_restore() {
+        let state = f05a_state();
+        for i in 1..=5u32 {
+            let id = format!("t{i}");
+            let stored = handle_store(
+                &state,
+                &json!({ "text": format!("text {id} v1"), "id": id, "embedding": f05a_emb(i as f64) }),
+            )
+            .expect("store");
+            assert_eq!(stored["id"], json!(id));
+        }
+        let search = |top_k: u64, q: Value| {
+            handle_search(
+                &state,
+                &json!({ "query": "q", "embedding": q, "top_k": top_k }),
+            )
+            .expect("search")
+        };
+        assert_eq!(f05a_ids(&search(3, f05a_emb(3.0))), vec!["t3", "t2", "t4"]);
+
+        handle_doc_del(&state, &json!({ "id": "t3" })).expect("del");
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.store.n_active(), 5, "the splat physically stays");
+            assert_eq!(s.tombstones, std::collections::HashSet::from([2]));
+            assert!(!s.doc_to_vec.contains_key("t3"));
+            assert!(!s.vector_to_doc.contains_key(&2));
+            assert_eq!(s.live_vectors(), 4);
+            assert!(s.doc_texts.get("t3").is_none());
+        }
+        // Top-k is refilled past the tombstone: 4 live docs, never a `vec_N`.
+        let res = search(5, f05a_emb(3.0));
+        let got = f05a_ids(&res);
+        assert_eq!(got.len(), 4, "{res}");
+        assert!(!got.contains(&"t3".to_string()), "{res}");
+        assert!(res["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| !r["text"].as_str().unwrap_or("").is_empty()));
+        // status exposes the difference between physical and live vectors
+        let status = handle_status(&state).unwrap();
+        assert_eq!(status["n_active"], json!(5));
+        assert_eq!(status["live_vectors"], json!(4));
+        assert_eq!(status["tombstoned_vectors"], json!(1));
+
+        // Re-store t1 with a NEW vector and text → exactly one hit, the new text.
+        handle_store(
+            &state,
+            &json!({ "text": "text t1 v2", "id": "t1", "embedding": json!([0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]) }),
+        )
+        .expect("re-store");
+        for q in [
+            json!([0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            f05a_emb(1.0),
+        ] {
+            let res = search(10, q);
+            let got = f05a_ids(&res);
+            assert_eq!(
+                got.iter().filter(|i| *i == "t1").count(),
+                1,
+                "duplicate mapping: {res}"
+            );
+            assert_eq!(got.len(), 4, "{res}");
+            let t1 = res["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == "t1")
+                .unwrap();
+            assert_eq!(t1["text"], json!("text t1 v2"), "stale text: {res}");
+        }
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.live_vectors(), 4);
+            assert_eq!(s.tombstones.len(), 2);
+            assert_eq!(s.doc_to_vec["t1"], 5);
+        }
+
+        // Deleting an unknown doc is still a clean "not found".
+        let err = handle_doc_del(&state, &json!({ "id": "nope" })).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
     }
 
     // -- end of F05a inline tests --

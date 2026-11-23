@@ -582,12 +582,13 @@ fn f13_ephemeral_doc_store_is_reported_as_not_persisted() {
 fn f11_doc_del_and_re_store_leave_no_orphans_before_and_after_restart() {
     let tmp = scratch("f11");
     let doc_db = tmp.join("docs.db");
+    let mut dim: usize = 0;
 
     let doc_emb = |dim: usize, i: f64| emb(dim, 1.0, 0.3 * i);
 
     {
         let mut srv = spawn_server(&doc_db, &[]);
-        let dim = srv.status(1)["dimension"].as_u64().expect("dimension") as usize;
+        dim = srv.status(1)["dimension"].as_u64().expect("dimension") as usize;
         for i in 1..=5 {
             let id = format!("d{i}");
             let stored = srv.ok(
@@ -724,9 +725,11 @@ fn f11_doc_del_and_re_store_leave_no_orphans_before_and_after_restart() {
     }
 
     // ---- restart (warm start from SQLite): same contract ----
+    // Vectors are not persisted yet (F05b): warm start re-embeds through the
+    // (fake, real-labelled) embed service.
     {
-        let mut srv = spawn_server(&doc_db, &[]);
-        let dim = srv.status(1)["dimension"].as_u64().expect("dimension") as usize;
+        let url = spawn_fake_embed_server(dim);
+        let mut srv = spawn_server(&doc_db, &[("SPLATSDB_EMBED_URL", url.as_str())]);
         let all = srv.ok(
             2,
             "splatsdb_search",
@@ -756,6 +759,15 @@ fn f11_doc_del_and_re_store_leave_no_orphans_before_and_after_restart() {
                 .any(|r| r["text"] == "text of d1 v2"),
             "{all}"
         );
+        // A text query goes through the real (fake) service and says so.
+        let by_text = srv.ok(
+            4,
+            "splatsdb_search",
+            serde_json::json!({ "query": "anything" }),
+        );
+        assert_eq!(by_text["embedding"], serde_json::json!("real"), "{by_text}");
+        assert_eq!(ids(&by_text).len(), 4, "{by_text}");
+        assert!(texts(&by_text).iter().all(|t| !t.is_empty()), "{by_text}");
         let status = srv.status(3);
         assert_eq!(status["live_vectors"], serde_json::json!(4), "{status}");
         assert_eq!(
@@ -763,6 +775,54 @@ fn f11_doc_del_and_re_store_leave_no_orphans_before_and_after_restart() {
             serde_json::json!(0),
             "{status}"
         );
+        srv.shutdown();
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// A03-F10 (warm start): without the embed service and without opt-in the
+/// server must NOT re-embed persisted docs with a text hash. It comes up with
+/// an empty vector store and says so: a visible failure instead of silent
+/// garbage ranking.
+#[test]
+fn f10_warm_start_without_service_indexes_nothing_and_warns() {
+    let tmp = scratch("f10_warm");
+    let doc_db = tmp.join("docs.db");
+    let mut dim: usize = 0;
+    {
+        let mut srv = spawn_server(&doc_db, &[]);
+        dim = srv.status(1)["dimension"].as_u64().expect("dimension") as usize;
+        srv.ok(
+            2,
+            "splatsdb_store",
+            serde_json::json!({ "text": "persisted doc", "id": "d_p", "embedding": emb(dim, 1.0, 0.0) }),
+        );
+        assert_eq!(srv.status(3)["n_active"], serde_json::json!(1));
+        srv.shutdown();
+    }
+    {
+        let mut srv = spawn_server(&doc_db, &[]);
+        assert!(
+            srv.wait_stderr_containing("documents were NOT indexed", Duration::from_secs(20)),
+            "warm start must report the skipped docs on stderr"
+        );
+        let status = srv.status(1);
+        assert_eq!(
+            status["doc_count"],
+            serde_json::json!(1),
+            "the doc is still in SQLite: {status}"
+        );
+        assert_eq!(
+            status["n_active"],
+            serde_json::json!(0),
+            "a doc was indexed with an unauthorized hash vector: {status}"
+        );
+        let res = srv.ok(
+            2,
+            "splatsdb_search",
+            serde_json::json!({ "query": "persisted doc", "embedding": emb(dim, 1.0, 0.0) }),
+        );
+        assert!(ids(&res).is_empty(), "{res}");
         srv.shutdown();
     }
     let _ = std::fs::remove_dir_all(&tmp);
