@@ -288,15 +288,17 @@ impl Server {
                 break;
             }
             if out_open {
-                match self.out.recv_timeout(left.min(Duration::from_millis(20))) {
-                    Err(RecvTimeoutError::Disconnected) => out_open = false,
-                    _ => {}
+                if let Err(RecvTimeoutError::Disconnected) =
+                    self.out.recv_timeout(left.min(Duration::from_millis(20)))
+                {
+                    out_open = false;
                 }
             }
             if err_open {
-                match self.err.recv_timeout(left.min(Duration::from_millis(20))) {
-                    Err(RecvTimeoutError::Disconnected) => err_open = false,
-                    _ => {}
+                if let Err(RecvTimeoutError::Disconnected) =
+                    self.err.recv_timeout(left.min(Duration::from_millis(20)))
+                {
+                    err_open = false;
                 }
             }
         }
@@ -437,11 +439,7 @@ fn spawn_black_hole() -> String {
     thread::spawn(move || {
         // Every accepted stream stays open (and unanswered) for the life of the test.
         let mut held: Vec<TcpStream> = Vec::new();
-        for stream in listener.incoming() {
-            if let Ok(stream) = stream {
-                held.push(stream);
-            }
-        }
+        held.extend(listener.incoming().flatten());
     });
     url
 }
