@@ -86,12 +86,14 @@ static DIST_MODULE: OnceLock<Option<Arc<CudaModule>>> = OnceLock::new();
 /// module (receipt for the latch: 1 on a PTX host, 0 without PTX).
 static MODULE_LOAD_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+#[cfg(test)]
 pub(crate) fn module_load_attempts() -> u64 {
     MODULE_LOAD_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// True once this process asked the driver for a CUDA context (read-only
 /// receipt for the without-PTX test: it must stay `false` there).
+#[cfg(test)]
 pub(crate) fn cuda_context_initialized() -> bool {
     CUDA_CONTEXT.get().is_some()
 }
@@ -127,6 +129,7 @@ pub(crate) fn dist_module() -> Option<Arc<CudaModule>> {
 }
 
 /// True when the distance PTX module is usable on this host (A02-F01 latch).
+#[cfg(test)]
 pub(crate) fn ptx_usable() -> bool {
     dist_module().is_some()
 }
