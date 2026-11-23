@@ -404,7 +404,6 @@ impl SplatStore {
         }
     }
 
-
     /// Build index only if not already built. Tries to load persisted HNSW first.
     ///
     /// Returns true if the index was built or loaded, false if nothing needed doing.
@@ -709,7 +708,6 @@ impl SplatStore {
         }
         Ok(true)
     }
-
 
     /// Find k nearest neighbors for a single query.
     ///
@@ -2677,14 +2675,18 @@ mod f02e1_contract_tests {
             ..Default::default()
         });
         assert!(plain.add_splat(&vectors));
-        assert!(plain.try_build_index_with_save(Some(dir.to_str().unwrap())).is_ok());
+        assert!(plain
+            .try_build_index_with_save(Some(dir.to_str().unwrap()))
+            .is_ok());
         let mut empty = SplatStore::new(SplatsDBConfig {
             latent_dim: 8,
             max_splats: 16,
             enable_hnsw: true,
             ..Default::default()
         });
-        assert!(empty.try_build_index_with_save(Some(dir.to_str().unwrap())).is_ok());
+        assert!(empty
+            .try_build_index_with_save(Some(dir.to_str().unwrap()))
+            .is_ok());
 
         std::fs::remove_dir_all(&dir).ok();
     }

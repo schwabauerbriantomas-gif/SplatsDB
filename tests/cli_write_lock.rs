@@ -121,7 +121,15 @@ fn writer_commands_refuse_a_data_dir_a_serve_holds_and_run_once_it_stops() {
         ),
         (
             "ingest",
-            owned(&["ingest", "--input", &raw_s, "--n-clusters", "6", "--seed", "7"]),
+            owned(&[
+                "ingest",
+                "--input",
+                &raw_s,
+                "--n-clusters",
+                "6",
+                "--seed",
+                "7",
+            ]),
             "ingested",
             &data,
         ),

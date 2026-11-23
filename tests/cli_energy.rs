@@ -57,15 +57,15 @@ fn read_landscape(path: &Path) -> (Vec<Vec<f32>>, Vec<f32>, Vec<f32>) {
         .collect();
     let o = 16 + rows * cols * 4;
     let n_alpha = u64at(o);
-    let alpha: Vec<f32> = (0..n_alpha)
-        .map(|i| f32_at(&b, o + 8 + i * 4))
-        .collect();
+    let alpha: Vec<f32> = (0..n_alpha).map(|i| f32_at(&b, o + 8 + i * 4)).collect();
     let o = o + 8 + n_alpha * 4;
     let n_kappa = u64at(o);
-    let kappa: Vec<f32> = (0..n_kappa)
-        .map(|i| f32_at(&b, o + 8 + i * 4))
-        .collect();
-    assert_eq!(o + 8 + n_kappa * 4, b.len(), "trailing bytes in landscape.bin");
+    let kappa: Vec<f32> = (0..n_kappa).map(|i| f32_at(&b, o + 8 + i * 4)).collect();
+    assert_eq!(
+        o + 8 + n_kappa * 4,
+        b.len(),
+        "trailing bytes in landscape.bin"
+    );
     (mu, alpha, kappa)
 }
 
@@ -167,8 +167,12 @@ fn serve_search(port: u16, embedding: &[f32], top_k: usize) -> Vec<usize> {
     let body = json!({ "query": "f02f-probe", "embedding": embedding, "top_k": top_k }).to_string();
     let (code, text) = http(port, "POST", "/search?rescore=gaussian", Some(&body))
         .unwrap_or_else(|| panic!("/search on :{port} did not answer"));
-    assert_eq!(code, 200, "POST /search?rescore=gaussian on :{port}: {text}");
-    let v: Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("/search json: {e}: {text}"));
+    assert_eq!(
+        code, 200,
+        "POST /search?rescore=gaussian on :{port}: {text}"
+    );
+    let v: Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("/search json: {e}: {text}"));
     v["results"]
         .as_array()
         .unwrap_or_else(|| panic!("results array missing: {v}"))
@@ -190,7 +194,10 @@ fn cli_rows(data_dir: &Path, q: &[f32], k: usize) -> (Vec<Row>, String) {
         DIM,
         &["search", "--query", &query, "--k", &k, "--format", "json"],
     );
-    assert!(status.success(), "search failed: stdout={out}\nstderr={err}");
+    assert!(
+        status.success(),
+        "search failed: stdout={out}\nstderr={err}"
+    );
     let v: Value = serde_json::from_str(out.trim())
         .unwrap_or_else(|e| panic!("search output is not JSON ({e}): {out}"));
     let rows: Vec<Row> = v
@@ -213,8 +220,8 @@ fn derived_gaussian(rows: &[Row], live: usize) -> Vec<(usize, f64)> {
     let mut all: Vec<(usize, f64)> = rows
         .iter()
         .map(|r| {
-            let score = f64::from(r.alpha)
-                * (-f64::from(r.kappa) * f64::from(r.distance).powi(2)).exp();
+            let score =
+                f64::from(r.alpha) * (-f64::from(r.kappa) * f64::from(r.distance).powi(2)).exp();
             (r.index, score)
         })
         .collect();
@@ -263,12 +270,26 @@ fn cli_reports_the_persisted_energy_state_before_and_after_a_serve_restart() {
     let (status, out, err) = cli(
         &seed,
         DIM,
-        &["ingest", "--input", &raw, "--n-clusters", "6", "--seed", "7"],
+        &[
+            "ingest",
+            "--input",
+            &raw,
+            "--n-clusters",
+            "6",
+            "--seed",
+            "7",
+        ],
     );
-    assert!(status.success(), "ingest failed: stdout={out}\nstderr={err}");
+    assert!(
+        status.success(),
+        "ingest failed: stdout={out}\nstderr={err}"
+    );
     let mu = read_bin(&shard_path(&seed));
     let (landscape_mu, alpha, kappa) = read_landscape(&landscape_path(&seed));
-    assert_eq!(landscape_mu, mu, "the landscape's mu must be the shard's mu");
+    assert_eq!(
+        landscape_mu, mu,
+        "the landscape's mu must be the shard's mu"
+    );
     assert_eq!(mu.len(), K, "ingest must leave {K} splats: {mu:?}");
     assert_ne!(
         (alpha.clone(), kappa.clone()),
@@ -281,10 +302,7 @@ fn cli_reports_the_persisted_energy_state_before_and_after_a_serve_restart() {
     let probe = discriminating_probe(&centres(), &mu, &alpha, &kappa);
     let gauss = gaussian_topk(&mu, &alpha, &kappa, &probe.q, K);
     let gauss_ids = ids_of(&gauss[..probe.live]);
-    let l2: Vec<usize> = l2_topk(&mu, &probe.q, K)
-        .iter()
-        .map(|r| r.0)
-        .collect();
+    let l2: Vec<usize> = l2_topk(&mu, &probe.q, K).iter().map(|r| r.0).collect();
     eprintln!(
         "[f02f] probe q={:?} live={} reference: gaussian={gauss:?} l2={l2:?}",
         probe.q, probe.live
@@ -310,7 +328,10 @@ fn cli_reports_the_persisted_energy_state_before_and_after_a_serve_restart() {
         gauss_ids,
         "the gaussian ranking implied by the CLI rows must be the persisted one"
     );
-    assert_ne!(gauss_ids, l2, "the probe must discriminate gaussian from L2");
+    assert_ne!(
+        gauss_ids, l2,
+        "the probe must discriminate gaussian from L2"
+    );
 
     // ── A `serve` session on a copy: one /store, then SIGTERM compacts the
     //    shard to K+1 rows and leaves the landscape alone.
@@ -321,7 +342,8 @@ fn cli_reports_the_persisted_energy_state_before_and_after_a_serve_restart() {
     wait_healthy(port, &mut server);
     let served = serve_search(port, &probe.q, K);
     assert_eq!(
-        served[..probe.live], gauss_ids,
+        served[..probe.live],
+        gauss_ids,
         "serve before /store must answer the persisted ranking: {served:?}"
     );
     let far: Vec<f32> = (0..DIM).map(|d| 40.0 + 0.25 * d as f32).collect();

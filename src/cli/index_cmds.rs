@@ -313,7 +313,8 @@ pub fn cmd_ingest_hierarchical(
 ) {
     // F02f: a writer holds the data-dir lock (the same `serve` holds) for
     // its whole read→write window, or exits 3 before touching anything.
-    let _data_dir_lock = crate::cli::helpers::exit_if_data_dir_locked(&data_dir, "ingest-hierarchical");
+    let _data_dir_lock =
+        crate::cli::helpers::exit_if_data_dir_locked(&data_dir, "ingest-hierarchical");
 
     let vectors = match load_vectors_bin(&input) {
         Ok(v) => v,

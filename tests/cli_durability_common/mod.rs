@@ -335,9 +335,7 @@ pub fn wait_exit(mut child: Child, timeout: Duration) -> (ExitStatus, String, St
             break (st, false);
         }
         if Instant::now() > deadline {
-            let _ = Command::new("kill")
-                .args(["-9", &pid.to_string()])
-                .status();
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
             break (child.wait().expect("wait after SIGKILL"), true);
         }
         std::thread::sleep(Duration::from_millis(50));

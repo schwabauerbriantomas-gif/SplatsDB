@@ -60,8 +60,14 @@ fn seeded(tag: &str) -> (std::path::PathBuf, String, String) {
     );
     let query = query_of(DIM);
     let (status, out, err) = cli(&data, DIM, &["hnsw-search", "--query", &query, "--k", "4"]);
-    assert!(status.success(), "hnsw-search failed: stdout={out}\nstderr={err}");
-    assert!(out.contains("\"index\""), "hnsw-search printed no rows: {out}");
+    assert!(
+        status.success(),
+        "hnsw-search failed: stdout={out}\nstderr={err}"
+    );
+    assert!(
+        out.contains("\"index\""),
+        "hnsw-search printed no rows: {out}"
+    );
     assert!(
         err.contains("Saved HNSW index (4 vectors)"),
         "hnsw-search must persist the index: {err}"
@@ -91,8 +97,14 @@ fn append_does_not_report_success_when_the_hnsw_index_cannot_be_persisted() {
         Some(0),
         "append reported success although the HNSW index could not be written: stdout={out}\nstderr={err}"
     );
-    assert!(!out.contains("appended"), "stdout must not claim an append: {out}");
-    assert!(err.contains("HNSW"), "the diagnostic must name the failed persist: {err}");
+    assert!(
+        !out.contains("appended"),
+        "stdout must not claim an append: {out}"
+    );
+    assert!(
+        err.contains("HNSW"),
+        "the diagnostic must name the failed persist: {err}"
+    );
     assert_eq!(
         std::fs::read(&shard).unwrap(),
         shard_before,
@@ -150,7 +162,10 @@ fn index_on_an_unwritable_shard_dir_exits_nonzero_and_keeps_the_previous_state()
         "index reported success on an unwritable shard dir: stdout={out}\nstderr={err}"
     );
     assert!(err.contains("Save error"), "{err}");
-    assert!(!out.contains("indexed"), "stdout must not claim an index: {out}");
+    assert!(
+        !out.contains("indexed"),
+        "stdout must not claim an index: {out}"
+    );
     assert_eq!(std::fs::read(&shard).unwrap(), shard_before, "the shard");
     assert_eq!(std::fs::read(&index).unwrap(), index_before, "the index");
 
@@ -185,7 +200,10 @@ fn hnsw_search_answers_when_the_stale_index_cannot_be_replaced_and_says_so() {
     restore(&index, original);
 
     let (status, out, err) = result;
-    assert!(status.success(), "a read-only command must not fail on the cache: {err}");
+    assert!(
+        status.success(),
+        "a read-only command must not fail on the cache: {err}"
+    );
     assert!(out.contains("\"index\""), "no rows: {out}");
     assert!(
         err.contains("failed to save HNSW index"),
@@ -198,7 +216,10 @@ fn hnsw_search_answers_when_the_stale_index_cannot_be_replaced_and_says_so() {
     );
 
     let (status, out, err) = cli(&data, DIM, &["hnsw-search", "--query", &query, "--k", "6"]);
-    assert!(status.success() && out.contains("\"index\""), "stdout={out}\nstderr={err}");
+    assert!(
+        status.success() && out.contains("\"index\""),
+        "stdout={out}\nstderr={err}"
+    );
     assert!(
         err.contains("Saved HNSW index (6 vectors)"),
         "a writable data-dir gets the rebuilt index: {err}"

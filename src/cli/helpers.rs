@@ -209,7 +209,9 @@ fn load_cli_energy_state(
         .map_err(|e| format!("energy state '{}' cannot be applied: {}", path.display(), e))?;
     eprintln!(
         "[splatsdb] energy state cargado (alpha/kappa de {}/{} splats desde {})",
-        loaded, n, path.display()
+        loaded,
+        n,
+        path.display()
     );
     Ok(())
 }
@@ -571,8 +573,16 @@ mod tests {
 
         // 1) The CLI loader and the library contract (`load_splats`) agree.
         let (cli, _) = try_load_shard_store(dir.to_str().unwrap(), &config, "default").unwrap();
-        assert_eq!(cli.get_alpha().unwrap(), alpha, "the CLI loader must load alpha");
-        assert_eq!(cli.get_kappa().unwrap(), kappa, "the CLI loader must load kappa");
+        assert_eq!(
+            cli.get_alpha().unwrap(),
+            alpha,
+            "the CLI loader must load alpha"
+        );
+        assert_eq!(
+            cli.get_kappa().unwrap(),
+            kappa,
+            "the CLI loader must load kappa"
+        );
         let mut reference = SplatStore::new(config.clone());
         reference
             .load_splats(&mu, alpha.as_slice().unwrap(), kappa.as_slice().unwrap())
@@ -634,8 +644,14 @@ mod tests {
             .save_vectors(&grown, "default")
             .unwrap();
         let (store, _) = try_load_shard_store(dir.to_str().unwrap(), &config, "default").unwrap();
-        assert_eq!(store.get_alpha().unwrap().slice(s![..6]), alpha.slice(s![..6]));
-        assert_eq!(store.get_kappa().unwrap().slice(s![..6]), kappa.slice(s![..6]));
+        assert_eq!(
+            store.get_alpha().unwrap().slice(s![..6]),
+            alpha.slice(s![..6])
+        );
+        assert_eq!(
+            store.get_kappa().unwrap().slice(s![..6]),
+            kappa.slice(s![..6])
+        );
         assert_eq!(store.get_alpha().unwrap()[6], init_alpha);
         assert_eq!(store.get_kappa().unwrap()[6], init_kappa);
 
