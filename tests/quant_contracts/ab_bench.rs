@@ -15,6 +15,7 @@
 //! `cargo test --no-default-features --test quant_contracts probe_ab_search -- --ignored
 //!  --nocapture --exact --test-threads=1`
 
+use super::d18_probe::{add_batch, encoded_bytes};
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
@@ -136,7 +137,7 @@ fn probe_ab_search() {
     for _ in 0..ENCODE_BUILDS {
         store = QuantizedStore::new(DIM, config.clone()).unwrap();
         let t0 = Instant::now();
-        store.add_batch(&data, 0).unwrap();
+        add_batch(&mut store, &data);
         encode_ms.push(t0.elapsed().as_secs_f64() * 1e3);
     }
     assert_eq!(store.len(), N);
@@ -199,7 +200,7 @@ fn probe_ab_search() {
             "search_throughput_qps_min": pass_qps.iter().cloned().fold(f64::INFINITY, f64::min),
             "search_alloc_bytes_per_query": alloc_total as f64 / (TIMED_PASSES * N_QUERIES) as f64,
             "search_peak_live_delta_bytes": peak_delta,
-            "encoded_bytes": store.encoded_bytes(),
+            "encoded_bytes": encoded_bytes(&store),
             "memory_usage": store.memory_usage(),
             "rss_after_encode_kb": rss_after_encode_kb,
             "rss_after_search_kb": rss_after_search_kb,

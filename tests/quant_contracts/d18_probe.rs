@@ -25,6 +25,18 @@ const N: usize = 400;
 const N_QUERIES: usize = 16;
 const K: usize = 10;
 
+// Commit-compat wrappers: the harness source is identical for every commit except this
+// block, which tmp/F04b/run_all.sh swaps in the archive copy for the pre-F04a API
+// (617822d: `add_batch` returned usize and there was no `encoded_bytes()`).
+pub(super) fn add_batch(store: &mut QuantizedStore, data: &Array2<f32>) {
+    store.add_batch(data, 0).unwrap();
+}
+
+/// `None` on commits without `encoded_bytes()` (no memory number is reported then).
+pub(super) fn encoded_bytes(store: &QuantizedStore) -> Option<usize> {
+    Some(store.encoded_bytes())
+}
+
 pub(super) fn gaussian_matrix(rows: usize, cols: usize, seed: u64) -> Array2<f32> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     Array2::from_shape_fn((rows, cols), |(_, _)| StandardNormal.sample(&mut rng))
@@ -126,7 +138,7 @@ fn probe_default_order() {
     for (family, data, queries) in families {
         for (name, config) in &configs {
             let mut store = QuantizedStore::new(DIM, config.clone()).unwrap();
-            let _ = store.add_batch(&data, 0);
+            add_batch(&mut store, &data);
             let mut recall_l2 = 0.0f64;
             let mut recall_ip = 0.0f64;
             let mut ranking_hash = HASH_INIT;
@@ -172,7 +184,7 @@ fn probe_default_order() {
                     "gt_l2_hash": format!("{gt_l2_hash:016x}"),
                     "gt_ip_hash": format!("{gt_ip_hash:016x}"),
                     "nonfinite_scores": nonfinite,
-                    "encoded_bytes": store.encoded_bytes(),
+                    "encoded_bytes": encoded_bytes(&store),
                     "memory_usage": store.memory_usage(),
                 })
             );
