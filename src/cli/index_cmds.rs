@@ -38,7 +38,18 @@ pub fn cmd_index(
     });
 
     let mut store = SplatStore::new(config);
-    store.add_splat(&vectors);
+    // A03-F17: `add_splat` rejects a dimension/capacity mismatch by returning
+    // false. Indexing on would build an empty index and still print "indexed".
+    if !store.add_splat(&vectors) {
+        eprintln!(
+            "Error: index: {}x{} vectors do not fit a store with --dim {} / --max-splats {}",
+            vectors.nrows(),
+            vectors.ncols(),
+            store.get_statistics().embedding_dim,
+            store.max_splats()
+        );
+        std::process::exit(1);
+    }
     store.build_index_with_save(Some(&data_dir));
 
     println!(
@@ -119,13 +130,27 @@ pub fn cmd_append(
         std::process::exit(1);
     }
 
-    // Persist vectors to storage backend
-    if let Some(p) = persist {
-        if let Some(vectors) = store.get_mu() {
-            if let Err(e) = p.save_vectors(&vectors, &shard) {
-                eprintln!("Warning: save failed: {}", e);
-            }
-        }
+    // Persist vectors to storage backend. A03-F17: "appended" (exit 0)
+    // requires the shard to have been written — a failed save is an error,
+    // not a warning.
+    let saved = match persist {
+        Some(p) => match store.get_mu() {
+            Some(all) => p.save_vectors(&all, &shard),
+            None => Err(std::io::Error::other("store has no vectors to save")),
+        },
+        None => Err(std::io::Error::other(
+            "no storage backend: the data-dir could not be opened",
+        )),
+    };
+    if let Err(e) = saved {
+        eprintln!(
+            "Save error: append NOT persisted, shard '{}' is unchanged on disk ({} vectors were \
+             not written): {}",
+            shard,
+            vectors.nrows(),
+            e
+        );
+        std::process::exit(1);
     }
 
     println!(

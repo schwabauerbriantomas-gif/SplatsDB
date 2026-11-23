@@ -50,39 +50,64 @@ pub fn load_shard_store(
     config: &SplatsDBConfig,
     shard: &str,
 ) -> (SplatStore, Option<SplatsDBPersistence>) {
-    let persist = make_persistence(data_dir, "sqlite", true).ok();
-    let mut store = SplatStore::new(config.clone());
-
-    if let Some(ref p) = persist {
-        match p.load_vectors(shard) {
-            Ok(Some(vectors)) => {
-                eprintln!(
-                    "[splatsdb] Loaded {} vectors from shard '{}'",
-                    vectors.nrows(),
-                    shard
-                );
-                store.add_splat(&vectors);
-                // Try loading persisted HNSW first; only build from scratch if needed
-                store.build_index_if_needed(data_dir);
-            }
-            Ok(None) => {
-                if shard != "default" {
-                    let known = p.list_shards();
-                    eprintln!(
-                        "Error: shard '{}' not found. Available shards: {:?}",
-                        shard, known
-                    );
-                    std::process::exit(2);
-                }
-            }
-            Err(e) => {
-                eprintln!("Error: failed to load shard '{}': {}", shard, e);
-                std::process::exit(2);
-            }
+    match try_load_shard_store(data_dir, config, shard) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(2);
         }
     }
+}
 
-    (store, persist)
+/// Result-returning core of [`load_shard_store`] (no `exit`, testable).
+///
+/// Fail-closed (A03-F17): a data-dir that cannot be opened and a shard that
+/// exists but cannot be loaded into the store — unreadable, or rejected by
+/// `add_splat` (dimension/capacity mismatch) — are an `Err`. They never
+/// degrade to an empty store that answers "0 results" with exit 0.
+pub fn try_load_shard_store(
+    data_dir: &str,
+    config: &SplatsDBConfig,
+    shard: &str,
+) -> Result<(SplatStore, Option<SplatsDBPersistence>), String> {
+    let persist = make_persistence(data_dir, "sqlite", true)
+        .map_err(|e| format!("cannot open data-dir '{}': {}", data_dir, e))?;
+    let mut store = SplatStore::new(config.clone());
+
+    match persist.load_vectors(shard) {
+        Ok(Some(vectors)) => {
+            eprintln!(
+                "[splatsdb] Loaded {} vectors from shard '{}'",
+                vectors.nrows(),
+                shard
+            );
+            if !store.add_splat(&vectors) {
+                return Err(format!(
+                    "shard '{}' holds {}x{} vectors but the store was configured with --dim {} \
+                     and --max-splats {}: dimension or capacity mismatch (nothing was modified)",
+                    shard,
+                    vectors.nrows(),
+                    vectors.ncols(),
+                    config.latent_dim,
+                    config.max_splats
+                ));
+            }
+            // Try loading persisted HNSW first; only build from scratch if needed
+            store.build_index_if_needed(data_dir);
+            Ok((store, Some(persist)))
+        }
+        Ok(None) => {
+            if shard != "default" {
+                let known = persist.list_shards();
+                return Err(format!(
+                    "shard '{}' not found. Available shards: {:?}",
+                    shard, known
+                ));
+            }
+            Ok((store, Some(persist)))
+        }
+        Err(e) => Err(format!("failed to load shard '{}': {}", shard, e)),
+    }
 }
 
 pub fn parse_query(s: &str) -> Result<Array1<f32>, String> {
@@ -321,6 +346,48 @@ mod tests {
         let q = load_query_bin(&p).unwrap();
         assert_eq!(q.len(), 3);
         assert_eq!(q[2], 2.5);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    #[test]
+    fn try_load_shard_store_fails_closed_on_mismatch_and_unreadable_shards() {
+        let dir = temp_dir("shard-store");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = SplatsDBPersistence::new(dir.to_str().unwrap(), false).unwrap();
+        let vectors = Array2::from_shape_fn((2, 32), |(i, j)| (i * 32 + j) as f32);
+        p.save_vectors(&vectors, "default").unwrap();
+
+        // configuración correcta: carga
+        let (store, _) =
+            try_load_shard_store(dir.to_str().unwrap(), &make_config(32, 10), "default").unwrap();
+        assert_eq!(store.n_active(), 2);
+
+        // --dim que no coincide: Err, nunca un store vacío con 0 resultados
+        let err = try_load_shard_store(dir.to_str().unwrap(), &make_config(16, 10), "default")
+            .err()
+            .expect("try_load_shard_store must fail closed");
+        assert!(err.contains("mismatch"), "{err}");
+        // capacidad insuficiente
+        let err = try_load_shard_store(dir.to_str().unwrap(), &make_config(32, 1), "default")
+            .err()
+            .expect("try_load_shard_store must fail closed");
+        assert!(err.contains("mismatch"), "{err}");
+
+        // shard ilegible
+        let shard = dir.join("data").join("vectors").join("default.bin");
+        std::fs::write(&shard, [7u8; 40]).unwrap();
+        let err = try_load_shard_store(dir.to_str().unwrap(), &make_config(32, 10), "default")
+            .err()
+            .expect("try_load_shard_store must fail closed");
+        assert!(err.contains("failed to load shard"), "{err}");
+
+        // data-dir que no se puede abrir (un archivo donde va el directorio)
+        let bogus = dir.join("not-a-dir");
+        std::fs::write(&bogus, b"x").unwrap();
+        let err = try_load_shard_store(bogus.to_str().unwrap(), &make_config(32, 10), "default")
+            .err()
+            .expect("try_load_shard_store must fail closed");
+        assert!(err.contains("cannot open data-dir"), "{err}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

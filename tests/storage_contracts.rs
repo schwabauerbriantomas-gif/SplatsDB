@@ -447,3 +447,104 @@ fn b2_serve_with_a_data_dir_never_starts_ephemeral_when_the_wal_cannot_open() {
     assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+fn cli(data_dir: &Path, dim: usize, args: &[&str]) -> (ExitStatus, String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_splatsdb"))
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("--dim")
+        .arg(dim.to_string())
+        .args(args)
+        .output()
+        .expect("run splatsdb");
+    (
+        out.status,
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+fn query_of(dim: usize) -> String {
+    (0..dim).map(|_| "0.1").collect::<Vec<_>>().join(",")
+}
+
+#[test]
+fn c1_search_on_a_shard_whose_dimension_does_not_match_exits_nonzero() {
+    let dir = scratch("c1");
+    write_matrix(&shard_path(&dir), 4, DIM, 0.0);
+    let (status, out, err) = cli(&dir, 16, &["search", "--query", &query_of(16), "--k", "3"]);
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "search reported success on a shard it never loaded; stdout={out}\nstderr={err}"
+    );
+    assert!(err.contains("mismatch"), "{err}");
+    // el mismo shard con el --dim correcto sigue siendo una búsqueda normal
+    let (status, out, err) = cli(
+        &dir,
+        DIM,
+        &["search", "--query", &query_of(DIM), "--k", "2"],
+    );
+    assert!(status.success(), "{err}");
+    assert!(out.contains(r#""index""#), "{out}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn c2_append_does_not_report_success_when_the_shard_cannot_be_written() {
+    let dir = scratch("c2");
+    write_matrix(&shard_path(&dir), 4, DIM, 0.0);
+    let input = dir.join("extra.bin");
+    write_matrix(&input, 2, DIM, 50.0);
+    let before = std::fs::read(shard_path(&dir)).unwrap();
+    let shard = shard_path(&dir);
+    let vectors_dir = shard.parent().unwrap();
+    let mut perms = std::fs::metadata(vectors_dir).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(vectors_dir, perms).unwrap();
+
+    let result = cli(&dir, DIM, &["append", "--input", input.to_str().unwrap()]);
+
+    // restaurar primero: el cleanup tiene que funcionar aunque falle un assert
+    let mut perms = std::fs::metadata(vectors_dir).unwrap().permissions();
+    perms.set_readonly(false);
+    std::fs::set_permissions(vectors_dir, perms).unwrap();
+
+    let (status, out, err) = result;
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "append reported success without writing the shard; stdout={out}\nstderr={err}"
+    );
+    assert!(err.contains("Save error"), "{err}");
+    assert!(!out.contains(r#""appended""#), "{out}");
+    assert_eq!(
+        std::fs::read(shard_path(&dir)).unwrap(),
+        before,
+        "a failed append must leave the shard untouched"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn c3_append_with_a_dimension_that_does_not_match_the_shard_exits_nonzero() {
+    let dir = scratch("c3");
+    write_matrix(&shard_path(&dir), 4, DIM, 0.0);
+    let input = dir.join("extra.bin");
+    write_matrix(&input, 2, 16, 50.0);
+    let before = std::fs::read(shard_path(&dir)).unwrap();
+    let (status, out, err) = cli(&dir, 16, &["append", "--input", input.to_str().unwrap()]);
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "append reported success on a shard it never loaded; stdout={out}\nstderr={err}"
+    );
+    assert!(!out.contains(r#""appended""#), "{out}");
+    assert_eq!(
+        std::fs::read(shard_path(&dir)).unwrap(),
+        before,
+        "the 4x{} shard must not be replaced by a 2x16 store",
+        DIM
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
