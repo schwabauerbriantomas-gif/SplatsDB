@@ -2219,7 +2219,15 @@ fn register_warm_start_spatial(
     spatial_warmstart_enabled: bool,
     warm_start_t0: std::time::Instant,
 ) {
-    let mut s = state.lock().unwrap();
+    // Never `unwrap()` a production lock (A05-F12): a poisoned mutex must
+    // degrade to a logged, controlled failure — not kill the stdio server.
+    let mut s = match state.lock() {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("[splatsdb] ERROR: state mutex poisoned, skipping spatial warm-start registration: {e}");
+            return;
+        }
+    };
     for (doc_id, wing, room, hall) in warm_start_spatial {
         s.spatial_index
             .register_doc(doc_id, wing.as_deref(), room.as_deref(), hall.as_deref());
@@ -2990,6 +2998,81 @@ mod tests {
         }
         // A doc with no row at all (cannot happen through the handlers) still degrades to "".
         assert_eq!(state.lock().unwrap().doc_text("ghost"), "");
+    }
+
+    /// A05-F12: a poisoned state mutex never panics the stdio server. Every
+    /// tool that takes the lock answers a controlled error, and the
+    /// cold-start helper returns instead of unwrapping.
+    #[test]
+    fn f12_poisoned_state_mutex_yields_controlled_errors() {
+        let state = f05a_state();
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state.lock().unwrap();
+            panic!("poison probe");
+        }));
+        std::panic::set_hook(prev_hook);
+        assert!(
+            poisoned.is_err(),
+            "probe must have panicked while holding the lock"
+        );
+        assert!(state.is_poisoned());
+
+        // Cold-start path: no panic on the poisoned lock.
+        register_warm_start_spatial(
+            &state,
+            &vec![("d".to_string(), None, None, None)],
+            true,
+            std::time::Instant::now(),
+        );
+
+        let calls: [(&str, Value); 14] = [
+            ("splatsdb_store", json!({ "text": "t", "id": "p" })),
+            ("splatsdb_search", json!({ "query": "q" })),
+            ("splatsdb_status", json!({})),
+            ("splatsdb_doc_add", json!({ "id": "p", "text": "t" })),
+            ("splatsdb_doc_get", json!({ "id": "p" })),
+            ("splatsdb_doc_del", json!({ "id": "p" })),
+            ("splatsdb_graph_add_doc", json!({ "text": "t" })),
+            (
+                "splatsdb_graph_add_entity",
+                json!({ "name": "n", "entity_type": "x" }),
+            ),
+            (
+                "splatsdb_graph_add_relation",
+                json!({ "source_id": 1, "target_id": 2, "relation_type": "r" }),
+            ),
+            ("splatsdb_graph_traverse", json!({ "start_id": 1 })),
+            ("splatsdb_graph_search", json!({ "query": "q" })),
+            ("splatsdb_graph_search_entities", json!({ "query": "q" })),
+            ("splatsdb_spatial_search", json!({ "query": "q" })),
+            ("splatsdb_spatial_info", json!({})),
+        ];
+        for (i, (tool, args)) in calls.iter().enumerate() {
+            let req: JsonRpcRequest = serde_json::from_value(json!({
+                "jsonrpc": "2.0", "id": i, "method": "tools/call",
+                "params": { "name": tool, "arguments": args }
+            }))
+            .unwrap();
+            let resp = dispatch_request(&state, &req);
+            assert!(
+                resp.error.is_none(),
+                "{tool}: protocol error instead of a controlled tool error"
+            );
+            let result = resp.result.expect("tool result");
+            assert_eq!(result["isError"], json!(true), "{tool}: {result}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("internal server error"), "{tool}: {text}");
+        }
+        // The verbatim search reaches the lock after its parameter validation.
+        let req: JsonRpcRequest = serde_json::from_value(json!({
+            "jsonrpc": "2.0", "id": 99, "method": "tools/call",
+            "params": { "name": "splatsdb_verbatim_search", "arguments": { "query": "q" } }
+        }))
+        .unwrap();
+        let resp = dispatch_request(&state, &req);
+        assert_eq!(resp.result.unwrap()["isError"], json!(true));
     }
 
     // -- end of F05a inline tests --
