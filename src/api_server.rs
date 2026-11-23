@@ -5240,7 +5240,14 @@ mod f02e1_energy_reload_tests {
         assert!((l2_out[0].1[1] - 4.25).abs() < 1e-5, "{:?}", l2_out[0].1);
         // malformed shapes are left for reassemble_gpu_rows to reject
         let mut bad = vec![(vec![0usize, 1], vec![1.0f32])];
-        canonicalize_gpu_rows(&snap, &[q.clone()], &[5], &[false], &mut [], &mut bad);
+        canonicalize_gpu_rows(
+            &snap,
+            std::slice::from_ref(&q),
+            &[5],
+            &[false],
+            &mut [],
+            &mut bad,
+        );
         assert_eq!(bad[0].0.len(), 2);
         assert_eq!(bad[0].1.len(), 1);
         // host fallbacks are contractual on their own

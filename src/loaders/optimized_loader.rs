@@ -106,10 +106,11 @@ impl EnergyLandscape {
             return 0;
         }
         let m = self.mu.nrows().min(shard.nrows());
-        (0..m)
-            .all(|i| self.mu.row(i) == shard.row(i))
-            .then_some(m)
-            .unwrap_or(0)
+        if (0..m).all(|i| self.mu.row(i) == shard.row(i)) {
+            m
+        } else {
+            0
+        }
     }
 }
 

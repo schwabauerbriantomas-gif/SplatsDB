@@ -2433,13 +2433,6 @@ mod f02e1_contract_tests {
         );
     }
 
-    fn dim32(rows: &[[f32; 3]]) -> Array2<f32> {
-        Array2::from_shape_fn(
-            (rows.len(), 32),
-            |(i, j)| if j < 3 { rows[i][j] } else { 0.0 },
-        )
-    }
-
     #[test]
     fn store_routes_resolve_ties_by_id_and_load_energy_replays_the_state() {
         let config = SplatsDBConfig {

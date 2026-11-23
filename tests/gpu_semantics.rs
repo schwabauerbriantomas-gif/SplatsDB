@@ -795,7 +795,7 @@ fn tie_reference(gaussian: bool, extra: &[Vec<f32>]) -> Vec<(u64, f64)> {
         .map(|(i, r)| {
             let d2 = d2(r, &q);
             let score = if gaussian {
-                f64::from(if i == 257 { 1000.0 } else { 1.0 }) * (-d2).exp()
+                (if i == 257 { 1000.0 } else { 1.0 }) * (-d2).exp()
             } else {
                 d2
             };
@@ -863,13 +863,13 @@ fn exact_ties_resolve_by_id_on_the_cpu_route() {
     assert_tie_rows_ordered(
         &search(port, false, &q, TOP_K),
         false,
-        &[far.clone()],
+        std::slice::from_ref(&far),
         "CPU L2 after /store",
     );
     assert_tie_rows_ordered(
         &search(port, true, &q, TOP_K),
         true,
-        &[far.clone()],
+        std::slice::from_ref(&far),
         "CPU gaussian after /store",
     );
 
@@ -962,23 +962,28 @@ fn exact_ties_resolve_by_id_on_the_gpu_fast_path_the_gpu_batch_and_the_cpu_route
         Value::Null,
         "the fast path must stay invalid after a mutation (A03-F05): {after}"
     );
-    assert_tie_rows(&after, false, &[far.clone()], "GPU batch L2 after /store");
+    assert_tie_rows(
+        &after,
+        false,
+        std::slice::from_ref(&far),
+        "GPU batch L2 after /store",
+    );
     assert_tie_rows(
         &search(port_gpu, true, &q, TOP_K),
         true,
-        &[far.clone()],
+        std::slice::from_ref(&far),
         "GPU batch gaussian after /store",
     );
     assert_tie_rows_ordered(
         &search(port_cpu, false, &q, TOP_K),
         false,
-        &[far.clone()],
+        std::slice::from_ref(&far),
         "CPU L2 after /store",
     );
     assert_tie_rows_ordered(
         &search(port_cpu, true, &q, TOP_K),
         true,
-        &[far.clone()],
+        std::slice::from_ref(&far),
         "CPU gaussian after /store",
     );
 

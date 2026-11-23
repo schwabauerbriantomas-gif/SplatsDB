@@ -454,16 +454,21 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
+/// What [`seed`] leaves behind.
+struct Seed {
+    dir: PathBuf,
+    mu: Vec<Vec<f32>>,
+    alpha: Vec<f32>,
+    kappa: Vec<f32>,
+    /// Discriminating query (see [`seed`]).
+    q: Vec<f32>,
+    /// Vector a later `/store` appends, far from every splat.
+    far: Vec<f32>,
+}
+
 /// The seed data-dir: real CLI `ingest` (shard + energy landscape). Returns
 /// `(dir, mu, alpha, kappa, query, far vector)`.
-fn seed() -> (
-    PathBuf,
-    Vec<Vec<f32>>,
-    Vec<f32>,
-    Vec<f32>,
-    Vec<f32>,
-    Vec<f32>,
-) {
+fn seed() -> Seed {
     let dir = scratch("seed");
     let (centers, chunks) = corpus();
     write_bin(&dir.join("raw.bin"), &chunks);
@@ -523,7 +528,14 @@ fn seed() -> (
         })
         .expect("no discriminating query for this corpus");
     let far: Vec<f32> = (0..DIM).map(|d| 40.0 + 0.25 * d as f32).collect();
-    (dir, mu, alpha, kappa, q, far)
+    Seed {
+        dir,
+        mu,
+        alpha,
+        kappa,
+        q,
+        far,
+    }
 }
 
 // ─── The lifecycle (every build) ──────────────────────────────────────
@@ -531,7 +543,14 @@ fn seed() -> (
 /// One `serve` lifecycle on a copy of the seed: gaussian + L2 before a
 /// `/store`, after it, and after a restart of the same data-dir.
 fn assert_energy_survives_a_restart(gpu: bool) {
-    let (seed_dir, mu, alpha, kappa, q, far) = seed();
+    let Seed {
+        dir: seed_dir,
+        mu,
+        alpha,
+        kappa,
+        q,
+        far,
+    } = seed();
     let port = probe_port();
     let dir = scratch(if gpu { "gpu" } else { "cpu" });
     copy_dir(&seed_dir, &dir);
