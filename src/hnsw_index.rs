@@ -491,14 +491,30 @@ impl HNSWIndex {
         }
     }
 
-    /// Distance with precomputed norm for the stored vector (avoids recomputing).
-    /// `a` is the query (norm computed fresh), `b_idx` is the stored vector index.
+    /// Norm of a query, computed ONCE per search/insert and threaded through
+    /// the layer walks (A01-F08a) instead of once per distance evaluation.
+    /// Same expression on the same input as the per-call value it replaces,
+    /// so cosine distances are bit-identical. 0.0 for L2, where it is unused.
     #[inline]
-    fn distance_cached(&self, query: &[f32], b_idx: usize) -> f32 {
+    fn query_norm(&self, query: &[f32]) -> f32 {
+        if self.metric == "cosine" {
+            query.iter().map(|x| x * x).sum::<f32>().sqrt()
+        } else {
+            0.0
+        }
+    }
+
+    /// Distance with precomputed norm for the stored vector (avoids recomputing).
+    /// `query` is the search vector, `q_norm` its norm (see [`Self::query_norm`]),
+    /// `b_idx` the stored vector index.
+    #[inline]
+    fn distance_cached(&self, query: &[f32], q_norm: f32, b_idx: usize) -> f32 {
         let b = &self.vectors[b_idx];
         if self.metric == "cosine" {
             let dot: f32 = query.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-            let na: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+            // Query norm computed once per search/insert (A01-F08a): the same
+            // expression on the same input, same bits.
+            let na: f32 = q_norm;
             let nb = self.norms[b_idx];
             let denom = na * nb;
             if denom < 1e-10 {
@@ -515,9 +531,9 @@ impl HNSWIndex {
         }
     }
 
-    fn greedy_closest(&self, query: &[f32], entry: usize, level: usize) -> usize {
+    fn greedy_closest(&self, query: &[f32], q_norm: f32, entry: usize, level: usize) -> usize {
         let mut current = entry;
-        let mut current_dist = self.distance_cached(query, current);
+        let mut current_dist = self.distance_cached(query, q_norm, current);
 
         loop {
             let mut changed = false;
@@ -529,7 +545,7 @@ impl HNSWIndex {
                 if self.removed.contains(&neighbor) {
                     continue;
                 }
-                let d = self.distance_cached(query, neighbor);
+                let d = self.distance_cached(query, q_norm, neighbor);
                 if d < current_dist {
                     current_dist = d;
                     current = neighbor;
@@ -546,13 +562,14 @@ impl HNSWIndex {
     fn search_layer(
         &self,
         query: &[f32],
+        q_norm: f32,
         entry: usize,
         ef: usize,
         level: usize,
     ) -> Vec<(f32, usize)> {
         let mut visited = HashSet::new();
         visited.insert(entry);
-        let dist_ep = self.distance_cached(query, entry);
+        let dist_ep = self.distance_cached(query, q_norm, entry);
 
         let mut candidates = BinaryHeap::new(); // min-heap via DistIdx
         let mut results = BinaryHeap::new(); // max-heap via MaxDistIdx
@@ -580,7 +597,7 @@ impl HNSWIndex {
                 }
                 visited.insert(neighbor);
 
-                let dist_n = self.distance_cached(query, neighbor);
+                let dist_n = self.distance_cached(query, q_norm, neighbor);
                 let farthest = match results.peek() {
                     Some(MaxDistIdx(d, _)) => *d,
                     None => f32::MAX,
@@ -627,15 +644,16 @@ impl HNSWIndex {
         }
 
         let mut ep = self.entry_point;
+        let q_norm = self.query_norm(vector);
 
         // Phase 1: greedy descent from top to above insertion level
         for lev in (level + 1..=self.max_level).rev() {
-            ep = self.greedy_closest(vector, ep, lev);
+            ep = self.greedy_closest(vector, q_norm, ep, lev);
         }
 
         // Phase 2: insert into each layer
         for lev in (0..=level.min(self.max_level)).rev() {
-            let candidates = self.search_layer(vector, ep, self.ef_construction, lev);
+            let candidates = self.search_layer(vector, q_norm, ep, self.ef_construction, lev);
             let m_max = if lev == 0 { self.m_max0 } else { self.m };
             let m = self.m;
 
@@ -656,10 +674,13 @@ impl HNSWIndex {
                 // brand-new edge to `idx` was silently discarded whenever the
                 // neighbor was already at capacity (m_max).
                 if self.nodes[neighbor_idx].neighbors[lev].len() > m_max {
-                    let n_vec = self.vectors[neighbor_idx].clone();
+                    // Score the full list under shared borrows — no clone of
+                    // the neighbor vector (A01-F08b). Same distances, same
+                    // stable sort, same order.
+                    let n_vec = &self.vectors[neighbor_idx];
                     let mut scored: Vec<(f32, usize)> = self.nodes[neighbor_idx].neighbors[lev]
                         .iter()
-                        .map(|&ni| (self.distance(&n_vec, &self.vectors[ni]), ni))
+                        .map(|&ni| (self.distance(n_vec, &self.vectors[ni]), ni))
                         .collect();
                     scored
                         .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -704,16 +725,17 @@ impl VectorIndex for HNSWIndex {
         }
 
         let q: Vec<f32> = query.to_vec();
+        let q_norm = self.query_norm(&q);
         let ef = self.ef_search.max(k);
         let mut ep = self.entry_point;
 
         // Phase 1: greedy descent from top layer to layer 1
         for level in (1..=self.max_level).rev() {
-            ep = self.greedy_closest(&q, ep, level);
+            ep = self.greedy_closest(&q, q_norm, ep, level);
         }
 
         // Phase 2: search at layer 0
-        let candidates = self.search_layer(&q, ep, ef, 0);
+        let candidates = self.search_layer(&q, q_norm, ep, ef, 0);
 
         let results: Vec<(f32, usize)> = candidates
             .into_iter()
@@ -1324,5 +1346,493 @@ mod tests {
         );
         assert!(target.is_dir());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── A01-F08 hot paths: exact parity guards ──────────────────────────────
+
+    /// Tie-heavy fixture: coordinates on a 3-value grid — many exact
+    /// duplicates and equidistant points, so ordering depends on tie-breaks.
+    fn tie_heavy_vectors(n: usize, dim: usize, seed: u64) -> Array2<f32> {
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let data: Vec<f32> = (0..n * dim)
+            .map(|_| (rng.gen_range(0..3) as f32) * 0.5)
+            .collect();
+        Array2::from_shape_vec((n, dim), data).unwrap()
+    }
+
+    /// Rows with non-unit norms on a wide scale (0.05 .. ~19.5), a zero row
+    /// every 97th row (cosine falls back to 1.0) and exact duplicate rows
+    /// (ties) — `small_random_vectors` alone never leaves [0, 1).
+    fn scaled_random_vectors(n: usize, dim: usize, seed: u64) -> Array2<f32> {
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let dup: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>() - 0.5).collect();
+        let mut data = Vec::with_capacity(n * dim);
+        for i in 0..n {
+            let scale = match i % 97 {
+                0 => 0.0,
+                1 | 2 => 1.0,
+                k => 0.05 + (k as f32) * 0.2,
+            };
+            let v: Vec<f32> = if matches!(i % 97, 1 | 2) {
+                dup.clone()
+            } else {
+                (0..dim).map(|_| rng.gen::<f32>() - 0.5).collect()
+            };
+            for x in v {
+                data.push(scale * x);
+            }
+        }
+        Array2::from_shape_vec((n, dim), data).unwrap()
+    }
+
+    /// `hotpath_fixture(kind, n, seed)`: "tie" -> dim 4 grid, "scaled" -> dim 12.
+    fn hotpath_fixture(kind: &str, n: usize, seed: u64) -> Array2<f32> {
+        match kind {
+            "tie" => tie_heavy_vectors(n, 4, seed),
+            _ => scaled_random_vectors(n, 12, seed),
+        }
+    }
+
+    /// The search path as it was BEFORE A01-F08: query norm recomputed for
+    /// every distance, the same heap walks in the same order. Reference for
+    /// the parity guard — it ran green against the untouched production path
+    /// first (reference faithfulness), then against the optimised one.
+    fn reference_search(idx: &HNSWIndex, query: &[f32], k: usize) -> IndexSearchResult {
+        let dc = |b_idx: usize| -> f32 {
+            let b = &idx.vectors[b_idx];
+            if idx.metric == "cosine" {
+                let dot: f32 = query.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+                let na: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let nb = idx.norms[b_idx];
+                let denom = na * nb;
+                if denom < 1e-10 {
+                    return 1.0;
+                }
+                1.0 - dot / denom
+            } else {
+                query
+                    .iter()
+                    .zip(b.iter())
+                    .map(|(x, y)| (x - y) * (x - y))
+                    .sum::<f32>()
+                    .sqrt()
+            }
+        };
+        if idx.vectors.is_empty() {
+            return IndexSearchResult {
+                indices: vec![],
+                distances: vec![],
+            };
+        }
+        let greedy = |mut current: usize, level: usize| -> usize {
+            let mut current_dist = dc(current);
+            loop {
+                let mut changed = false;
+                let node = &idx.nodes[current];
+                if level >= node.neighbors.len() {
+                    break;
+                }
+                for &neighbor in &node.neighbors[level] {
+                    if idx.removed.contains(&neighbor) {
+                        continue;
+                    }
+                    let d = dc(neighbor);
+                    if d < current_dist {
+                        current_dist = d;
+                        current = neighbor;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            current
+        };
+        let ef = idx.ef_search.max(k);
+        let mut ep = idx.entry_point;
+        for level in (1..=idx.max_level).rev() {
+            ep = greedy(ep, level);
+        }
+        let mut visited = HashSet::new();
+        visited.insert(ep);
+        let dist_ep = dc(ep);
+        let mut candidates = BinaryHeap::new();
+        let mut results = BinaryHeap::new();
+        candidates.push(DistIdx(dist_ep, ep));
+        results.push(MaxDistIdx(dist_ep, ep));
+        while let Some(DistIdx(dist_c, c)) = candidates.pop() {
+            let farthest = match results.peek() {
+                Some(MaxDistIdx(d, _)) => *d,
+                None => break,
+            };
+            if dist_c > farthest {
+                break;
+            }
+            let node = &idx.nodes[c];
+            if node.neighbors.is_empty() {
+                continue;
+            }
+            for &neighbor in &node.neighbors[0] {
+                if visited.contains(&neighbor) || idx.removed.contains(&neighbor) {
+                    continue;
+                }
+                visited.insert(neighbor);
+                let dist_n = dc(neighbor);
+                let farthest = match results.peek() {
+                    Some(MaxDistIdx(d, _)) => *d,
+                    None => f32::MAX,
+                };
+                if dist_n < farthest || results.len() < ef {
+                    candidates.push(DistIdx(dist_n, neighbor));
+                    results.push(MaxDistIdx(dist_n, neighbor));
+                    if results.len() > ef {
+                        results.pop();
+                    }
+                }
+            }
+        }
+        let mut r: Vec<(f32, usize)> = results.into_iter().map(|MaxDistIdx(d, i)| (d, i)).collect();
+        r.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let results: Vec<(f32, usize)> = r
+            .into_iter()
+            .filter(|(_, i)| !idx.removed.contains(i))
+            .take(k)
+            .collect();
+        IndexSearchResult {
+            indices: results.iter().map(|(_, i)| *i).collect(),
+            distances: results.iter().map(|(d, _)| *d).collect(),
+        }
+    }
+
+    /// A01-F08 guard: the production search path must return exactly the ids
+    /// AND distances of `reference_search` (the pre-optimisation path) on
+    /// tie-heavy and non-unit-norm fixtures, both metrics, with removed ids,
+    /// before and after a save/load round-trip and after an insert + remove
+    /// on the reloaded index, for every k. A tie ordered differently or a
+    /// distance off by one ulp fails here.
+    #[test]
+    fn test_search_matches_reference_path_exact() {
+        let dim_of = |kind: &str| if kind == "tie" { 4 } else { 12 };
+        let mut compared = 0usize;
+        for (metric, kind, seed) in [
+            ("l2", "tie", 11u64),
+            ("cosine", "tie", 12),
+            ("l2", "scaled", 13),
+            ("cosine", "scaled", 14),
+        ] {
+            let tag = format!("{metric}/{kind}");
+            let mut idx = HNSWIndex::new(dim_of(kind), 8, 100, 50, metric, 42);
+            idx.build(hotpath_fixture(kind, 3_000, seed));
+            idx.remove(&[5, 77, 800]);
+            idx.insert(&vec![0.25; dim_of(kind)]);
+            assert!(
+                idx.max_level >= 1,
+                "{tag}: fixture must walk the upper layers"
+            );
+            let queries = hotpath_fixture(kind, 40, seed + 100);
+            let mut check = |idx: &HNSWIndex, phase: &str| {
+                for i in 0..queries.nrows() {
+                    let q = queries.row(i).to_vec();
+                    for k in [1usize, 5, 10, 50] {
+                        let got = idx.search(queries.row(i), k);
+                        let want = reference_search(idx, &q, k);
+                        assert_eq!(got.indices, want.indices, "{tag} {phase} q{i} k{k}: ids");
+                        assert_eq!(
+                            got.distances, want.distances,
+                            "{tag} {phase} q{i} k{k}: distances"
+                        );
+                        assert!(!got.indices.is_empty());
+                        compared += 1;
+                    }
+                }
+            };
+            check(&idx, "in-memory");
+            let path = temp_file(&format!("hotpath_{metric}_{kind}"));
+            idx.save(&path).unwrap();
+            let mut reloaded = HNSWIndex::load(&path, 8, 100, 50, metric, 42).unwrap();
+            std::fs::remove_file(&path).ok();
+            check(&reloaded, "reloaded");
+            reloaded.insert(&vec![-0.5; dim_of(kind)]);
+            reloaded.remove(&[1, 2]);
+            check(&reloaded, "reloaded+insert+remove");
+        }
+        assert_eq!(compared, 4 * 3 * 40 * 4);
+    }
+
+    /// Golden fixtures: (metric, kind, seed).
+    const GOLDEN_FIXTURES: &[(&str, &str, u64)] = &[
+        ("l2", "tie", 1),
+        ("l2", "tie", 2),
+        ("cosine", "tie", 3),
+        ("cosine", "tie", 4),
+        ("l2", "scaled", 5),
+        ("cosine", "scaled", 6),
+    ];
+
+    /// FNV-1a 64 over bytes (parity hash of a saved HNSW file / search output).
+    fn fnv64(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
+    /// The saved-file layout (header, removed ids, adjacency, raw vectors)
+    /// with ONE difference: the removed ids are sorted. `save()` writes them
+    /// in `HashSet` iteration order, which is randomised per process
+    /// (RandomState), so the raw bytes of a file with >= 2 removed ids are
+    /// not reproducible across processes; every other section is.
+    fn canonical_file_bytes(idx: &HNSWIndex) -> Vec<u8> {
+        let mut removed: Vec<u64> = idx.removed.iter().map(|&x| x as u64).collect();
+        removed.sort_unstable();
+        let dim = if idx.vectors.is_empty() {
+            idx._dim as u64
+        } else {
+            idx.vectors[0].len() as u64
+        };
+        let mut h = Vec::new();
+        for v in [
+            HNSW_MAGIC,
+            idx.vectors.len() as u64,
+            dim,
+            idx.m as u64,
+            idx.m_max0 as u64,
+            idx.ef_construction as u64,
+            idx.ef_search as u64,
+            idx.entry_point as u64,
+            idx.max_level as u64,
+            removed.len() as u64,
+        ] {
+            h.extend_from_slice(&v.to_le_bytes());
+        }
+        for r in &removed {
+            h.extend_from_slice(&r.to_le_bytes());
+        }
+        for node in &idx.nodes {
+            h.extend_from_slice(&(node.neighbors.len() as u64).to_le_bytes());
+            for level in &node.neighbors {
+                h.extend_from_slice(&(level.len() as u64).to_le_bytes());
+                for &nb in level {
+                    h.extend_from_slice(&(nb as u64).to_le_bytes());
+                }
+            }
+        }
+        for v in &idx.vectors {
+            h.extend_from_slice(bytemuck::cast_slice(v.as_slice()));
+        }
+        h
+    }
+
+    /// One deterministic fixture -> (name, len, FNV) of the raw saved file
+    /// (`/file`), of the canonical file layout (`/canonical-file`) and of
+    /// the SEARCH OUTPUT (ids + raw f32 bits of every distance, in order;
+    /// 64 queries x k in {1, 5, 10, 50}) at three points: built, reloaded
+    /// from disk, and reloaded + 4 inserts + 4 removals (the insert/prune
+    /// path after load).
+    fn golden_fixture(metric: &str, kind: &str, seed: u64) -> Vec<(String, usize, u64)> {
+        let dim = if kind == "tie" { 4 } else { 12 };
+        let mut out = Vec::new();
+        let mut idx = HNSWIndex::new(dim, 8, 100, 50, metric, 42);
+        idx.build(hotpath_fixture(kind, 2_000, seed));
+        idx.remove(&[5, 77, 800]);
+        idx.insert(&vec![0.5; dim]);
+        idx.insert(&vec![0.25; dim]);
+        let queries = hotpath_fixture(kind, 64, seed + 100);
+        let mut record = |idx: &HNSWIndex, tag: &str| {
+            let bytes = saved_bytes(idx, &format!("golden_{metric}_{kind}_{seed}_{tag}"));
+            out.push((
+                format!("{metric}/{kind}/{seed}/{tag}/file"),
+                bytes.len(),
+                fnv64(&bytes),
+            ));
+            let canonical = canonical_file_bytes(idx);
+            out.push((
+                format!("{metric}/{kind}/{seed}/{tag}/canonical-file"),
+                canonical.len(),
+                fnv64(&canonical),
+            ));
+            let mut h = Vec::new();
+            for i in 0..queries.nrows() {
+                for k in [1usize, 5, 10, 50] {
+                    let r = idx.search(queries.row(i), k);
+                    for id in &r.indices {
+                        h.extend_from_slice(&(*id as u64).to_le_bytes());
+                    }
+                    for d in &r.distances {
+                        h.extend_from_slice(&d.to_bits().to_le_bytes());
+                    }
+                }
+            }
+            out.push((
+                format!("{metric}/{kind}/{seed}/{tag}/search"),
+                h.len(),
+                fnv64(&h),
+            ));
+        };
+        record(&idx, "built");
+        let path = temp_file(&format!("golden_file_{metric}_{kind}_{seed}"));
+        idx.save(&path).unwrap();
+        let mut reloaded = HNSWIndex::load(&path, 8, 100, 50, metric, 42).unwrap();
+        std::fs::remove_file(&path).ok();
+        record(&reloaded, "reloaded");
+        for s in [0.125f32, -0.75, 3.5, -8.0] {
+            reloaded.insert(&vec![s; dim]);
+        }
+        reloaded.remove(&[0, 1, 2, 3]);
+        record(&reloaded, "after_inserts");
+        out
+    }
+
+    /// (fixture, bytes, FNV-1a) recorded on the code BEFORE the A01-F08 hot
+    /// paths (4b78909; logs/F03c_hnsw_pre.log).
+    const GOLDEN: &[(&str, usize, u64)] = &[
+        ("l2/tie/1/built/canonical-file", 281248, 0x50a2a702ace9cb63),
+        ("l2/tie/1/built/search", 49536, 0xae34808971c598df),
+        (
+            "l2/tie/1/reloaded/canonical-file",
+            281248,
+            0x50a2a702ace9cb63,
+        ),
+        ("l2/tie/1/reloaded/search", 49536, 0xae34808971c598df),
+        (
+            "l2/tie/1/after_inserts/canonical-file",
+            281736,
+            0x2d1af6079a4f1c90,
+        ),
+        ("l2/tie/1/after_inserts/search", 49536, 0x7befad7ececc3d7f),
+        ("l2/tie/2/built/canonical-file", 280168, 0xe5d85ed9cf84bbdb),
+        ("l2/tie/2/built/search", 50232, 0x1b9e230d22e5ec7b),
+        (
+            "l2/tie/2/reloaded/canonical-file",
+            280168,
+            0xe5d85ed9cf84bbdb,
+        ),
+        ("l2/tie/2/reloaded/search", 50232, 0x1b9e230d22e5ec7b),
+        (
+            "l2/tie/2/after_inserts/canonical-file",
+            280704,
+            0x602f427dca2481f9,
+        ),
+        ("l2/tie/2/after_inserts/search", 50232, 0x4947e36b0d5796f6),
+        (
+            "cosine/tie/3/built/canonical-file",
+            278528,
+            0xe8ac5bf23ba1179e,
+        ),
+        ("cosine/tie/3/built/search", 49872, 0xa198cb9f0e4354b3),
+        (
+            "cosine/tie/3/reloaded/canonical-file",
+            278528,
+            0xe8ac5bf23ba1179e,
+        ),
+        ("cosine/tie/3/reloaded/search", 49872, 0xa198cb9f0e4354b3),
+        (
+            "cosine/tie/3/after_inserts/canonical-file",
+            279000,
+            0x03ed5b2f1568e39e,
+        ),
+        (
+            "cosine/tie/3/after_inserts/search",
+            49872,
+            0x4b16d72f66985215,
+        ),
+        (
+            "cosine/tie/4/built/canonical-file",
+            278544,
+            0xfd030ab6341fbf70,
+        ),
+        ("cosine/tie/4/built/search", 50688, 0x985bf0c83168ee60),
+        (
+            "cosine/tie/4/reloaded/canonical-file",
+            278544,
+            0xfd030ab6341fbf70,
+        ),
+        ("cosine/tie/4/reloaded/search", 50688, 0x985bf0c83168ee60),
+        (
+            "cosine/tie/4/after_inserts/canonical-file",
+            279016,
+            0x8e276d482d829da8,
+        ),
+        (
+            "cosine/tie/4/after_inserts/search",
+            50688,
+            0x154c67417bf6eff2,
+        ),
+        (
+            "l2/scaled/5/built/canonical-file",
+            344456,
+            0xcfcdee2a0d0c89c7,
+        ),
+        ("l2/scaled/5/built/search", 50688, 0x83dcbeebf20a476a),
+        (
+            "l2/scaled/5/reloaded/canonical-file",
+            344456,
+            0xcfcdee2a0d0c89c7,
+        ),
+        ("l2/scaled/5/reloaded/search", 50688, 0x83dcbeebf20a476a),
+        (
+            "l2/scaled/5/after_inserts/canonical-file",
+            345128,
+            0xc896841b9e55fdac,
+        ),
+        (
+            "l2/scaled/5/after_inserts/search",
+            50688,
+            0x38c5dae6d16676b6,
+        ),
+        (
+            "cosine/scaled/6/built/canonical-file",
+            352712,
+            0x95e43902b906cf69,
+        ),
+        ("cosine/scaled/6/built/search", 50688, 0x9b271a5e8627deb4),
+        (
+            "cosine/scaled/6/reloaded/canonical-file",
+            352712,
+            0x95e43902b906cf69,
+        ),
+        ("cosine/scaled/6/reloaded/search", 50688, 0x9b271a5e8627deb4),
+        (
+            "cosine/scaled/6/after_inserts/canonical-file",
+            353440,
+            0x0b8435b5516eaf33,
+        ),
+        (
+            "cosine/scaled/6/after_inserts/search",
+            50688,
+            0xe76fa11027429f68,
+        ),
+    ];
+
+    /// Golden hashes of the saved HNSW file (graph, removed ids, raw vectors)
+    /// and of the search output (ids + distance bits, in order) on the
+    /// deterministic fixtures above. One different byte, id, distance or tie
+    /// order fails here.
+    #[test]
+    fn test_hot_path_graph_and_search_match_golden() {
+        let mut n = 0usize;
+        for &(metric, kind, seed) in GOLDEN_FIXTURES {
+            for (name, len, got) in golden_fixture(metric, kind, seed) {
+                // Raw file bytes: removed ids in HashSet order -> not pinned.
+                if name.ends_with("/file") {
+                    continue;
+                }
+                let (want_len, want_hash) = GOLDEN
+                    .iter()
+                    .find(|(g, _, _)| *g == name.as_str())
+                    .map(|(_, l, h)| (l, h))
+                    .unwrap_or_else(|| panic!("fixture {name} not pinned"));
+                assert_eq!(len, *want_len, "{name}: length");
+                assert_eq!(
+                    got, *want_hash,
+                    "{name}: hash differs from the pre-hot-path golden"
+                );
+                n += 1;
+            }
+        }
+        assert_eq!(n, GOLDEN.len(), "every golden entry must be covered");
     }
 }
