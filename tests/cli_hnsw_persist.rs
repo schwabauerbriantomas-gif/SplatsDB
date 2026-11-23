@@ -3,9 +3,18 @@
 //! `build_index_with_save` returned `()` and only warned when
 //! `hnsw_index.bin` could not be written, so `append` (the CLI writer that
 //! maintains a persisted HNSW index) reported `appended` / exit 0 with a
-//! stale index on disk. Fault injection on the real binary: the index FILE
-//! is made read-only (the directory stays writable), and separately the
-//! shard DIRECTORY is made read-only.
+//! stale index on disk. Fault injection on the real binary: the shard
+//! DIRECTORY is made read-only — no temp file can be created in it, so no
+//! writer can persist the index — for `append`, `hnsw-search` and `index`.
+//!
+//! I1 (integration of fix/hnsw-gpu): until f6fde19 the index was written in
+//! place and a read-only index FILE in a writable directory made
+//! `File::create` fail. The index is now persisted atomically — unique temp
+//! file, fsync, rename over the target, directory fsync (A01-F09, A05-F09) —
+//! and rename replaces a read-only file in a writable directory: that state
+//! is no longer a failed persist (the new index IS on disk). The injection
+//! moved to the directory, which fails for an in-place writer and for a
+//! tmp+rename writer alike.
 
 #[path = "cli_durability_common/mod.rs"]
 mod common;
@@ -75,7 +84,7 @@ fn seeded(tag: &str) -> (std::path::PathBuf, String, String) {
     (data, vectors4, extra2)
 }
 
-/// FILE not writable: `append` must exit non-zero without `appended` and
+/// DIRECTORY not writable: `append` must exit non-zero without `appended` and
 /// leave both the shard and the previous index untouched.
 #[test]
 fn append_does_not_report_success_when_the_hnsw_index_cannot_be_persisted() {
@@ -87,9 +96,11 @@ fn append_does_not_report_success_when_the_hnsw_index_cannot_be_persisted() {
         std::fs::read(&index).unwrap(),
     );
 
-    let original = readonly(&index, true);
+    // The directory, not the file: see the module doc (I1).
+    let dir = index.parent().unwrap();
+    let original = readonly(dir, true);
     let result = cli(&data, DIM, &["append", "--input", &extra2]);
-    restore(&index, original); // first: the cleanup has to work anyway
+    restore(dir, original); // first: the cleanup has to work anyway
 
     let (status, out, err) = result;
     assert_ne!(
@@ -195,9 +206,13 @@ fn hnsw_search_answers_when_the_stale_index_cannot_be_replaced_and_says_so() {
     assert!(status.success(), "index failed: stdout={out}\nstderr={err}");
     let index_before = std::fs::read(&index).unwrap();
 
-    let original = readonly(&index, true);
+    // The directory is read-only, not the file (I1, see the module doc):
+    // the stale index can still be read and rebuilt in memory, just not
+    // replaced.
+    let dir = index.parent().unwrap();
+    let original = readonly(dir, true);
     let result = cli(&data, DIM, &["hnsw-search", "--query", &query, "--k", "6"]);
-    restore(&index, original);
+    restore(dir, original);
 
     let (status, out, err) = result;
     assert!(
@@ -212,7 +227,7 @@ fn hnsw_search_answers_when_the_stale_index_cannot_be_replaced_and_says_so() {
     assert_eq!(
         std::fs::read(&index).unwrap(),
         index_before,
-        "the read-only index file is untouched"
+        "the previous HNSW index is untouched by the failed persist"
     );
 
     let (status, out, err) = cli(&data, DIM, &["hnsw-search", "--query", &query, "--k", "6"]);
