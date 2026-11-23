@@ -134,17 +134,42 @@ impl PolarQuantizer {
         Ok(output)
     }
 
+    /// `<reconstruction(code), query>`: the exact inner product of the polar
+    /// reconstruction (no QJL stage; this is what PolarQuant ranks by in every
+    /// [`ScoreMode`](super::qjl::ScoreMode)).
     pub fn inner_product_estimate(&self, code: &PolarCode, query: &[f32]) -> Result<f32> {
+        let rotated_query = self.rotated_query(query)?;
+        self.inner_product_estimate_rotated(code, &rotated_query)
+    }
+
+    /// Rotate a query once (`R·query`) so that many codes can be scored against it
+    /// without repeating the O(d²) rotation per code (A02-F02).
+    pub fn rotated_query(&self, query: &[f32]) -> Result<Vec<f32>> {
         if query.len() != self.dim {
             return Err(QuantError::DimensionMismatch {
                 expected: self.dim,
                 got: query.len(),
             });
         }
-        self.validate_code(code)?;
-        let mut rotated_query = vec![0.0f32; self.dim];
-        self.rotation.apply(query, &mut rotated_query)?;
+        let mut rotated = vec![0.0f32; self.dim];
+        self.rotation.apply(query, &mut rotated)?;
+        Ok(rotated)
+    }
 
+    /// [`Self::inner_product_estimate`] against a query already rotated by
+    /// [`Self::rotated_query`]: O(d) per code. Bit-identical to the one-shot path.
+    pub fn inner_product_estimate_rotated(
+        &self,
+        code: &PolarCode,
+        rotated_query: &[f32],
+    ) -> Result<f32> {
+        if rotated_query.len() != self.dim {
+            return Err(QuantError::DimensionMismatch {
+                expected: self.dim,
+                got: rotated_query.len(),
+            });
+        }
+        self.validate_code(code)?;
         let pairs = self.dim / 2;
         let mut estimate = 0.0f32;
         for i in 0..pairs {
@@ -155,6 +180,12 @@ impl PolarQuantizer {
             estimate += r * (q_a * theta.cos() + q_b * theta.sin());
         }
         Ok(estimate)
+    }
+
+    /// Heap bytes of the cached d×d rotation matrix: `dim * dim * 4`, held once per
+    /// quantizer and shared by every code and query.
+    pub fn rotation_memory_bytes(&self) -> usize {
+        self.rotation.memory_bytes()
     }
 
     fn validate_code(&self, code: &PolarCode) -> Result<()> {

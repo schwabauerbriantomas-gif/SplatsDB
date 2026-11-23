@@ -24,6 +24,7 @@ use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, StandardNormal};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::f32::consts::PI;
+use std::sync::Arc;
 
 use super::error::{QuantError, Result};
 
@@ -115,11 +116,37 @@ impl QjlSketch {
 }
 
 /// Projects vectors to QJL sketches and estimates inner products.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The `projections x dim` Gaussian matrix is a pure function of `(dim, projections,
+/// seed)`. It is generated exactly once, in [`Self::new`], and shared (never copied per
+/// sketch or per row) by every `sketch`, estimate and search of this quantizer
+/// (A02-F02); [`Self::projection_bytes`] is what it costs.
+#[derive(Debug, Clone, Serialize)]
 pub struct QjlQuantizer {
     dim: usize,
     projections: usize,
     seed: u64,
+    /// Row-major `projections x dim` matrix. Not serialized: it is rebuilt from
+    /// `(dim, projections, seed)` on deserialization, so the wire format is unchanged.
+    #[serde(skip)]
+    projection: Arc<[f32]>,
+}
+
+impl<'de> Deserialize<'de> for QjlQuantizer {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Same wire fields as before the cache existed; `new` regenerates the matrix.
+        #[derive(Deserialize)]
+        struct Repr {
+            dim: usize,
+            projections: usize,
+            seed: u64,
+        }
+        let repr = Repr::deserialize(deserializer)?;
+        Self::new(repr.dim, repr.projections, repr.seed).map_err(serde::de::Error::custom)
+    }
 }
 
 impl QjlQuantizer {
@@ -130,11 +157,35 @@ impl QjlQuantizer {
         if projections == 0 {
             return Err(QuantError::ZeroProjectionCount);
         }
+        // Generated once per quantizer configuration (A02-F02): before, every sketch()
+        // and every estimate sampled m*d normals again.
+        let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(0xDEAD_BEEF_1234_5678));
+        let mut matrix = Vec::with_capacity(projections * dim);
+        for _ in 0..projections {
+            for _ in 0..dim {
+                matrix.push(StandardNormal.sample(&mut rng));
+            }
+        }
         Ok(Self {
             dim,
             projections,
             seed,
+            projection: matrix.into(),
         })
+    }
+
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    pub fn projections(&self) -> usize {
+        self.projections
+    }
+
+    /// Heap bytes of the cached projection matrix: `projections * dim * 4`, held once
+    /// per quantizer regardless of how many sketches or queries use it.
+    pub fn projection_bytes(&self) -> usize {
+        self.projection.len() * std::mem::size_of::<f32>()
     }
 
     pub fn sketch(&self, vector: &[f32]) -> Result<QjlSketch> {
@@ -148,9 +199,9 @@ impl QjlQuantizer {
         if let Some(index) = vector.iter().position(|v| !v.is_finite()) {
             return Err(QuantError::NonFiniteValue { index });
         }
-        let g = self.projection_matrix();
-        let signs: Vec<i8> = g
-            .iter()
+        let signs: Vec<i8> = self
+            .projection
+            .chunks_exact(self.dim)
             .map(|row| {
                 let dot: f32 = row.iter().zip(vector.iter()).map(|(g, x)| g * x).sum();
                 if dot >= 0.0 {
@@ -179,17 +230,43 @@ impl QjlQuantizer {
         })
     }
 
+    /// Unbiased estimate of `<x, query>`:
+    /// `sqrt(pi/2) * ||x|| / m * sum_i sign(g_i.x) * (g_i.query)`.
     pub fn inner_product_estimate(&self, sketch: &QjlSketch, query: &[f32]) -> Result<f32> {
-        if sketch.dim != self.dim {
-            return Err(QuantError::DimensionMismatch {
-                expected: self.dim,
-                got: sketch.dim,
-            });
-        }
+        let projected = self.projected_query(query)?;
+        self.inner_product_estimate_projected(sketch, &projected)
+    }
+
+    /// `g_i . query` for every projection row `i` (`projections` values): the only part
+    /// of an estimate that depends on the query. Compute it once per query and score any
+    /// number of sketches against it with [`Self::inner_product_estimate_projected`] —
+    /// the per-sketch cost drops from `m*d` to `m` (A02-F02). Bit-identical to the dot
+    /// product the per-sketch path used to recompute.
+    pub fn projected_query(&self, query: &[f32]) -> Result<Vec<f32>> {
         if query.len() != self.dim {
             return Err(QuantError::DimensionMismatch {
                 expected: self.dim,
                 got: query.len(),
+            });
+        }
+        Ok(self
+            .projection
+            .chunks_exact(self.dim)
+            .map(|row| row.iter().zip(query.iter()).map(|(g, q)| g * q).sum())
+            .collect())
+    }
+
+    /// [`Self::inner_product_estimate`] against a query already projected by
+    /// [`Self::projected_query`].
+    pub fn inner_product_estimate_projected(
+        &self,
+        sketch: &QjlSketch,
+        projected_query: &[f32],
+    ) -> Result<f32> {
+        if sketch.dim != self.dim {
+            return Err(QuantError::DimensionMismatch {
+                expected: self.dim,
+                got: sketch.dim,
             });
         }
         if sketch.signs.len() != self.projections {
@@ -199,30 +276,24 @@ impl QjlQuantizer {
                 self.projections
             )));
         }
-        let g = self.projection_matrix();
+        if projected_query.len() != self.projections {
+            return Err(QuantError::MalformedCode(format!(
+                "projected query has {} entries, this quantizer has {} projections",
+                projected_query.len(),
+                self.projections
+            )));
+        }
         let m = self.projections as f32;
         // E[sign(g.x)(g.q)] = sqrt(2/pi) * <x,q>/||x||  =>  scale = sqrt(pi/2) * ||x|| / m
         let scale = (PI / 2.0).sqrt() * sketch.norm / m;
-        let estimate: f32 = g
+        // Same accumulation order as the per-sketch estimator (bit-identical values).
+        let estimate: f32 = sketch
+            .signs
             .iter()
-            .zip(sketch.signs.iter())
-            .map(|(row, &sign)| {
-                let g_dot_query: f32 = row.iter().zip(query.iter()).map(|(g, q)| g * q).sum();
-                sign as f32 * g_dot_query
-            })
+            .zip(projected_query.iter())
+            .map(|(&sign, &g_dot_query)| sign as f32 * g_dot_query)
             .sum();
         Ok(scale * estimate)
-    }
-
-    fn projection_matrix(&self) -> Vec<Vec<f32>> {
-        let mut rng = ChaCha8Rng::seed_from_u64(self.seed.wrapping_add(0xDEAD_BEEF_1234_5678));
-        (0..self.projections)
-            .map(|_| {
-                (0..self.dim)
-                    .map(|_| StandardNormal.sample(&mut rng))
-                    .collect()
-            })
-            .collect()
     }
 }
 
@@ -267,5 +338,85 @@ mod tests {
         let other = QjlQuantizer::new(8, 8, 0).unwrap();
         let sketch = other.sketch(&vec![1.0f32; 8]).unwrap();
         assert!(q.inner_product_estimate(&sketch, &[1.0f32; 8]).is_err());
+    }
+
+    #[test]
+    fn cached_matrix_matches_the_regenerated_one_bit_for_bit() {
+        // The matrix is the same function of the seed as the per-call generator of
+        // <= F04a: same RNG stream, row-major, one f32 per sample.
+        let dim = 24;
+        let m = 48;
+        let seed = 77;
+        let q = QjlQuantizer::new(dim, m, seed).unwrap();
+        let mut rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(0xDEAD_BEEF_1234_5678));
+        let expected: Vec<f32> = (0..m * dim)
+            .map(|_| StandardNormal.sample(&mut rng))
+            .collect();
+        assert_eq!(q.projection.len(), m * dim);
+        for (a, b) in q.projection.iter().zip(expected.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+        assert_eq!(q.projection_bytes(), m * dim * 4);
+    }
+
+    #[test]
+    fn projected_query_reuse_is_bit_identical() {
+        let dim = 32;
+        let q = QjlQuantizer::new(dim, 64, 9).unwrap();
+        let mut rng = ChaCha8Rng::seed_from_u64(1234);
+        let query: Vec<f32> = (0..dim).map(|_| StandardNormal.sample(&mut rng)).collect();
+        let projected = q.projected_query(&query).unwrap();
+        // Reference: the per-sketch loop of <= F04a, on the cached matrix.
+        let m = q.projections as f32;
+        for i in 0..1000 {
+            let mut rng = ChaCha8Rng::seed_from_u64(10_000 + i);
+            let x: Vec<f32> = (0..dim).map(|_| StandardNormal.sample(&mut rng)).collect();
+            let sketch = q.sketch(&x).unwrap();
+            let estimate: f32 = q
+                .projection
+                .chunks_exact(dim)
+                .zip(sketch.signs.iter())
+                .map(|(row, &sign)| {
+                    let g_dot_query: f32 = row.iter().zip(query.iter()).map(|(g, q)| g * q).sum();
+                    sign as f32 * g_dot_query
+                })
+                .sum();
+            let reference = (PI / 2.0).sqrt() * sketch.norm / m * estimate;
+            assert_eq!(
+                q.inner_product_estimate(&sketch, &query).unwrap().to_bits(),
+                reference.to_bits(),
+                "pair {i}"
+            );
+            assert_eq!(
+                q.inner_product_estimate_projected(&sketch, &projected)
+                    .unwrap()
+                    .to_bits(),
+                reference.to_bits(),
+                "pair {i}"
+            );
+        }
+        assert!(q
+            .inner_product_estimate_projected(&q.sketch(&query).unwrap(), &projected[..63])
+            .is_err());
+    }
+
+    #[test]
+    fn projection_cache_is_built_once_and_not_serialized() {
+        let dim = 16;
+        let q = QjlQuantizer::new(dim, 32, 5).unwrap();
+        assert_eq!(q.projection_bytes(), 32 * dim * 4);
+        let x = random_vector(dim, 3);
+        let y = random_vector(dim, 4);
+        let sketch = q.sketch(&x).unwrap();
+        let wire = serde_json::to_string(&q).unwrap();
+        assert!(!wire.contains("\"projection\":"), "{wire}");
+        let back: QjlQuantizer = serde_json::from_str(&wire).unwrap();
+        // The deserialized quantizer rebuilt the same matrix: same signs, same estimate.
+        assert_eq!(back.sketch(&x).unwrap(), sketch);
+        assert_eq!(
+            back.inner_product_estimate(&sketch, &y).unwrap().to_bits(),
+            q.inner_product_estimate(&sketch, &y).unwrap().to_bits()
+        );
+        assert_eq!(back.projection_bytes(), q.projection_bytes());
     }
 }

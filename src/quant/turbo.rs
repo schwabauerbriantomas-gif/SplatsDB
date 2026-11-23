@@ -42,10 +42,29 @@ impl TurboCode {
     }
 }
 
+/// Everything in an estimate that depends only on the query (A02-F02): the rotated
+/// query `R·q` for the polar stage and `g_i·q` for the QJL stage. Built once per
+/// search by [`TurboQuantizer::prepare_query`] and shared by every code, so the O(d²)
+/// rotation and the O(m·d) projection are paid once per query instead of once per code.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurboQueryContext {
+    rotated_query: Vec<f32>,
+    projected_query: Vec<f32>,
+}
+
+impl TurboQueryContext {
+    /// Heap bytes of the context: `(dim + projections) * 4`. Transient — it lives for
+    /// one search and is not part of the store's memory.
+    pub fn memory_bytes(&self) -> usize {
+        (self.rotated_query.len() + self.projected_query.len()) * std::mem::size_of::<f32>()
+    }
+}
+
 /// TurboQuant compressor: encodes vectors and estimates inner products.
 ///
 /// Configuration `(dim, bits, projections, seed)` fully determines state.
-/// Only these four values need to be persisted.
+/// Only these four values need to be persisted; the rotation and projection
+/// matrices are rebuilt from them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurboQuantizer {
     dim: usize,
@@ -97,6 +116,18 @@ impl TurboQuantizer {
         self.projections
     }
 
+    /// Heap bytes of the cached QJL projection matrix: `projections * dim * 4`, held
+    /// once per quantizer (shared by every code and query).
+    pub fn projection_cache_bytes(&self) -> usize {
+        self.qjl.projection_bytes()
+    }
+
+    /// Heap bytes of the cached d×d rotation matrix: `dim * dim * 4`, held once per
+    /// quantizer.
+    pub fn rotation_matrix_bytes(&self) -> usize {
+        self.polar.rotation_memory_bytes()
+    }
+
     /// Encode a vector into a TurboCode.
     pub fn encode(&self, vector: &[f32]) -> Result<TurboCode> {
         if vector.len() != self.dim {
@@ -130,16 +161,39 @@ impl TurboQuantizer {
     /// Unbiased in expectation over the projection matrix (see module docs); not a
     /// per-code guarantee.
     pub fn inner_product_estimate(&self, code: &TurboCode, query: &[f32]) -> Result<f32> {
+        let context = self.prepare_query(query)?;
+        self.inner_product_estimate_projected(code, &context)
+    }
+
+    /// Build the per-query context once and score every code with
+    /// [`Self::inner_product_estimate_projected`]: O(d² + m·d) once per query,
+    /// O(d + m) per code.
+    pub fn prepare_query(&self, query: &[f32]) -> Result<TurboQueryContext> {
         if query.len() != self.dim {
             return Err(QuantError::DimensionMismatch {
                 expected: self.dim,
                 got: query.len(),
             });
         }
-        let polar_est = self.polar.inner_product_estimate(&code.polar_code, query)?;
+        Ok(TurboQueryContext {
+            rotated_query: self.polar.rotated_query(query)?,
+            projected_query: self.qjl.projected_query(query)?,
+        })
+    }
+
+    /// [`Self::inner_product_estimate`] against a query already prepared by
+    /// [`Self::prepare_query`]. Bit-identical to the per-code path.
+    pub fn inner_product_estimate_projected(
+        &self,
+        code: &TurboCode,
+        context: &TurboQueryContext,
+    ) -> Result<f32> {
+        let polar_est = self
+            .polar
+            .inner_product_estimate_rotated(&code.polar_code, &context.rotated_query)?;
         let qjl_correction = self
             .qjl
-            .inner_product_estimate(&code.residual_sketch, query)?;
+            .inner_product_estimate_projected(&code.residual_sketch, &context.projected_query)?;
         Ok(polar_est + qjl_correction)
     }
 
@@ -226,5 +280,45 @@ mod tests {
         assert!(TurboQuantizer::new(7, 8, 16, 0).is_err());
         assert!(TurboQuantizer::new(8, 1, 16, 0).is_err());
         assert!(TurboQuantizer::new(8, 8, 0, 0).is_err());
+    }
+
+    #[test]
+    fn prepared_query_estimates_are_bit_identical() {
+        let dim = 32;
+        let q = TurboQuantizer::new(dim, 4, 64, 11).unwrap();
+        let query = random_vector(dim, 77);
+        let context = q.prepare_query(&query).unwrap();
+        assert_eq!(context.memory_bytes(), (dim + 64) * 4);
+        for i in 0..1000 {
+            let x = random_vector(dim, 5000 + i);
+            let code = q.encode(&x).unwrap();
+            assert_eq!(
+                q.inner_product_estimate(&code, &query).unwrap().to_bits(),
+                q.inner_product_estimate_projected(&code, &context)
+                    .unwrap()
+                    .to_bits(),
+                "code {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_sizes_and_serde_roundtrip() {
+        let dim = 16;
+        let q = TurboQuantizer::new(dim, 4, 32, 3).unwrap();
+        assert_eq!(q.projection_cache_bytes(), 32 * dim * 4);
+        assert_eq!(q.rotation_matrix_bytes(), dim * dim * 4);
+        let x = random_vector(dim, 8);
+        let query = random_vector(dim, 9);
+        let code = q.encode(&x).unwrap();
+        let back: TurboQuantizer =
+            serde_json::from_str(&serde_json::to_string(&q).unwrap()).unwrap();
+        assert_eq!(back.encode(&x).unwrap(), code);
+        assert_eq!(
+            back.inner_product_estimate(&code, &query)
+                .unwrap()
+                .to_bits(),
+            q.inner_product_estimate(&code, &query).unwrap().to_bits()
+        );
     }
 }

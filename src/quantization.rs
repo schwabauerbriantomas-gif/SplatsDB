@@ -8,6 +8,13 @@
 //! only, never the byte count: at 640-D a 4-bit TurboQuant code is 2004 B, i.e. 1.28x
 //! smaller than f32 — not the 8x of the nominal `dim*bits/8` formula.
 //! `encoded_bytes()`, `memory_usage()` and `compression_ratio()` report that real layout.
+//!
+//! # Query reuse (A02-F02)
+//!
+//! The quantizer caches its deterministic matrices once per store (the d×d rotation and
+//! the m×d QJL projection); a search rotates and projects the query once and scores
+//! every code against that context. Scores are bit-identical to the per-code path, and
+//! `memory_usage()` counts each cache exactly once.
 
 use crate::quant::{PolarCode, PolarQuantizer, QjlSketch, TurboCode, TurboQuantizer};
 use ndarray::{Array2, ArrayView1};
@@ -207,6 +214,10 @@ impl QuantizedStore {
 
     /// Search for k nearest neighbors using parallel inner product estimation.
     /// Returns (id, estimated_inner_product) pairs sorted by similarity (descending).
+    ///
+    /// The query-dependent work — the rotation `R·q` and the projections `g_i·q` — is
+    /// done once per call and shared by every code (A02-F02); a code that fails
+    /// validation is skipped, as before.
     pub fn search(&self, query: &ArrayView1<f32>, k: usize) -> Vec<(u64, f32)> {
         let q: Vec<f32> = query.to_vec();
         let n = self.ids.len();
@@ -216,17 +227,35 @@ impl QuantizedStore {
         }
 
         let mut scores: Vec<(usize, f32)> = if let Some(ref turbo) = self.turbo {
-            self.codes_turbo
-                .par_iter()
-                .enumerate()
-                .filter_map(|(i, code)| turbo.inner_product_estimate(code, &q).ok().map(|s| (i, s)))
-                .collect()
+            match turbo.prepare_query(&q) {
+                Ok(context) => self
+                    .codes_turbo
+                    .par_iter()
+                    .enumerate()
+                    .filter_map(|(i, code)| {
+                        turbo
+                            .inner_product_estimate_projected(code, &context)
+                            .ok()
+                            .map(|s| (i, s))
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
         } else if let Some(ref polar) = self.polar {
-            self.codes_polar
-                .par_iter()
-                .enumerate()
-                .filter_map(|(i, code)| polar.inner_product_estimate(code, &q).ok().map(|s| (i, s)))
-                .collect()
+            match polar.rotated_query(&q) {
+                Ok(rotated_query) => self
+                    .codes_polar
+                    .par_iter()
+                    .enumerate()
+                    .filter_map(|(i, code)| {
+                        polar
+                            .inner_product_estimate_rotated(code, &rotated_query)
+                            .ok()
+                            .map(|s| (i, s))
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
         } else {
             Vec::new()
         };
@@ -282,17 +311,44 @@ impl QuantizedStore {
     }
 
     /// `false`: codes are stored unpacked (f32 / u16 / i8 fields). `bits` changes only the
-    /// quantization error, never the byte count. Bit-packing is deferred (F04b).
+    /// quantization error, never the byte count. Bit-packing is deferred (F04c).
     pub fn is_bit_packed(&self) -> bool {
         false
+    }
+
+    /// Heap bytes of the cached QJL projection matrix (`projections * dim * 4`,
+    /// TurboQuant only; 0 for PolarQuant). It is generated once per store and shared by
+    /// every code, sketch and query — never a copy per sketch or per row (A02-F02).
+    pub fn projection_cache_bytes(&self) -> usize {
+        self.turbo
+            .as_ref()
+            .map_or(0, |turbo| turbo.projection_cache_bytes())
+    }
+
+    /// Heap bytes of the cached d×d rotation matrix (`dim * dim * 4`), held once per
+    /// store (directly for PolarQuant, inside the TurboQuantizer for TurboQuant).
+    pub fn rotation_matrix_bytes(&self) -> usize {
+        self.turbo.as_ref().map_or_else(
+            || self.polar.as_ref().map_or(0, |p| p.rotation_memory_bytes()),
+            |t| t.rotation_matrix_bytes(),
+        )
+    }
+
+    /// Memory held by the quantizer configuration, independent of the number of codes:
+    /// [`Self::projection_cache_bytes`] + [`Self::rotation_matrix_bytes`], each counted
+    /// exactly once.
+    pub fn quantizer_memory_usage(&self) -> usize {
+        self.projection_cache_bytes() + self.rotation_matrix_bytes()
     }
 
     /// Memory held by the store in bytes: the heap payload of the codes
     /// (`heap_bytes()`: radius, angle and sign vectors) plus `size_of::<code>()` per
     /// code (struct incl. the `Vec` headers and, for TurboQuant, the inline `f32`
-    /// norm, which is therefore not counted a second time) and 8 B per id. Excludes
-    /// allocator slack (`Vec` capacity beyond `len`) and the fixed quantizer
-    /// configuration.
+    /// norm, which is therefore not counted a second time), 8 B per id, and the
+    /// quantizer caches ([`Self::quantizer_memory_usage`]: rotation matrix and QJL
+    /// projection matrix, once each). Excludes allocator slack (`Vec` capacity beyond
+    /// `len`) and the transient per-query context (`(dim + projections) * 4` B for the
+    /// duration of one search).
     pub fn memory_usage(&self) -> usize {
         // Heap payload of the codes + the inline part of each code (the struct with
         // its Vec headers and, for TurboQuant, the f32 norm) + 8 B per id. The norm
@@ -315,7 +371,7 @@ impl QuantizedStore {
                     .sum::<usize>(),
             )
         };
-        heap + self.len() * (inline + std::mem::size_of::<u64>())
+        heap + self.len() * (inline + std::mem::size_of::<u64>()) + self.quantizer_memory_usage()
     }
 
     /// Raw f32 bytes divided by real encoded bytes. For an empty store the per-code ratio
@@ -484,6 +540,7 @@ mod tests {
             mem,
             store.encoded_bytes() - n * std::mem::size_of::<f32>()
                 + n * (std::mem::size_of::<TurboCode>() + std::mem::size_of::<u64>())
+                + store.quantizer_memory_usage()
         );
         assert!(
             mem > raw,
@@ -509,7 +566,9 @@ mod tests {
                         + code.polar_code.angle_indices.capacity() * std::mem::size_of::<u16>()
                         + code.residual_sketch.signs.capacity() * std::mem::size_of::<i8>()
                 })
-                .sum::<usize>();
+                .sum::<usize>()
+            // The two quantizer matrices are heap allocations too.
+            + store.quantizer_memory_usage();
         let payload: usize = store
             .codes_turbo
             .iter()
@@ -521,8 +580,45 @@ mod tests {
         // struct, not again as payload).
         assert_eq!(
             store.memory_usage() + n * std::mem::size_of::<f32>(),
-            payload + n * (std::mem::size_of::<TurboCode>() + std::mem::size_of::<u64>())
+            payload
+                + n * (std::mem::size_of::<TurboCode>() + std::mem::size_of::<u64>())
+                + store.quantizer_memory_usage()
         );
         assert!(store.memory_usage() <= reserved);
+    }
+
+    #[test]
+    fn quantizer_memory_is_counted_once_not_per_code() {
+        let dim = 64;
+        let config = QuantConfig::for_search(dim);
+        let empty = QuantizedStore::new(dim, config.clone()).unwrap();
+        assert_eq!(empty.memory_usage(), empty.quantizer_memory_usage());
+        // Rotation matrix + QJL projection matrix, one independent count.
+        assert_eq!(
+            empty.quantizer_memory_usage(),
+            dim * dim * 4 + (dim / 8) * dim * 4
+        );
+        assert_eq!(empty.projection_cache_bytes(), (dim / 8) * dim * 4);
+        let mut full = QuantizedStore::new(dim, config).unwrap();
+        full.add_batch(&random_vectors(100, dim, 1), 0).unwrap();
+        let per_code = std::mem::size_of::<TurboCode>() + std::mem::size_of::<u64>()
+            - std::mem::size_of::<f32>();
+        assert_eq!(
+            full.memory_usage(),
+            full.encoded_bytes() + 100 * per_code + empty.quantizer_memory_usage()
+        );
+        // PolarQuant has no QJL stage: only the rotation matrix.
+        let polar = QuantizedStore::new(
+            dim,
+            QuantConfig {
+                bits: 4,
+                projections: 0,
+                seed: 42,
+                algorithm: QuantAlgorithm::PolarQuant,
+            },
+        )
+        .unwrap();
+        assert_eq!(polar.projection_cache_bytes(), 0);
+        assert_eq!(polar.quantizer_memory_usage(), dim * dim * 4);
     }
 }

@@ -7,8 +7,16 @@
 //! A02-F03: the estimator contract (property tests + evidence probes) lives in
 //! `quant_contracts/properties.rs`.
 //!
+//! A02-F02: the projection cache and the per-query context (bit-identity, memory counted
+//! once, A/B bench) live in `quant_contracts/ab_bench.rs`; `quant_contracts/d18_probe.rs`
+//! is the cross-commit evidence probe (default order: recall vs exact-L2 GT + hash).
+//!
 //! Run: `cargo test --no-default-features --test quant_contracts`
 
+#[path = "quant_contracts/ab_bench.rs"]
+mod ab_bench;
+#[path = "quant_contracts/d18_probe.rs"]
+mod d18_probe;
 #[path = "quant_contracts/properties.rs"]
 mod properties;
 
@@ -297,9 +305,17 @@ fn memory_metrics_report_the_real_unpacked_layout_for_bits_2_4_8() {
             // The f32 norm is inline in TurboCode (already inside `inline`), so it is
             // subtracted from the logical payload: memory_usage() = heap + struct + id.
             let inline_norm = if turbo { std::mem::size_of::<f32>() } else { 0 };
+            // Quantizer matrices held once per store: the d×d rotation and, for
+            // TurboQuant, the m×d QJL projection cache (A02-F02) — never per code.
+            let quantizer = DIM * DIM * 4 + if turbo { DIM / 8 * DIM * 4 } else { 0 };
+            assert_eq!(store.quantizer_memory_usage(), quantizer);
+            assert_eq!(
+                store.projection_cache_bytes(),
+                if turbo { DIM / 8 * DIM * 4 } else { 0 }
+            );
             assert_eq!(
                 store.memory_usage(),
-                real - n * inline_norm + n * (inline + std::mem::size_of::<u64>())
+                real - n * inline_norm + n * (inline + std::mem::size_of::<u64>()) + quantizer
             );
             report.push(format!(
                 "bits={bits} {algorithm:?}: raw={raw} B, encoded={real} B ({per_code} B/code), ratio={ratio:.4} (nominal {nominal}), memory_usage={} B",
@@ -323,8 +339,12 @@ fn memory_usage_on_a_10k_code_store_matches_the_declared_overhead() {
     assert_eq!(store.encoded_bytes(), N * per_code);
     // The f32 norm lives inline in TurboCode (counted through size_of::<TurboCode>()),
     // so memory_usage() = encoded_bytes() - 4 B/code + struct + 8 B/id: no double count.
+    // Plus the quantizer matrices counted once: rotation d×d + QJL projection m×d.
+    let quantizer = DIM * DIM * 4 + DIM / 8 * DIM * 4;
+    assert_eq!(store.quantizer_memory_usage(), quantizer);
     let declared = store.encoded_bytes() - N * std::mem::size_of::<f32>()
-        + N * (std::mem::size_of::<TurboCode>() + std::mem::size_of::<u64>());
+        + N * (std::mem::size_of::<TurboCode>() + std::mem::size_of::<u64>())
+        + quantizer;
     assert_eq!(store.memory_usage(), declared);
     let raw = N * DIM * 4;
     println!(
