@@ -878,6 +878,13 @@ impl SplatStore {
     /// - Dataset has fewer than 100 active vectors (not worth the overhead)
     /// - HRM2 engine is not indexed
     /// - HRM2 query returns an error
+    ///
+    /// Distance contract (identical on every branch): `distance` is the exact
+    /// raw L2 `||q - mu||` recomputed against the store's `mu` for each
+    /// returned candidate, and `score` derives from it. The engine ranks in
+    /// its own metric space (cosine: L2-normalized rows), so its distances
+    /// are candidate hints only. The candidate SET stays approximate (probed
+    /// clusters); results are ordered by the exported distance.
     pub fn find_neighbors_fast(
         &mut self,
         query: &ArrayView1<f32>,
@@ -898,15 +905,39 @@ impl SplatStore {
         match self.engine.query(query, k, 2) {
             Ok(candidates) if !candidates.is_empty() => {
                 let index_data = self.mu.slice(ndarray::s![..n, ..]);
-                candidates
+                // The engine ranks in its own space (metric "cosine": L2-
+                // normalized rows, distances in [0, 2]) and only searches the
+                // probed clusters. Its distances are candidate hints: the
+                // exported `distance` is the exact raw L2 ||q - mu_i|| against
+                // the store's `mu` — the same value the linear path reports
+                // for the same index — and `score` derives from it.
+                let mut ranked: Vec<(usize, f32)> = candidates
                     .into_iter()
-                    .map(|(idx, dist)| NeighborResult {
+                    .map(|(idx, _hint)| {
+                        let dist_sq = index_data
+                            .row(idx)
+                            .iter()
+                            .zip(query.iter())
+                            .map(|(a, b)| {
+                                let d = a - b;
+                                d * d
+                            })
+                            .sum::<f32>();
+                        (idx, dist_sq)
+                    })
+                    .collect();
+                // Stable sort: ties keep the engine's order, so the generator
+                // order survives whenever it agrees with the raw distance.
+                ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                ranked
+                    .into_iter()
+                    .map(|(idx, dist_sq)| NeighborResult {
                         mu: index_data.row(idx).to_vec(),
                         alpha: self.alpha[idx],
                         kappa: self.kappa[idx],
                         index: idx,
-                        distance: dist,
-                        score: Self::gaussian_score(self.alpha[idx], self.kappa[idx], dist * dist),
+                        distance: dist_sq.sqrt(),
+                        score: Self::gaussian_score(self.alpha[idx], self.kappa[idx], dist_sq),
                     })
                     .collect()
             }
