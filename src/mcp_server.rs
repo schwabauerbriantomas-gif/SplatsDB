@@ -463,27 +463,18 @@ impl McpState {
             .unwrap_or_default()
     }
 
-    /// (text, metadata) of a doc for a result, from a row that was already
-    /// read: the cache text first, else the row's `document` column — a live
-    /// doc evicted from the capped cache must never come back as
-    /// `"text": ""` (A03-F14).
-    fn result_from_record(&self, id: &str, record: &DocumentRecord) -> (String, Value) {
-        let cached = self.doc_texts.get(id).filter(|t| !t.is_empty()).cloned();
-        let text = cached
-            .or(record.document.clone())
-            .filter(|t| !t.is_empty())
-            .unwrap_or_default();
-        (text, record.metadata.clone().unwrap_or(json!(null)))
-    }
-
-    /// (text, metadata) of a doc for a result, from ONE SQLite read (cached
-    /// statement) — no extra roundtrip for the text fallback. Search results
-    /// come in batches and read their rows through
-    /// `SqliteMetadataStore::get_many` instead.
+    /// (text, metadata) of a doc for a search result, from ONE SQLite read
+    /// (cached statement) — no extra roundtrip for the text fallback.
     fn result_text_and_metadata(&self, id: &str) -> (String, Value) {
         let cached = self.doc_texts.get(id).filter(|t| !t.is_empty()).cloned();
         match self.doc_store.get(id) {
-            Ok(Some(record)) => self.result_from_record(id, &record),
+            Ok(Some(record)) => {
+                let text = cached
+                    .or(record.document)
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_default();
+                (text, record.metadata.unwrap_or(json!(null)))
+            }
             _ => (cached.unwrap_or_default(), json!(null)),
         }
     }
@@ -1292,44 +1283,24 @@ fn handle_search(state: &Mutex<McpState>, params: &Value) -> Result<Value, Strin
     let k = s.fetch_k(top_k, s.store.n_active());
     let neighbors = s.store.find_neighbors_fast(&query_vec.view(), k);
 
-    // The `top_k` live hits with the document each one maps to
-    // (`is_live()` guarantees a mapping: anonymous `vec_N` hits can no
-    // longer be produced).
-    let live: Vec<_> = neighbors
+    let results: Vec<Value> = neighbors
         .into_iter()
         .filter(|n| s.is_live(n.index))
-        .filter_map(|n| {
-            s.vector_to_doc
-                .get(&n.index)
-                .cloned()
-                .map(|doc_id| (n, doc_id))
-        })
         .take(top_k)
-        .collect();
+        .map(|n| {
+            // is_live() guarantees a mapping: anonymous `vec_N` hits can no
+            // longer be produced.
+            let doc_id = s.vector_to_doc.get(&n.index).cloned().unwrap_or_default();
+            let (text, metadata) = s.result_text_and_metadata(&doc_id);
 
-    // Their rows in ONE keyed query — a statement per result was the cost
-    // of the hot path (A03-F14). A row that is gone by now is dropped like
-    // a dead vector; a read that fails is reported, never answered with
-    // empty texts.
-    let ids: Vec<String> = live.iter().map(|(_, doc_id)| doc_id.clone()).collect();
-    let rows = s
-        .doc_store
-        .get_many(&ids)
-        .map_err(|e| format!("document store read failed: {e}"))?;
-
-    let results: Vec<Value> = live
-        .into_iter()
-        .filter_map(|(n, doc_id)| {
-            let record = rows.get(&doc_id)?;
-            let (text, metadata) = s.result_from_record(&doc_id, record);
-            Some(json!({
+            json!({
                 "id": doc_id,
                 "index": n.index,
                 "score": n.distance,
                 "text": text,
                 "metadata": metadata,
                 "embedding_source": s.vector_label(&doc_id),
-            }))
+            })
         })
         .collect();
 
