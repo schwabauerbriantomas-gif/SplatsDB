@@ -2,12 +2,17 @@
 //!
 //! Data-oblivious quantization — no training, no codebooks, instant indexing.
 //!
-//! Storage layout (NOT bit-packed): every code stores an f32 radius and a u16 polar
-//! angle index per pair of dimensions (3 B per value); TurboQuant codes add one i8 QJL
-//! sign per projection and one f32 residual norm. `bits` changes the quantization error
-//! only, never the byte count: at 640-D a 4-bit TurboQuant code is 2004 B, i.e. 1.28x
-//! smaller than f32 — not the 8x of the nominal `dim*bits/8` formula.
-//! `encoded_bytes()`, `memory_usage()` and `compression_ratio()` report that real layout.
+//! Storage layout (bit-packed, F04c): every code stores an f32 radius per pair of
+//! dimensions (exact — not quantized, so not packable), the polar angle index in `bits`
+//! bits (`bits - 1` for TurboQuant) and — TurboQuant only — one QJL sign bit per
+//! projection plus an f32 residual norm. At 640-D with 256 projections a 4-bit TurboQuant
+//! code is 1436 B: 1.78x smaller than f32 and 1.52x smaller than the former unpacked
+//! 2180 B — not the 8x of the nominal `dim*bits/8` formula, because the radii are 1280
+//! of those bytes. The packing is a lossless bijection of the unpacked code (`TurboCode`
+//! / `PolarCode`, still the public and the serde representation): ids, order and f32
+//! score bits are identical (tests/quant_contracts/packing.rs).
+//! `encoded_bytes()`, `memory_usage()`, `compression_ratio()` and `is_bit_packed()`
+//! report that real layout.
 //!
 //! # Ranking objective (D18)
 //!
@@ -18,8 +23,10 @@
 //! estimate and is selected on purpose. `search` is the default mode;
 //! `search_scored` takes the mode and rejects a NaN/±Inf query before ranking.
 
+use crate::quant::polar::PackedPolarCode;
 pub use crate::quant::qjl::ScoreMode;
-use crate::quant::{PolarCode, PolarQuantizer, QjlSketch, QuantError, TurboCode, TurboQuantizer};
+use crate::quant::turbo::PackedTurboCode;
+use crate::quant::{PolarQuantizer, QuantError, TurboQuantizer};
 use ndarray::{Array2, ArrayView1};
 use rayon::prelude::*;
 
@@ -34,7 +41,8 @@ pub enum QuantAlgorithm {
 #[derive(Debug, Clone)]
 pub struct QuantConfig {
     /// Polar angle resolution (3-8). TurboQuant spends `bits - 1` on the angle and the
-    /// QJL sketch carries the residual. Does not change the stored size (unpacked layout).
+    /// QJL sketch carries the residual. Sets the stored size of the angle stream: `bits`
+    /// bits per pair (`bits - 1` for TurboQuant); radii and norms stay exact f32.
     pub bits: u8,
     /// Number of random projections. Recommended: dim / 4 for search.
     pub projections: usize,
@@ -105,8 +113,8 @@ pub struct QuantizedStore {
     dim: usize,
     turbo: Option<TurboQuantizer>,
     polar: Option<PolarQuantizer>,
-    codes_turbo: Vec<TurboCode>,
-    codes_polar: Vec<PolarCode>,
+    codes_turbo: Vec<PackedTurboCode>,
+    codes_polar: Vec<PackedPolarCode>,
     ids: Vec<u64>,
 }
 
@@ -178,10 +186,10 @@ impl QuantizedStore {
                 .map(|i| {
                     let v: Vec<f32> = vectors.row(i).to_vec();
                     turbo
-                        .encode(&v)
+                        .encode_packed(&v)
                         .map_err(|e| format!("add_batch: row {i}: {e}"))
                 })
-                .collect::<Result<Vec<TurboCode>, String>>()?;
+                .collect::<Result<Vec<PackedTurboCode>, String>>()?;
             self.codes_turbo.extend(new_codes);
         } else if let Some(ref polar) = self.polar {
             let new_codes = (0..n)
@@ -189,10 +197,10 @@ impl QuantizedStore {
                 .map(|i| {
                     let v: Vec<f32> = vectors.row(i).to_vec();
                     polar
-                        .encode(&v)
+                        .encode_packed(&v)
                         .map_err(|e| format!("add_batch: row {i}: {e}"))
                 })
-                .collect::<Result<Vec<PolarCode>, String>>()?;
+                .collect::<Result<Vec<PackedPolarCode>, String>>()?;
             self.codes_polar.extend(new_codes);
         } else {
             return Err("add_batch: store has no quantizer".to_string());
@@ -206,14 +214,14 @@ impl QuantizedStore {
     pub fn add_single(&mut self, vector: &ArrayView1<f32>, id: u64) -> bool {
         let v: Vec<f32> = vector.to_vec();
         if let Some(ref turbo) = self.turbo {
-            match turbo.encode(&v) {
+            match turbo.encode_packed(&v) {
                 Ok(code) => {
                     self.codes_turbo.push(code);
                 }
                 Err(_) => return false,
             }
         } else if let Some(ref polar) = self.polar {
-            match polar.encode(&v) {
+            match polar.encode_packed(&v) {
                 Ok(code) => {
                     self.codes_polar.push(code);
                 }
@@ -283,7 +291,7 @@ impl QuantizedStore {
                 .enumerate()
                 .filter_map(|(i, code)| {
                     turbo
-                        .score_projected(code, &context, mode)
+                        .score_packed(code, &context, mode)
                         .ok()
                         .map(|s| (i, s))
                 })
@@ -297,7 +305,7 @@ impl QuantizedStore {
                 .enumerate()
                 .filter_map(|(i, code)| {
                     polar
-                        .inner_product_estimate_rotated(code, &rotated_query)
+                        .inner_product_estimate_packed(code, &rotated_query)
                         .ok()
                         .map(|s| (i, s))
                 })
@@ -330,12 +338,12 @@ impl QuantizedStore {
         self.ids.is_empty()
     }
 
-    /// Real payload bytes of the stored codes in the current layout — NOT `dim*bits/8`.
+    /// Real payload bytes of the stored codes in the packed layout — NOT `dim*bits/8`.
     ///
-    /// Unpacked layout: one f32 radius + one u16 angle index per pair of dimensions
-    /// (6 B per pair, for every `bits`); TurboQuant codes add one i8 QJL sign per
-    /// projection and one f32 residual norm. Excludes struct headers and ids, which
-    /// [`Self::memory_usage`] declares separately.
+    /// Per PolarQuant code: `dim / 2` f32 radii (exact) + the angle indices at `bits`
+    /// bits each; a TurboQuant code adds `projections` sign bits and the f32 residual
+    /// norm. Zero padding of each stream up to a byte included. Excludes struct headers
+    /// and ids, which [`Self::memory_usage`] declares separately.
     pub fn encoded_bytes(&self) -> usize {
         if self.turbo.is_some() {
             self.codes_turbo
@@ -350,20 +358,21 @@ impl QuantizedStore {
         }
     }
 
-    /// Payload bytes one code occupies in the current layout (data-independent: it only
-    /// depends on `dim` and, for TurboQuant, on the projection count).
+    /// Payload bytes one code occupies in the packed layout (data-independent: it only
+    /// depends on `dim`, `bits` and, for TurboQuant, on the projection count).
     pub fn code_layout_bytes(&self) -> usize {
-        let polar = PolarCode::layout_bytes(self.dim);
         match self.turbo {
-            Some(ref turbo) => polar + QjlSketch::layout_bytes(turbo.projections()),
-            None => polar,
+            Some(ref turbo) => turbo.code_layout_bytes(),
+            None => self.polar.as_ref().map_or(0, |p| p.code_layout_bytes()),
         }
     }
 
-    /// `false`: codes are stored unpacked (f32 / u16 / i8 fields). `bits` changes only the
-    /// quantization error, never the byte count. Bit-packing is deferred (F04c).
+    /// `true`: codes are stored bit-packed (angle indices at `bits` bits, QJL signs at
+    /// 1 bit; radii and norms as exact f32). `bits` therefore does change the byte count
+    /// — see [`Self::code_layout_bytes`] — and the scores are bit-identical to those of
+    /// the unpacked representation.
     pub fn is_bit_packed(&self) -> bool {
-        false
+        true
     }
 
     /// Heap bytes of the cached QJL projection matrix (`projections * dim * 4`,
@@ -392,13 +401,15 @@ impl QuantizedStore {
     }
 
     /// Memory held by the store in bytes: the heap payload of the codes
-    /// (`heap_bytes()`: radius, angle and sign vectors) plus `size_of::<code>()` per
-    /// code (struct incl. the `Vec` headers and, for TurboQuant, the inline `f32`
-    /// norm, which is therefore not counted a second time), 8 B per id, and the
-    /// quantizer caches ([`Self::quantizer_memory_usage`]: rotation matrix and QJL
-    /// projection matrix, once each). Excludes allocator slack (`Vec` capacity beyond
-    /// `len`) and the transient per-query context (`(dim + projections) * 4` B for the
-    /// duration of one search).
+    /// (`heap_bytes()`: the f32 radii and the packed angle/sign streams) plus
+    /// `size_of::<code>()` per code (struct incl. the two `Vec` headers and, for
+    /// TurboQuant, the inline `f32` norm, which is therefore not counted a second
+    /// time), 8 B per id, and the quantizer caches ([`Self::quantizer_memory_usage`]:
+    /// rotation matrix and QJL projection matrix, once each). Excludes allocator
+    /// overhead (`Vec` capacity beyond `len`, and the allocator's own per-allocation
+    /// metadata: two heap blocks per code — RSS is the number that includes it) and the
+    /// transient per-query context (`(dim + projections) * 4` B for the duration of one
+    /// search).
     pub fn memory_usage(&self) -> usize {
         // Heap payload of the codes + the inline part of each code (the struct with
         // its Vec headers and, for TurboQuant, the f32 norm) + 8 B per id. The norm
@@ -406,7 +417,7 @@ impl QuantizedStore {
         // `encoded_bytes()`.
         let (inline, heap) = if self.turbo.is_some() {
             (
-                std::mem::size_of::<TurboCode>(),
+                std::mem::size_of::<PackedTurboCode>(),
                 self.codes_turbo
                     .iter()
                     .map(|code| code.heap_bytes())
@@ -414,7 +425,7 @@ impl QuantizedStore {
             )
         } else {
             (
-                std::mem::size_of::<PolarCode>(),
+                std::mem::size_of::<PackedPolarCode>(),
                 self.codes_polar
                     .iter()
                     .map(|code| code.heap_bytes())
@@ -511,6 +522,7 @@ impl QuantizedStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quant::PolarCode;
 
     fn random_vectors(n: usize, dim: usize, seed: u64) -> Array2<f32> {
         use rand::Rng;
@@ -568,30 +580,37 @@ mod tests {
 
     #[test]
     fn test_compression_ratio_reports_the_real_layout() {
-        // dim=128, 4-bit TurboQuant, 16 projections: 64 pairs * 6 B + 16 signs + 4 B norm
-        // = 404 B per code => 512/404 = 1.27x, not the nominal 8x.
+        // dim=128, 4-bit TurboQuant, 16 projections, packed: 64 radii * 4 B = 256 B
+        // (exact f32, the bulk of the code) + 64 angles * 3 bits = 24 B + 16 sign bits
+        // = 2 B + 4 B norm = 286 B per code => 512/286 = 1.79x, not the nominal 8x.
         let dim = 128;
         let config = QuantConfig::for_search(dim);
         let mut store = QuantizedStore::new(dim, config).unwrap();
         let empty_ratio = store.compression_ratio();
         store.add_batch(&random_vectors(50, dim, 42), 0).unwrap();
         let ratio = store.compression_ratio();
-        assert!((ratio - 512.0 / 404.0).abs() < 1e-4, "ratio={ratio}");
+        assert!((ratio - 512.0 / 286.0).abs() < 1e-4, "ratio={ratio}");
         assert!(
             (empty_ratio - ratio).abs() < 1e-4,
             "empty={empty_ratio}, filled={ratio}"
         );
+        assert!(store.is_bit_packed());
+        assert_eq!(store.code_layout_bytes(), 286);
+        assert_eq!(store.encoded_bytes(), 50 * 286);
+        // The unpacked representation this layout replaced: 64 pairs * 6 B + 16 + 4.
+        assert_eq!(PolarCode::layout_bytes(dim) + 16 + 4, 404);
         assert!(
-            ratio > 1.0 && ratio < 2.0,
-            "unpacked layout at 128-D: {ratio}"
+            (512.0 / 404.0 - ratio).abs() > 0.1,
+            "must not report the unpacked ratio"
         );
     }
 
     #[test]
     fn test_memory_usage_counts_codes_plus_declared_overhead() {
-        // dim=64 is too small for this layout to save anything: 32 pairs * 6 B + 8 signs
-        // + 4 B = 204 B payload per code vs 256 B raw, i.e. MORE than raw once the
-        // struct headers and ids are counted.
+        // dim=64, 4-bit TurboQuant, 8 projections, packed: 32 radii * 4 B + 32 angles *
+        // 3 bits (12 B) + 1 sign byte + 4 B norm = 145 B payload per code (the unpacked
+        // layout was 204 B). Payload + struct header + id is now below raw f32 even at
+        // this small dimension, where the unpacked layout cost MORE than raw.
         let dim = 64;
         let n = 50;
         let config = QuantConfig::for_search(dim);
@@ -600,15 +619,17 @@ mod tests {
 
         let mem = store.memory_usage();
         let raw = n * dim * 4;
+        assert_eq!(store.code_layout_bytes(), 145);
         assert_eq!(
             mem,
             store.encoded_bytes() - n * std::mem::size_of::<f32>()
-                + n * (std::mem::size_of::<TurboCode>() + std::mem::size_of::<u64>())
+                + n * (std::mem::size_of::<PackedTurboCode>() + std::mem::size_of::<u64>())
                 + store.quantizer_memory_usage()
         );
+        let codes_and_ids = mem - store.quantizer_memory_usage();
         assert!(
-            mem > raw,
-            "unpacked 64-D layout costs more than raw: {mem} > {raw}"
+            codes_and_ids < raw,
+            "packed 64-D layout with headers and ids: {codes_and_ids} B < raw {raw} B"
         );
     }
 
@@ -620,16 +641,12 @@ mod tests {
         store.add_batch(&random_vectors(n, dim, 42), 0).unwrap();
 
         // What the heap actually holds for the codes: reserved capacity, not just len.
-        let reserved = store.codes_turbo.capacity() * std::mem::size_of::<TurboCode>()
+        let reserved = store.codes_turbo.capacity() * std::mem::size_of::<PackedTurboCode>()
             + store.ids.capacity() * std::mem::size_of::<u64>()
             + store
                 .codes_turbo
                 .iter()
-                .map(|code| {
-                    code.polar_code.radii.capacity() * std::mem::size_of::<f32>()
-                        + code.polar_code.angle_indices.capacity() * std::mem::size_of::<u16>()
-                        + code.residual_sketch.signs.capacity() * std::mem::size_of::<i8>()
-                })
+                .map(|code| code.reserved_bytes())
                 .sum::<usize>()
             // The two quantizer matrices are heap allocations too.
             + store.quantizer_memory_usage();
@@ -645,7 +662,7 @@ mod tests {
         assert_eq!(
             store.memory_usage() + n * std::mem::size_of::<f32>(),
             payload
-                + n * (std::mem::size_of::<TurboCode>() + std::mem::size_of::<u64>())
+                + n * (std::mem::size_of::<PackedTurboCode>() + std::mem::size_of::<u64>())
                 + store.quantizer_memory_usage()
         );
         assert!(store.memory_usage() <= reserved);
@@ -665,7 +682,7 @@ mod tests {
         assert_eq!(empty.projection_cache_bytes(), (dim / 8) * dim * 4);
         let mut full = QuantizedStore::new(dim, config).unwrap();
         full.add_batch(&random_vectors(100, dim, 1), 0).unwrap();
-        let per_code = std::mem::size_of::<TurboCode>() + std::mem::size_of::<u64>()
+        let per_code = std::mem::size_of::<PackedTurboCode>() + std::mem::size_of::<u64>()
             - std::mem::size_of::<f32>();
         assert_eq!(
             full.memory_usage(),
@@ -684,5 +701,28 @@ mod tests {
         .unwrap();
         assert_eq!(polar.projection_cache_bytes(), 0);
         assert_eq!(polar.quantizer_memory_usage(), dim * dim * 4);
+    }
+
+    #[test]
+    fn packed_payload_meets_the_predeclared_reduction_at_2_and_4_bits() {
+        // F04c kill criterion, declared before measuring: the real payload of a code
+        // (d=640, m=256) must shrink by >= 1.5x at bits 2 and 4. The unpacked layout
+        // was 320 pairs * 6 B + 256 signs + 4 B norm = 2180 B whatever `bits` is; the
+        // packed one keeps the 1280 B of exact f32 radii and spends `bits` on the rest.
+        const DIM: usize = 640;
+        const M: usize = 256;
+        let unpacked = DIM / 2 * 6 + M + 4;
+        assert_eq!(unpacked, 2180);
+        for (bits, expected_bytes) in [(2u8, 1356usize), (4, 1436)] {
+            let packed = PackedTurboCode::layout_bytes(DIM, bits, M);
+            assert_eq!(packed, expected_bytes, "bits={bits}");
+            let reduction = unpacked as f64 / packed as f64;
+            assert!(
+                reduction >= 1.5,
+                "bits={bits}: payload reduction {reduction} is below the predeclared 1.5x"
+            );
+        }
+        // 8-bit is not part of the criterion: 1.37x (the angle stream grows to 280 B).
+        assert_eq!(PackedTurboCode::layout_bytes(DIM, 8, M), 1596);
     }
 }
