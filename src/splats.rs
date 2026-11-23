@@ -973,6 +973,47 @@ impl SplatStore {
         Ok(())
     }
 
+    /// Load the persisted energy state — alpha and kappa of the FIRST
+    /// `alpha.len()` active splats — over vectors that are already in the
+    /// store (F02e1).
+    ///
+    /// `serve` loads mu through `add_splat` (init alpha/kappa) and then the
+    /// alpha/kappa `ingest` persisted; the rows a later `/store` appended
+    /// (beyond `alpha.len()`) keep their init values, exactly as they had in
+    /// memory before the restart. Fails without touching anything when the
+    /// arrays disagree or hold a non-finite / negative value: a corrupted
+    /// state must never be half-applied. Mutation → the VRAM-cache key
+    /// (`data_version`) moves, like on every other load.
+    pub fn load_energy(&mut self, alpha: &[f32], kappa: &[f32]) -> Result<usize, String> {
+        let n = alpha.len();
+        if kappa.len() != n {
+            return Err(format!(
+                "energy state: {} alpha values for {} kappa values",
+                n,
+                kappa.len()
+            ));
+        }
+        if n > self.n_active {
+            return Err(format!(
+                "energy state holds {n} splats but the store has {} active",
+                self.n_active
+            ));
+        }
+        if alpha
+            .iter()
+            .chain(kappa)
+            .any(|v| !v.is_finite() || *v < 0.0)
+        {
+            return Err("energy state holds a non-finite or negative alpha/kappa".into());
+        }
+        for i in 0..n {
+            self.alpha[i] = alpha[i];
+            self.kappa[i] = kappa[i];
+        }
+        self.data_version += 1;
+        Ok(n)
+    }
+
     /// Update frequency for accessed splats (SOC boost).
     pub fn touch(&mut self, indices: &[usize]) {
         for &idx in indices {

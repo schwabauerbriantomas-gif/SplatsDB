@@ -2472,32 +2472,101 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     result == 0
 }
 
-/// Load vectors from the `default` shard of `data_dir` into `store`.
+/// Load vectors from the `default` shard of `data_dir` into `store`, with the
+/// persisted energy state (F02e1).
 ///
 /// Returns the number of vectors loaded. Mirrors the CLI's
 /// `load_or_create_store` behaviour (src/cli/helpers.rs), keeping `serve`
 /// consistent with `status`/`search` over the same data-dir.
+///
+/// Energy state — `energy/landscape.bin`, the alpha/kappa per splat that
+/// `ingest`, `save` and `verbatim store` write next to the shard. Before
+/// F02e1 `serve` loaded only mu (`add_splat` → init alpha/kappa = 1.0), so
+/// after every restart the splats answered with fabricated values and
+/// `?rescore=gaussian` ranked with them. Policies, in order:
+/// * absent → mu only (a data-dir written by a route without energy state);
+/// * corrupt — truncated, hostile header, counts that do not match,
+///   non-finite or negative values → `Err`, fail-closed like an unreadable
+///   shard (A03-F06 / D4): nothing is modified on disk;
+/// * foreign or stale — its mu is not a prefix of the shard's rows →
+///   ignored with a LOUD warning, the server behaves exactly as before;
+/// * otherwise the alpha/kappa of the `m` leading rows the landscape shares
+///   with the shard are loaded. A prefix is the normal case after a `serve`
+///   session: its compact rewrites the shard with the rows `/store`
+///   appended and leaves the landscape alone; those rows keep the init
+///   alpha/kappa they had in memory.
 fn load_default_shard(store: &mut SplatStore, data_dir: &str) -> anyhow::Result<usize> {
-    let persist = crate::storage::persistence::SplatsDBPersistence::with_backend(
-        data_dir,
-        crate::storage::persistence::StorageBackend::Sqlite,
-        false,
-    )
-    .map_err(|e| anyhow::anyhow!("persistence init failed: {e}"))?;
+    use crate::storage::persistence::{SplatsDBPersistence, StorageBackend};
+
+    let persist = SplatsDBPersistence::with_backend(data_dir, StorageBackend::Sqlite, false)
+        .map_err(|e| anyhow::anyhow!("persistence init failed: {e}"))?;
     match persist.load_vectors("default")? {
-        Some(vectors) => {
-            if !store.add_splat(&vectors) {
-                anyhow::bail!(
-                    "store capacity exceeded or dimension mismatch while loading {} vectors \
-                     (max_splats={}) — check --dim against the shard's dim",
-                    vectors.nrows(),
-                    store.max_splats()
-                );
-            }
-            Ok(vectors.nrows())
-        }
+        Some(vectors) => load_shard_with_energy(store, data_dir, &vectors),
         None => Ok(0),
     }
+}
+
+/// [`load_default_shard`] with the shard already read: adds the vectors, then
+/// applies the energy-state policy.
+fn load_shard_with_energy(
+    store: &mut SplatStore,
+    data_dir: &str,
+    vectors: &ndarray::Array2<f32>,
+) -> anyhow::Result<usize> {
+    if !store.add_splat(vectors) {
+        anyhow::bail!(
+            "store capacity exceeded or dimension mismatch while loading {} vectors \
+             (max_splats={}) — check --dim against the shard's dim",
+            vectors.nrows(),
+            store.max_splats()
+        );
+    }
+    let n = vectors.nrows();
+    let path = crate::loaders::EnergyLandscape::path_in(std::path::Path::new(data_dir));
+    if !path.exists() {
+        eprintln!(
+            "[splatsdb] serve: {data_dir} has no energy state ({}): alpha/kappa stay at the init values",
+            path.display()
+        );
+        return Ok(n);
+    }
+    let landscape = crate::loaders::load_energy_landscape(path.to_str().unwrap_or_default())
+        .map_err(anyhow::Error::msg)?;
+    let m = landscape.matching_prefix(vectors);
+    if m == 0 {
+        eprintln!(
+            "[splatsdb] serve: WARNING {} does not describe the 'default' shard ({}x{} vs {}x{}): \
+             it is IGNORED and alpha/kappa stay at the init values — ?rescore=gaussian \
+             rescores with them",
+            path.display(),
+            landscape.mu.nrows(),
+            landscape.mu.ncols(),
+            n,
+            vectors.ncols()
+        );
+        return Ok(n);
+    }
+    let loaded = store
+        .load_energy(&landscape.alpha[..m], &landscape.kappa[..m])
+        .map_err(anyhow::Error::msg)?;
+    eprintln!(
+        "[splatsdb] serve: energy state cargado (alpha/kappa de {loaded}/{n} splats desde {}): \
+         alpha={} kappa={}",
+        path.display(),
+        preview(&landscape.alpha[..loaded]),
+        preview(&landscape.kappa[..loaded])
+    );
+    Ok(n)
+}
+
+/// First values of a loaded vector for the startup log (4 decimals, at most 8).
+fn preview(v: &[f32]) -> String {
+    let head: Vec<String> = v.iter().take(8).map(|x| format!("{x:.4}")).collect();
+    format!(
+        "[{}{}]",
+        head.join(", "),
+        if v.len() > 8 { ", …" } else { "" }
+    )
 }
 
 /// Loopback bind check for the bind policy ([`check_bind_policy`]):

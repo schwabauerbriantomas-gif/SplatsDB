@@ -75,8 +75,226 @@ pub fn save_vectors_bin(path: &str, vectors: &Array2<f32>) -> Result<(), String>
     Ok(())
 }
 
+/// Persisted energy landscape — `energy/landscape.bin`, exactly as
+/// `storage::persistence::SplatsDBPersistence::save_energy_state` writes it:
+/// `[u64 rows][u64 cols][f32 mu, row-major][u64 n_alpha][f32 alpha]
+/// [u64 n_kappa][f32 kappa]`, little-endian.
+///
+/// Before F02e1 nothing in the crate read this file back: `ingest`, `save`
+/// and `verbatim store` wrote it and every reload (`serve`, the CLI)
+/// answered with the init alpha/kappa.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnergyLandscape {
+    /// Splat centres the state belongs to: `rows × cols`.
+    pub mu: Array2<f32>,
+    /// Per-splat amplitudes `[rows]`.
+    pub alpha: Vec<f32>,
+    /// Per-splat concentrations `[rows]`.
+    pub kappa: Vec<f32>,
+}
+
+impl EnergyLandscape {
+    /// Path of the landscape inside a data-dir.
+    pub fn path_in(data_dir: &std::path::Path) -> std::path::PathBuf {
+        data_dir.join("energy").join("landscape.bin")
+    }
+
+    /// Number of leading rows whose mu equals `shard`'s row-wise — `0` when
+    /// the state belongs to another dataset (dim or first row differ).
+    pub fn matching_prefix(&self, shard: &Array2<f32>) -> usize {
+        if self.mu.ncols() != shard.ncols() {
+            return 0;
+        }
+        let m = self.mu.nrows().min(shard.nrows());
+        (0..m)
+            .all(|i| self.mu.row(i) == shard.row(i))
+            .then_some(m)
+            .unwrap_or(0)
+    }
+}
+
+/// Largest `rows*cols` / vector length accepted from an untrusted header.
+const MAX_ENERGY_ELEMENTS: usize = MAX_LOAD_ELEMENTS;
+
+fn read_u64(file: &mut std::fs::File, what: &str) -> Result<u64, String> {
+    let mut buf8 = [0u8; 8];
+    file.read_exact(&mut buf8)
+        .map_err(|e| format!("Read error ({what}): {e}"))?;
+    Ok(u64::from_le_bytes(buf8))
+}
+
+fn read_f32s(file: &mut std::fs::File, n: usize, what: &str) -> Result<Vec<f32>, String> {
+    let mut data = vec![0.0f32; n];
+    let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut data);
+    file.read_exact(bytes)
+        .map_err(|e| format!("Read error ({what}): {e}"))?;
+    Ok(data)
+}
+
+fn header_len(value: u64, what: &str) -> Result<usize, String> {
+    let n = usize::try_from(value).map_err(|_| format!("{what} overflow"))?;
+    if n > MAX_ENERGY_ELEMENTS {
+        return Err(format!(
+            "Allocation too large: {what} = {n} elements (max {MAX_ENERGY_ELEMENTS})"
+        ));
+    }
+    Ok(n)
+}
+
+/// Load `energy/landscape.bin`.
+///
+/// The header is untrusted input: every count is validated against the
+/// on-disk size BEFORE allocating, and the file must be exactly as long as
+/// its header promises — a truncated file, trailing bytes, a count that does
+/// not match the rows, or a non-finite / negative alpha·kappa or mu value is
+/// an `Err` (never a partially loaded state). The caller decides the policy
+/// (`serve` fails closed, like with an unreadable shard).
+pub fn load_energy_landscape(path: &str) -> Result<EnergyLandscape, String> {
+    let mut file = std::fs::File::open(path).map_err(|e| format!("Cannot open {}: {}", path, e))?;
+    let size = file
+        .metadata()
+        .map_err(|e| format!("Cannot stat {}: {}", path, e))?
+        .len();
+    let rows = header_len(read_u64(&mut file, "rows")?, "rows")?;
+    let cols = header_len(read_u64(&mut file, "cols")?, "cols")?;
+    let mu_len = rows.checked_mul(cols).ok_or("overflow in rows*cols")?;
+    if mu_len > MAX_ENERGY_ELEMENTS {
+        return Err(format!(
+            "Allocation too large: {rows}x{cols} elements (max {MAX_ENERGY_ELEMENTS})"
+        ));
+    }
+    // The counts follow the mu payload: skip over it (already validated
+    // against the on-disk size above).
+    std::io::Seek::seek(
+        &mut file,
+        std::io::SeekFrom::Current((mu_len as u64 * 4) as i64),
+    )
+    .map_err(|e| format!("Seek error: {e}"))?;
+    let n_alpha = header_len(read_u64(&mut file, "n_alpha")?, "n_alpha")?;
+    // Same for the alpha payload before the kappa count.
+    std::io::Seek::seek(
+        &mut file,
+        std::io::SeekFrom::Current((n_alpha as u64 * 4) as i64),
+    )
+    .map_err(|e| format!("Seek error: {e}"))?;
+    let n_kappa = header_len(read_u64(&mut file, "n_kappa")?, "n_kappa")?;
+    let floats =
+        u64::try_from(mu_len + n_alpha + n_kappa).map_err(|_| "overflow in element count")?;
+    let expected = 32 + floats * 4;
+    if size != expected {
+        return Err(format!(
+            "{} is {size} bytes, its header promises {expected} (truncated or trailing garbage)",
+            path
+        ));
+    }
+    if n_alpha != rows || n_kappa != rows {
+        return Err(format!(
+            "{} holds {n_alpha} alpha / {n_kappa} kappa values for {rows} splats",
+            path
+        ));
+    }
+    // Back to the payload start for the reads themselves.
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(16))
+        .map_err(|e| format!("Seek error: {e}"))?;
+    let mu_flat = read_f32s(&mut file, mu_len, "mu")?;
+    // Payload order is mu | count | alpha | count | kappa:
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Current(8))
+        .map_err(|e| format!("Seek error: {e}"))?;
+    let alpha = read_f32s(&mut file, n_alpha, "alpha")?;
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Current(8))
+        .map_err(|e| format!("Seek error: {e}"))?;
+    let kappa = read_f32s(&mut file, n_kappa, "kappa")?;
+    let mu =
+        Array2::from_shape_vec((rows, cols), mu_flat).map_err(|e| format!("Shape error: {}", e))?;
+    if mu.iter().any(|v| !v.is_finite()) {
+        return Err(format!("{path} holds a non-finite mu value"));
+    }
+    for (name, v) in [("alpha", &alpha), ("kappa", &kappa)] {
+        if v.iter().any(|x| !x.is_finite() || *x < 0.0) {
+            return Err(format!(
+                "{path} holds a non-finite or negative {name} value"
+            ));
+        }
+    }
+    Ok(EnergyLandscape { mu, alpha, kappa })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn load_energy_landscape_roundtrips_save_energy_state() {
+        use crate::storage::persistence::{SplatsDBPersistence, StorageBackend};
+        use ndarray::s;
+        let dir = std::env::temp_dir().join(format!("F02e1-loader-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let persist =
+            SplatsDBPersistence::with_backend(dir.to_str().unwrap(), StorageBackend::Sqlite, false)
+                .unwrap();
+        let mu = Array2::from_shape_fn((3, 4), |(i, j)| (i * 4 + j) as f32 - 2.0);
+        let alpha = [0.5f32, 0.25, 1.0 / 3.0];
+        let kappa = [0.1f32, 5.0, 100.0];
+        persist.save_energy_state(&mu, &alpha, &kappa).unwrap();
+        let path = EnergyLandscape::path_in(&dir);
+        let l = load_energy_landscape(path.to_str().unwrap()).unwrap();
+        assert_eq!(l.mu, mu);
+        assert_eq!(l.alpha, alpha);
+        assert_eq!(l.kappa, kappa);
+        assert_eq!(l.matching_prefix(&mu), 3);
+        let mut bigger = Array2::zeros((4, 4));
+        bigger.slice_mut(s![..3, ..]).assign(&mu);
+        assert_eq!(l.matching_prefix(&bigger), 3);
+        let other = Array2::from_shape_fn((3, 4), |(i, j)| (i * 4 + j) as f32);
+        assert_eq!(l.matching_prefix(&other), 0);
+        assert_eq!(l.matching_prefix(&Array2::zeros((3, 5))), 0);
+        // reject: truncated / trailing / hostile / mismatched / non-finite / negative
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..bytes.len() - 4]).unwrap();
+        assert!(load_energy_landscape(path.to_str().unwrap())
+            .unwrap_err()
+            .contains("bytes"));
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        std::fs::write(&path, &trailing).unwrap();
+        assert!(load_energy_landscape(path.to_str().unwrap()).is_err());
+        let mut bomb = bytes.clone();
+        bomb[0..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&path, &bomb).unwrap();
+        assert!(load_energy_landscape(path.to_str().unwrap())
+            .unwrap_err()
+            .contains("Allocation too large"));
+        let mut mismatch = bytes.clone();
+        let o = 16 + 3 * 4 * 4;
+        mismatch[o..o + 8].copy_from_slice(&2u64.to_le_bytes());
+        // n_alpha=2 / n_kappa=4 keeps the total size, so the size check passes
+        // and the count check is the one that fires.
+        mismatch[o + 8 + 2 * 4..o + 8 + 2 * 4 + 8].copy_from_slice(&4u64.to_le_bytes());
+        std::fs::write(&path, &mismatch).unwrap();
+        assert!(load_energy_landscape(path.to_str().unwrap())
+            .unwrap_err()
+            .contains("alpha /"));
+        let mut nan = bytes.clone();
+        nan[16 + 3 * 4 * 4 + 8..16 + 3 * 4 * 4 + 8 + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        std::fs::write(&path, &nan).unwrap();
+        assert!(load_energy_landscape(path.to_str().unwrap())
+            .unwrap_err()
+            .contains("non-finite"));
+        let mut negative = bytes.clone();
+        let o = 16 + 3 * 4 * 4 + 8 + 3 * 4 + 8;
+        negative[o..o + 4].copy_from_slice(&(-1.0f32).to_le_bytes());
+        std::fs::write(&path, &negative).unwrap();
+        assert!(load_energy_landscape(path.to_str().unwrap())
+            .unwrap_err()
+            .contains("negative"));
+        let mut nan_mu = bytes.clone();
+        nan_mu[16..20].copy_from_slice(&f32::NAN.to_le_bytes());
+        std::fs::write(&path, &nan_mu).unwrap();
+        assert!(load_energy_landscape(path.to_str().unwrap())
+            .unwrap_err()
+            .contains("non-finite mu"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     fn scratch(tag: &str) -> std::path::PathBuf {
