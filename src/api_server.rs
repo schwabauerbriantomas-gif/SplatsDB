@@ -4519,7 +4519,7 @@ mod tests {
 
         // un store aceptado y el compact del shutdown
         d.log_store("mem_0", Some(0), 3, &[0.5f32; 32]).unwrap();
-        let err = d.compact(&store).err().expect("compact must refuse");
+        let err = d.compact(&store).expect_err("compact must refuse");
         assert!(err.to_string().contains("cambió en disco"), "{err}");
         assert_eq!(
             std::fs::read(&shard).unwrap(),
@@ -4560,8 +4560,7 @@ mod tests {
         assert!(store.add_splat(&Array2::from_shape_fn((1, 32), |(_, j)| j as f32)));
         let err = d
             .compact(&store)
-            .err()
-            .expect("compact must not truncate the WAL");
+            .expect_err("compact must not truncate the WAL");
         assert!(err.to_string().contains("no se aplicaron"), "{err}");
         let ops: Vec<String> = d
             .wal
