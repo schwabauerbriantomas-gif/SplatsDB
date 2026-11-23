@@ -376,3 +376,74 @@ fn a3_shutdown_never_overwrites_a_shard_modified_outside_the_server() {
     assert_eq!(std::fs::read(shard_path(&dir)).unwrap(), external);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+use serde_json::Value;
+
+fn status_json(port: u16) -> Value {
+    let (code, body) = http(port, "POST", "/status", None).expect("/status answered");
+    assert_eq!(code, 200, "{body}");
+    serde_json::from_str(&body).unwrap_or_else(|e| panic!("/status is not JSON ({e}): {body}"))
+}
+
+#[test]
+fn b1_store_is_acknowledged_before_it_is_durable_and_says_so() {
+    let dir = scratch("b1");
+    let port = probe_port();
+    let mut server = Running(Some(spawn_serve(&dir, port)));
+    wait_healthy(port, &mut server);
+
+    let v = status_json(port);
+    assert_eq!(
+        v["persistence"], "wal",
+        "a serve with --data-dir is never ephemeral: {v}"
+    );
+    assert_eq!(v["durable"], true, "nothing accepted yet: {v}");
+
+    // CHECKPOINT_EVERY = 32: las primeras 31 quedan aceptadas en el WAL pero
+    // sin fsync → la respuesta no puede afirmar durabilidad.
+    for i in 1..32 {
+        let (code, body) = store(port, &format!("doc {i}"));
+        assert_eq!(code, 200, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["status"], "stored", "{body}");
+        assert_eq!(v["durable"], false, "store #{i} was not fsynced: {body}");
+    }
+    let v = status_json(port);
+    assert_eq!(v["durable"], false, "{v}");
+    assert_eq!(v["wal_pending"], 31, "{v}");
+
+    // la 32ª hace el group commit: sync_all terminó ANTES de este 200
+    let (code, body) = store(port, "doc 32");
+    assert_eq!(code, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["durable"], true, "{body}");
+    let v = status_json(port);
+    assert_eq!(v["durable"], true, "{v}");
+    assert_eq!(v["wal_pending"], 0, "{v}");
+
+    terminate(&mut server);
+    let (status, _out, err) = finish(server.take(), Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "clean shutdown must exit 0; stderr:\n{err}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn b2_serve_with_a_data_dir_never_starts_ephemeral_when_the_wal_cannot_open() {
+    let dir = scratch("b2");
+    write_matrix(&shard_path(&dir), 5, DIM, 0.0);
+    // un DIRECTORIO donde tiene que estar el WAL
+    std::fs::create_dir_all(wal_path(&dir)).unwrap();
+    let port = probe_port();
+    let (status, _out, err) = finish(spawn_serve(&dir, port), Duration::from_secs(30));
+    assert_ne!(
+        status.code(),
+        Some(0),
+        "serve must abort instead of answering /store 200 with no WAL; stderr:\n{err}"
+    );
+    assert!(err.contains("fail-closed"), "stderr:\n{err}");
+    assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+    std::fs::remove_dir_all(&dir).ok();
+}

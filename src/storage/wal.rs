@@ -413,7 +413,7 @@ impl WriteAheadLog {
     /// Test-only fault injection: the next entry is cut after `bytes` bytes
     /// and reported as a failed write (simulates ENOSPC / EIO mid-entry).
     #[cfg(test)]
-    fn debug_fail_next_entry_after(&self, bytes: usize) {
+    pub(crate) fn debug_fail_next_entry_after(&self, bytes: usize) {
         self.inner.lock().fail_next_entry_after = Some(bytes);
     }
 }

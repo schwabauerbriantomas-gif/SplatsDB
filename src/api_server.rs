@@ -423,6 +423,13 @@ pub struct SearchQuery {
 pub struct StoreResponse {
     pub id: String,
     pub status: String,
+    /// `true` sii, además de estar en el WAL, `sync_all` del WAL ya terminó
+    /// después de esta entrada. `false` = aceptado (sobrevive a un crash del
+    /// proceso) pero todavía no duradero ante corte de energía, o bien el
+    /// server corre efímero sin data-dir.
+    pub durable: bool,
+    /// "wal" (persistente en --data-dir) o "ephemeral" (sólo memoria).
+    pub persistence: String,
 }
 
 #[derive(Serialize)]
@@ -456,6 +463,17 @@ pub struct StatusResponse {
     pub has_hnsw: bool,
     pub has_lsh: bool,
     pub has_quantization: bool,
+    /// "wal": persistente en --data-dir. "ephemeral": nada sobrevive al
+    /// proceso (sólo cuando se pidió explícitamente; `serve` con --data-dir
+    /// nunca arranca efímero, A03-F01).
+    pub persistence: String,
+    /// `true` sii todo lo aceptado hasta ahora pasó por `sync_all`.
+    pub durable: bool,
+    /// Entradas aceptadas que todavía no pasaron por `sync_all` (group commit).
+    pub wal_pending: u64,
+    /// Último error de compact: el shard o el WAL no se pudieron persistir.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_compact_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -474,6 +492,16 @@ async fn health() -> Json<HealthResponse> {
 async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
     let store = state.store.lock().await;
     let stats = store.get_statistics();
+    // Sin data-dir el modo efímero es explícito y visible: nunca `durable`.
+    let (persistence, durable, wal_pending, last_compact_error) = match state.durability.as_ref() {
+        Some(d) => (
+            "wal",
+            d.is_durable(),
+            d.wal_pending(),
+            d.last_compact_error(),
+        ),
+        None => ("ephemeral", false, 0, None),
+    };
     Json(StatusResponse {
         n_active: store.n_active(),
         max_splats: store.max_splats(),
@@ -481,6 +509,10 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
         has_hnsw: store.has_hnsw(),
         has_lsh: store.has_lsh(),
         has_quantization: store.has_quantization(),
+        persistence: persistence.into(),
+        durable,
+        wal_pending,
+        last_compact_error,
     })
 }
 
@@ -544,7 +576,7 @@ async fn store_memory(
     let emb_for_wal = embedding.clone();
     let id_for_wal = id.clone();
     let auto_id = (!user_supplied).then_some(id_num);
-    let added = tokio::task::spawn_blocking(move || {
+    let wal_outcome = tokio::task::spawn_blocking(move || -> Result<bool, String> {
         let mut store = store.blocking_lock();
         let added = store.add_splat(&arr);
         if added {
@@ -554,8 +586,13 @@ async fn store_memory(
                 // Mismo lock que add_splat: el orden del WAL replica el orden
                 // de índices del store, así el replay es determinista.
                 let idx = store.n_active().saturating_sub(1);
+                // Contrato: `stored` (200) exige que la entrada llegó al WAL.
+                // Si el WAL falla NO hay ACK: 503, nunca un 200 falso.
                 if let Err(e) = d.log_store(&id_for_wal, auto_id, idx, &emb_for_wal) {
-                    eprintln!("[splatsdb] WAL: fallo al loggear store (queda en memoria): {e}");
+                    return Err(format!(
+                        "store not accepted: the WAL write failed, the vector is NOT recoverable \
+                         after a restart: {e}"
+                    ));
                 }
                 if d.stores_since_compact() % Durability::COMPACT_EVERY == 0 {
                     match d.compact(&store) {
@@ -567,7 +604,7 @@ async fn store_memory(
                 }
             }
         }
-        added
+        Ok(added)
     })
     .await
     .map_err(|e| {
@@ -577,15 +614,28 @@ async fn store_memory(
         (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
     })?;
 
+    // The vector may sit in the in-memory store, but without its WAL entry
+    // it is volatile: it is not acknowledged as stored.
+    let added = wal_outcome.map_err(|e| {
+        eprintln!("[splatsdb] /store: {e}");
+        (StatusCode::SERVICE_UNAVAILABLE, e)
+    })?;
+
     if !added {
         return Err((StatusCode::INSUFFICIENT_STORAGE, "Store full".into()));
     }
 
+    let (durable, persistence) = match state.durability.as_ref() {
+        Some(d) => (d.is_durable(), "wal"),
+        None => (false, "ephemeral"),
+    };
     Ok((
         StatusCode::OK,
         Json(StoreResponse {
             id,
             status: "stored".into(),
+            durable,
+            persistence: persistence.into(),
         }),
     ))
 }
@@ -3847,5 +3897,145 @@ mod tests {
             "WAL untouched, operations: {ops:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── F02b: contrato durable explícito de /store y /status ───
+
+    async fn f02b_call(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, String) {
+        let req = HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Router con un WAL real sobre `dir` (sin batch worker: /store y
+    /// /status no lo usan).
+    fn app_with_wal(dir: &std::path::Path) -> (Router, Arc<Durability>) {
+        let d = Arc::new(Durability::open(dir.to_str().unwrap()).expect("durability open"));
+        let mut store = SplatStore::new(test_config());
+        let _ = load_default_shard(&mut store, dir.to_str().unwrap());
+        replay_wal(&mut store, &d).expect("wal replay");
+        let (batch_tx, _batch_rx) = mpsc::channel(BATCH_CHANNEL_CAP);
+        let app = build_router(AppState {
+            store: Arc::new(Mutex::new(store)),
+            next_id: Arc::new(AtomicUsize::new(0)),
+            batch_tx,
+            batches_served: Arc::new(AtomicUsize::new(0)),
+            #[cfg(feature = "cuda")]
+            gpu: None,
+            field: None,
+            corpus_n: 0,
+            data_dir: Some(dir.to_str().unwrap().to_string()),
+            durability: Some(d.clone()),
+        });
+        (app, d)
+    }
+
+    #[tokio::test]
+    async fn f02b_store_reports_durable_only_after_the_wal_was_fsynced() {
+        let dir = f02b_dir("durable-flag");
+        let (app, _d) = app_with_wal(&dir);
+        let (status, body) = f02b_call(&app, "POST", "/status", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["persistence"], "wal", "{body}");
+        assert_eq!(v["durable"], true, "nothing accepted yet: {body}");
+        // group commit: las primeras 31 están aceptadas en el WAL pero sin fsync
+        for i in 1..32 {
+            let (status, body) = f02b_call(
+                &app,
+                "POST",
+                "/store",
+                Some(json!({"text": format!("doc {i}")})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["status"], "stored", "{body}");
+            assert_eq!(v["durable"], false, "store #{i} was not fsynced: {body}");
+        }
+        let (_, body) = f02b_call(&app, "POST", "/status", None).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["durable"], false, "{body}");
+        assert_eq!(v["wal_pending"], 31, "{body}");
+        // la 32ª dispara el checkpoint: sync_all terminó ANTES de este 200
+        let (status, body) =
+            f02b_call(&app, "POST", "/store", Some(json!({"text": "doc 32"}))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["durable"], true, "{body}");
+        let (_, body) = f02b_call(&app, "POST", "/status", None).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["durable"], true, "{body}");
+        assert_eq!(v["wal_pending"], 0, "{body}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn f02b_store_is_503_when_the_wal_write_fails() {
+        let dir = f02b_dir("wal-fail");
+        let (app, d) = app_with_wal(&dir);
+        let (status, body) = f02b_call(&app, "POST", "/store", Some(json!({"text": "ok"}))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // fallo real en el fd: la próxima entrada se corta a los 0 bytes y se
+        // reporta como write fallido (mismo inyector que los tests del WAL).
+        d.wal.debug_fail_next_entry_after(0);
+        let (status, body) =
+            f02b_call(&app, "POST", "/store", Some(json!({"text": "fails"}))).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.contains("WAL write failed"), "{body}");
+        assert!(!body.contains("\"stored\""), "{body}");
+        // el WAL sigue terminando en la última entrada completa y acepta la siguiente
+        let (status, body) =
+            f02b_call(&app, "POST", "/store", Some(json!({"text": "after"}))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            d.wal
+                .recover()
+                .unwrap()
+                .iter()
+                .filter(|e| e.operation == "store")
+                .count(),
+            2,
+            "only the two accepted entries"
+        );
+        let (_, body) = f02b_call(&app, "POST", "/status", None).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["persistence"], "wal", "{body}");
+        assert_eq!(v["durable"], false, "{body}");
+        assert_eq!(v["wal_pending"], 2, "{body}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn f02b_ephemeral_mode_is_visible_and_never_durable() {
+        // `durability: None` es el modo efímero explícito (tests / lib);
+        // `serve` con --data-dir nunca llega acá (arranque fail-closed).
+        let (app, _batches) = test_app().await;
+        let (status, body) =
+            f02b_call(&app, "POST", "/store", Some(json!({"text": "ephemeral"}))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["status"], "stored", "{body}");
+        assert_eq!(v["persistence"], "ephemeral", "{body}");
+        assert_eq!(v["durable"], false, "{body}");
+        let (_, body) = f02b_call(&app, "POST", "/status", None).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["persistence"], "ephemeral", "{body}");
+        assert_eq!(v["durable"], false, "{body}");
+        assert_eq!(v["wal_pending"], 0, "{body}");
     }
 }
