@@ -362,16 +362,17 @@ fn a3_non_loopback_bind_without_a_key_is_refused() {
 
 #[test]
 fn a4_non_loopback_bind_without_a_key_needs_the_explicit_opt_in_to_serve() {
+    // Both halves share one probe port: the first never binds (it exits
+    // before listening), the second does.
+    let port = probe_port();
     // Anything but exactly "1" is NOT an opt-in.
     let dir = scratch("a4-refuse");
-    let port = probe_port();
     let err = serve_must_refuse(&dir, port, "0.0.0.0", &opt_in("true"), "a4-optin-true");
     assert!(err.contains("SPLATSDB_ALLOW_UNAUTHENTICATED"), "{err}");
     std::fs::remove_dir_all(&dir).ok();
 
     // Exactly "1" → serves, and keeps warning loudly about it.
     let dir = scratch("a4-serve");
-    let port = probe_port();
     let mut server = Running(Some(spawn_serve(
         &dir,
         port,
