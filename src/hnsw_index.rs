@@ -97,6 +97,14 @@ pub struct HNSWIndex {
     removed: HashSet<usize>,
 }
 
+/// Serialize tombstones in canonical order: HashSet iteration order is not
+/// reproducible across processes even for identical graph contents.
+fn sorted_removed_ids(removed: &HashSet<usize>) -> Vec<u64> {
+    let mut ids: Vec<u64> = removed.iter().map(|&idx| idx as u64).collect();
+    ids.sort_unstable();
+    ids
+}
+
 impl HNSWIndex {
     /// Number of vectors currently in the index (incl. tombstoned).
     pub fn len(&self) -> usize {
@@ -190,7 +198,7 @@ impl HNSWIndex {
         f.write_all(&(self.max_level as u64).to_le_bytes())
             .map_err(|e| format!("write max_level: {}", e))?;
 
-        let removed_vec: Vec<u64> = self.removed.iter().map(|&x| x as u64).collect();
+        let removed_vec = sorted_removed_ids(&self.removed);
         f.write_all(&(removed_vec.len() as u64).to_le_bytes())
             .map_err(|e| format!("write n_removed: {}", e))?;
         for &idx in &removed_vec {
@@ -1164,9 +1172,9 @@ mod tests {
         assert_eq!(loaded.n_items(), 10);
     }
 
-    /// The layout `save()` has always written — header, removed ids, node
-    /// adjacency, raw f32 vectors — as an independent UNBUFFERED reference,
-    /// so the buffered/atomic writer cannot change a single valid byte.
+    /// The canonical on-disk layout — header, sorted removed ids, node
+    /// adjacency, raw f32 vectors — as an independent UNBUFFERED reference.
+    /// HashSet iteration order must not make identical graphs byte-different.
     fn reference_bytes(idx: &HNSWIndex) -> Vec<u8> {
         use std::io::Cursor;
         let mut f = Cursor::new(Vec::new());
@@ -1188,7 +1196,8 @@ mod tests {
         ] {
             f.write_all(&v.to_le_bytes()).unwrap();
         }
-        let removed: Vec<u64> = idx.removed.iter().map(|&x| x as u64).collect();
+        let mut removed: Vec<u64> = idx.removed.iter().map(|&x| x as u64).collect();
+        removed.sort_unstable();
         f.write_all(&(removed.len() as u64).to_le_bytes()).unwrap();
         for r in &removed {
             f.write_all(&r.to_le_bytes()).unwrap();
@@ -1834,5 +1843,12 @@ mod tests {
             }
         }
         assert_eq!(n, GOLDEN.len(), "every golden entry must be covered");
+    }
+
+    #[test]
+    fn f03d_removed_ids_serialization_is_canonical() {
+        let removed: HashSet<usize> = [800usize, 5, 77, 2, 99].into_iter().collect();
+        assert_eq!(sorted_removed_ids(&removed), vec![2u64, 5, 77, 99, 800]);
+        assert!(sorted_removed_ids(&HashSet::new()).is_empty());
     }
 }
