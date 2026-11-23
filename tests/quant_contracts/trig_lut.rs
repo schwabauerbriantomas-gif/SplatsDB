@@ -413,32 +413,57 @@ fn foreign_and_malformed_codes_keep_their_behaviour() {
         })
     ));
 
-    // An angle index outside [0, 2^bits) is not rejected before scoring: it must yield
-    // the direct value of that code (no new panic from the table).
+    // An angle index outside [0, 2^bits) is rejected BEFORE the table is indexed
+    // (F04e; until c2c6206 such a code was scored with the direct value): an `Err`,
+    // never a number, on the polar path and on both turbo paths.
     for bad in [8u16, 100, 4096, u16::MAX] {
         for position in [0usize, 3, 7] {
             let mut malformed = code.clone();
             malformed.angle_indices[position] = bad;
-            let expected = reference_polar_estimate(&malformed, &rotated);
-            assert_same_bits(
-                polar
-                    .inner_product_estimate_rotated(&malformed, &rotated)
-                    .unwrap(),
-                expected,
-                &format!("polar index {bad} at {position}"),
+            assert!(
+                matches!(
+                    polar.inner_product_estimate_rotated(&malformed, &rotated),
+                    Err(QuantError::MalformedCode(_))
+                ),
+                "polar index {bad} at {position}"
             );
             let mut malformed_turbo = turbo_code.clone();
-            malformed_turbo.polar_code = malformed.clone();
+            malformed_turbo.polar_code = malformed;
             for mode in MODES {
-                // The sketch is untouched: reference polar estimate of the mutated code
-                // + the reference QJL term of x.
-                let expected = expected + reference_qjl_term(&x, &query, &polar, &qjl, &g, mode);
-                assert_same_bits(
-                    turbo.score(&malformed_turbo, &query, mode).unwrap(),
-                    expected,
-                    &format!("turbo {mode:?} index {bad} at {position}"),
+                assert!(
+                    matches!(
+                        turbo.score(&malformed_turbo, &query, mode),
+                        Err(QuantError::MalformedCode(_))
+                    ),
+                    "turbo {mode:?} index {bad} at {position}"
                 );
             }
+        }
+    }
+    // A different but valid index is still scored bit-identically to the formulas.
+    let valid = 7u16;
+    for position in [0usize, 3, 7] {
+        let mut mutated = code.clone();
+        mutated.angle_indices[position] = valid;
+        let expected = reference_polar_estimate(&mutated, &rotated);
+        assert_same_bits(
+            polar
+                .inner_product_estimate_rotated(&mutated, &rotated)
+                .unwrap(),
+            expected,
+            &format!("polar valid index {valid} at {position}"),
+        );
+        let mut mutated_turbo = turbo_code.clone();
+        mutated_turbo.polar_code = mutated;
+        for mode in MODES {
+            // The sketch is untouched: reference polar estimate of the mutated code
+            // + the reference QJL term of x.
+            let expected = expected + reference_qjl_term(&x, &query, &polar, &qjl, &g, mode);
+            assert_same_bits(
+                turbo.score(&mutated_turbo, &query, mode).unwrap(),
+                expected,
+                &format!("turbo {mode:?} valid index {valid} at {position}"),
+            );
         }
     }
 }

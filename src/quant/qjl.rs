@@ -37,6 +37,7 @@ use std::f32::consts::PI;
 use std::sync::Arc;
 
 use super::error::{QuantError, Result};
+use super::polar::check_finite;
 
 /// Wire schema version of [`QjlSketch`]. v1 adds `norm`; v0 (<= 2.11.0: `{dim,
 /// projections, signs}` only) is rejected on deserialization and never reinterpreted.
@@ -346,6 +347,22 @@ impl QjlQuantizer {
                 self.projections
             )));
         }
+        // A projected query is a public argument: a non-finite entry (a finite query near
+        // `f32::MAX` overflowed the dot products) is an `Err` before anything is scored.
+        check_finite(projected_query)?;
+        self.score_projected_validated(sketch, projected_query, mode)
+    }
+
+    /// [`Self::score_projected`] for a sketch whose length was checked against this
+    /// quantizer and a finite projected query: the per-code path of a TurboQuant /
+    /// `QuantizedStore` search, where both were checked once per search. A score that
+    /// overflows is still an `Err`, never a non-finite number (F04e).
+    pub(crate) fn score_projected_validated(
+        &self,
+        sketch: &QjlSketch,
+        projected_query: &[f32],
+        mode: ScoreMode,
+    ) -> Result<f32> {
         let m = self.projections as f32;
         // Same accumulation order as the per-sketch estimator (bit-identical values).
         let estimate: f32 = sketch
@@ -361,7 +378,11 @@ impl QjlQuantizer {
             // no division, so ||x|| == 0 is finite.
             ScoreMode::L2Heuristic => PI / (2.0 * m),
         };
-        Ok(scale * estimate)
+        let score = scale * estimate;
+        if !score.is_finite() {
+            return Err(QuantError::NonFiniteScore);
+        }
+        Ok(score)
     }
 }
 

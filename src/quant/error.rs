@@ -25,6 +25,15 @@ pub enum QuantError {
     NonFiniteRadius {
         pair: usize,
     },
+    /// The rotated or the projected query of a finite query is not finite at `index`
+    /// (the rotation or the projection overflowed f32): it is rejected before any code
+    /// is scored.
+    NonFiniteQueryContext {
+        index: usize,
+    },
+    /// The score of a valid code against a valid query came out NaN/Inf (f32 overflow):
+    /// an `Err`, never ranked or returned.
+    NonFiniteScore,
 }
 
 impl std::fmt::Display for QuantError {
@@ -45,6 +54,10 @@ impl std::fmt::Display for QuantError {
             Self::NonFiniteRadius { pair } => {
                 write!(f, "non-finite radius at pair {pair} (f32 overflow)")
             }
+            Self::NonFiniteQueryContext { index } => {
+                write!(f, "non-finite query context (NaN/Inf) at index {index}")
+            }
+            Self::NonFiniteScore => write!(f, "non-finite score (NaN/Inf, f32 overflow)"),
         }
     }
 }

@@ -16,7 +16,9 @@
 //! versions <= 2.11.0 (`estimate / ||x||`: a heuristic for L2 candidate generation, not
 //! an unbiased estimator); [`ScoreMode::InnerProduct`] ranks by the unbiased inner-product
 //! estimate and is selected on purpose. `search` is the default mode;
-//! `search_scored` takes the mode and rejects a NaN/±Inf query before ranking.
+//! `search_scored` takes the mode and rejects a NaN/±Inf query before ranking; a search
+//! whose query context or whose score overflows f32 fails as a whole (`Err`): it never
+//! returns a ranking with a hole or a non-finite score (F04e).
 
 pub use crate::quant::qjl::ScoreMode;
 use crate::quant::{PolarCode, PolarQuantizer, QjlSketch, QuantError, TurboCode, TurboQuantizer};
@@ -141,7 +143,8 @@ impl QuantizedStore {
     ///
     /// Atomic: the batch is validated and encoded into temporary buffers first. A batch
     /// whose column count differs from the store dimension, that contains any NaN/±Inf,
-    /// or with any row that fails to encode returns `Err` and leaves ids, codes and
+    /// or with any row that fails to encode (a finite row whose rotated radius or norm
+    /// overflows f32 included) returns `Err` and leaves ids, codes and
     /// `len()` exactly as they were. Ids are pushed only together with the codes that
     /// were actually encoded.
     pub fn add_batch(&mut self, vectors: &Array2<f32>, start_id: u64) -> Result<usize, String> {
@@ -276,35 +279,37 @@ impl QuantizedStore {
             return Ok(Vec::new());
         }
 
-        let mut scores: Vec<(usize, f32)> = if let Some(ref turbo) = self.turbo {
-            let context = turbo.prepare_query(&q)?;
-            self.codes_turbo
-                .par_iter()
-                .enumerate()
-                .filter_map(|(i, code)| {
-                    turbo
-                        .score_projected(code, &context, mode)
-                        .ok()
-                        .map(|s| (i, s))
-                })
-                .collect()
-        } else if let Some(ref polar) = self.polar {
-            // No QJL stage: both modes rank by the polar reconstruction inner product
-            // (the legacy order; nothing was ever divided by a norm here).
-            let rotated_query = polar.rotated_query(&q)?;
-            self.codes_polar
-                .par_iter()
-                .enumerate()
-                .filter_map(|(i, code)| {
-                    polar
-                        .inner_product_estimate_rotated(code, &rotated_query)
-                        .ok()
-                        .map(|s| (i, s))
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // Every code of a store was produced by its own quantizer's `encode`, which only
+        // emits valid codes (lengths, finite non-negative radii, in-range angle indices,
+        // +/-1 signs): those invariants are checked once at ingestion, not per query.
+        // What is checked per code here is the one thing valid inputs can still break --
+        // a score that overflows -- and it fails the whole search. Until c2c6206 a code
+        // that failed to score was dropped from the ranking: a silent hole.
+        let scored: Vec<(usize, std::result::Result<f32, QuantError>)> =
+            if let Some(ref turbo) = self.turbo {
+                let context = turbo.prepare_query(&q)?;
+                self.codes_turbo
+                    .par_iter()
+                    .enumerate()
+                    .map(|(i, code)| (i, turbo.score_projected_validated(code, &context, mode)))
+                    .collect()
+            } else if let Some(ref polar) = self.polar {
+                // No QJL stage: both modes rank by the polar reconstruction inner product
+                // (the legacy order; nothing was ever divided by a norm here).
+                let rotated_query = polar.prepared_query(&q)?;
+                self.codes_polar
+                    .par_iter()
+                    .enumerate()
+                    .map(|(i, code)| (i, polar.score_validated(code, &rotated_query)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        // The first code (lowest index) that failed to score is the error of the search.
+        let mut scores: Vec<(usize, f32)> = Vec::with_capacity(scored.len());
+        for (i, result) in scored {
+            scores.push((i, result?));
+        }
 
         // Sort descending by score (higher = more similar)
         scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));

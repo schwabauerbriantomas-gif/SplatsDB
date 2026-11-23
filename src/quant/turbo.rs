@@ -24,17 +24,43 @@
 //! License: MIT (adapted from github.com/RecursiveIntell/turbo-quant)
 
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::error::{QuantError, Result};
-use super::polar::{PolarCode, PolarQuantizer};
+use super::polar::{check_finite, PolarCode, PolarQuantizer};
 use super::qjl::{QjlQuantizer, QjlSketch, ScoreMode};
 
 /// A TurboQuant-compressed vector: polar code + QJL residual sketch.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TurboCode {
     pub polar_code: PolarCode,
     pub residual_sketch: QjlSketch,
+}
+
+impl<'de> Deserialize<'de> for TurboCode {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Repr {
+            polar_code: PolarCode,
+            residual_sketch: QjlSketch,
+        }
+        let repr = Repr::deserialize(deserializer)?;
+        // Both halves are validated by their own deserializers; what only this one can
+        // see is that they describe the same vector (F04e).
+        if repr.polar_code.dim != repr.residual_sketch.dim {
+            return Err(serde::de::Error::custom(format!(
+                "malformed TurboCode: polar code dim {} but residual sketch dim {}",
+                repr.polar_code.dim, repr.residual_sketch.dim
+            )));
+        }
+        Ok(TurboCode {
+            polar_code: repr.polar_code,
+            residual_sketch: repr.residual_sketch,
+        })
+    }
 }
 
 impl TurboCode {
@@ -53,6 +79,15 @@ impl TurboCode {
     }
 }
 
+/// `polar_est + qjl_term`, rejected if the sum overflowed f32 (F04e).
+fn combine(polar_est: f32, qjl_term: f32) -> Result<f32> {
+    let score = polar_est + qjl_term;
+    if !score.is_finite() {
+        return Err(QuantError::NonFiniteScore);
+    }
+    Ok(score)
+}
+
 /// Everything in a score that depends only on the query (A02-F02): the rotated query
 /// `R·q` for the polar stage and `g_i·q` for the QJL stage. Built once per search by
 /// [`TurboQuantizer::prepare_query`] and shared by every code, so the O(d²) rotation
@@ -68,6 +103,12 @@ impl TurboQueryContext {
     /// one search and is not part of the store's memory.
     pub fn memory_bytes(&self) -> usize {
         (self.rotated_query.len() + self.projected_query.len()) * std::mem::size_of::<f32>()
+    }
+
+    /// Both halves finite (F04e): what [`TurboQuantizer::prepare_query`] guarantees.
+    fn check_finite(&self) -> Result<()> {
+        check_finite(&self.rotated_query)?;
+        check_finite(&self.projected_query)
     }
 }
 
@@ -197,10 +238,14 @@ impl TurboQuantizer {
                 got: query.len(),
             });
         }
-        Ok(TurboQueryContext {
+        let context = TurboQueryContext {
             rotated_query: self.polar.rotated_query(query)?,
             projected_query: self.qjl.projected_query(query)?,
-        })
+        };
+        // A finite query can overflow the rotation or the projections: such a context is
+        // an `Err` here, once per search, before any code is scored (F04e).
+        context.check_finite()?;
+        Ok(context)
     }
 
     /// [`Self::score`] against a query already prepared by [`Self::prepare_query`].
@@ -217,7 +262,31 @@ impl TurboQuantizer {
         let qjl_term =
             self.qjl
                 .score_projected(&code.residual_sketch, &context.projected_query, mode)?;
-        Ok(polar_est + qjl_term)
+        combine(polar_est, qjl_term)
+    }
+
+    /// [`Self::score_projected`] for a context built by [`Self::prepare_query`] (finite
+    /// by construction) and the codes a store holds: each was produced by [`Self::encode`],
+    /// which only emits valid codes, so the per-code invariants are checked once at
+    /// ingestion and not again per query. A score that overflows is still an `Err`,
+    /// never a non-finite number (F04e).
+    pub(crate) fn score_projected_validated(
+        &self,
+        code: &TurboCode,
+        context: &TurboQueryContext,
+        mode: ScoreMode,
+    ) -> Result<f32> {
+        debug_assert_eq!(context.rotated_query.len(), self.dim);
+        debug_assert_eq!(context.projected_query.len(), self.projections);
+        let polar_est = self
+            .polar
+            .score_validated(&code.polar_code, &context.rotated_query)?;
+        let qjl_term = self.qjl.score_projected_validated(
+            &code.residual_sketch,
+            &context.projected_query,
+            mode,
+        )?;
+        combine(polar_est, qjl_term)
     }
 
     /// Estimate squared L2 distance.
@@ -225,7 +294,13 @@ impl TurboQuantizer {
         let ip = self.inner_product_estimate(code, query)?;
         let query_norm_sq: f32 = query.iter().map(|x| x * x).sum();
         let code_norm_sq: f32 = code.polar_code.radii.iter().map(|r| r * r).sum();
-        Ok((query_norm_sq + code_norm_sq - 2.0 * ip).max(0.0))
+        // The estimate can overflow even when `ip` did not (a huge query norm); it is
+        // checked before the clamp, which would otherwise turn a NaN into a 0 distance.
+        let estimate = query_norm_sq + code_norm_sq - 2.0 * ip;
+        if !estimate.is_finite() {
+            return Err(QuantError::NonFiniteScore);
+        }
+        Ok(estimate.max(0.0))
     }
 
     /// Decode to approximate reconstruction (PolarQuant component only).

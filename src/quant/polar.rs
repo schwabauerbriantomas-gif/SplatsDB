@@ -9,7 +9,7 @@
 //!
 //! License: MIT (adapted from github.com/RecursiveIntell/turbo-quant)
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::f32::consts::PI;
 use std::sync::OnceLock;
 
@@ -17,7 +17,7 @@ use super::error::{QuantError, Result};
 use super::rotation::StoredRotation;
 
 /// A compressed vector in polar form.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PolarCode {
     pub dim: usize,
     pub bits: u8,
@@ -25,6 +25,92 @@ pub struct PolarCode {
     pub radii: Vec<f32>,
     /// Quantized angle indices in [0, 2^bits).
     pub angle_indices: Vec<u16>,
+}
+
+impl<'de> Deserialize<'de> for PolarCode {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Repr {
+            dim: usize,
+            bits: u8,
+            radii: Vec<f32>,
+            angle_indices: Vec<u16>,
+        }
+        let repr = Repr::deserialize(deserializer)?;
+        // A hostile payload is rejected when it is read, by the same rules a quantizer
+        // applies to a code built by hand before scoring it (F04e).
+        if repr.dim == 0 || repr.dim % 2 != 0 {
+            return Err(serde::de::Error::custom(format!(
+                "malformed code: dim {} (must be non-zero and even)",
+                repr.dim
+            )));
+        }
+        if !(1..=16).contains(&repr.bits) {
+            return Err(serde::de::Error::custom(format!(
+                "malformed code: bits={} (no quantizer accepts it)",
+                repr.bits
+            )));
+        }
+        check_fields(&repr.radii, &repr.angle_indices, repr.bits, repr.dim / 2)
+            .map_err(serde::de::Error::custom)?;
+        Ok(PolarCode {
+            dim: repr.dim,
+            bits: repr.bits,
+            radii: repr.radii,
+            angle_indices: repr.angle_indices,
+        })
+    }
+}
+
+/// Every invariant of the two vectors of a code, checked before either is indexed or
+/// scored (F04e): exactly `pairs` entries in both, every radius finite and
+/// non-negative, and every angle index below the `2^bits` levels of its bit width.
+/// `bits` must be a width a quantizer accepts; the callers check that first.
+fn check_fields(
+    radii: &[f32],
+    angle_indices: &[u16],
+    bits: u8,
+    pairs: usize,
+) -> std::result::Result<(), String> {
+    if radii.len() != pairs {
+        return Err(format!("{} radii for {pairs} pairs", radii.len()));
+    }
+    if angle_indices.len() != pairs {
+        return Err(format!(
+            "{} angle indices for {pairs} pairs",
+            angle_indices.len()
+        ));
+    }
+    if let Some(pair) = radii.iter().position(|r| !r.is_finite() || *r < 0.0) {
+        return Err(format!(
+            "radius {} at pair {pair} (must be finite and non-negative)",
+            radii[pair]
+        ));
+    }
+    let levels = 1u32 << bits;
+    if let Some(pair) = angle_indices
+        .iter()
+        .position(|&index| u32::from(index) >= levels)
+    {
+        return Err(format!(
+            "angle index {} at pair {pair} (must be below {levels} at bits={bits})",
+            angle_indices[pair]
+        ));
+    }
+    Ok(())
+}
+
+/// A rotated or projected query that is not finite at some `index`: the query itself was
+/// finite, but the rotation or the projection overflowed f32. Rejected before any code
+/// is scored (F04e).
+pub(crate) fn check_finite(values: &[f32]) -> Result<()> {
+    match values.iter().position(|v| !v.is_finite()) {
+        Some(index) => Err(QuantError::NonFiniteQueryContext { index }),
+        None => Ok(()),
+    }
 }
 
 impl PolarCode {
@@ -73,11 +159,47 @@ impl PolarCode {
 }
 
 /// Encodes/decodes vectors using PolarQuant.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PolarQuantizer {
     dim: usize,
     bits: u8,
     rotation: StoredRotation,
+}
+
+impl<'de> Deserialize<'de> for PolarQuantizer {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Same wire fields as the derive this replaces.
+        #[derive(Deserialize)]
+        struct Repr {
+            dim: usize,
+            bits: u8,
+            rotation: StoredRotation,
+        }
+        let repr = Repr::deserialize(deserializer)?;
+        // `new` validates a configuration; a payload must not bypass it with a width that
+        // would overflow the `1 << bits` of the encoder, or a rotation of another size
+        // (F04e).
+        let valid = repr.dim != 0
+            && repr.dim.is_multiple_of(2)
+            && (1..=16).contains(&repr.bits)
+            && repr.rotation.dim() == repr.dim;
+        if !valid {
+            return Err(serde::de::Error::custom(format!(
+                "malformed quantizer: dim {}, bits {}, rotation dimension {}",
+                repr.dim,
+                repr.bits,
+                repr.rotation.dim()
+            )));
+        }
+        Ok(Self {
+            dim: repr.dim,
+            bits: repr.bits,
+            rotation: repr.rotation,
+        })
+    }
 }
 
 impl PolarQuantizer {
@@ -169,7 +291,9 @@ impl PolarQuantizer {
 
     /// Rotate a query once (`R·query`) so that many codes can be scored against it
     /// without repeating the O(d²) rotation per code (A02-F02). A NaN/±Inf query is
-    /// rejected here, before anything is ranked.
+    /// rejected here, before anything is ranked. The rotation of a finite query can
+    /// still overflow near `f32::MAX`: every consumer of the result rejects a non-finite
+    /// entry before scoring (`prepared_query`, `inner_product_estimate_rotated`).
     pub fn rotated_query(&self, query: &[f32]) -> Result<Vec<f32>> {
         if query.len() != self.dim {
             return Err(QuantError::DimensionMismatch {
@@ -182,6 +306,15 @@ impl PolarQuantizer {
         }
         let mut rotated = vec![0.0f32; self.dim];
         self.rotation.apply(query, &mut rotated)?;
+        Ok(rotated)
+    }
+
+    /// [`Self::rotated_query`] rejected if the rotation itself overflowed: the query
+    /// context a `QuantizedStore` search scores its codes against, validated once per
+    /// search instead of once per code (F04e).
+    pub(crate) fn prepared_query(&self, query: &[f32]) -> Result<Vec<f32>> {
+        let rotated = self.rotated_query(query)?;
+        check_finite(&rotated)?;
         Ok(rotated)
     }
 
@@ -203,24 +336,32 @@ impl PolarQuantizer {
             });
         }
         self.validate_code(code)?;
+        check_finite(rotated_query)?;
+        self.score_validated(code, rotated_query)
+    }
+
+    /// [`Self::inner_product_estimate_rotated`] for a code that passed
+    /// [`Self::validate_code`] and a rotated query that passed [`check_finite`]: the
+    /// per-code path of a `QuantizedStore` search. Every code of a store was produced by
+    /// [`Self::encode`], which only emits valid codes, so the invariants are checked once
+    /// at ingestion and not again per query; what is checked here is the one thing valid
+    /// inputs can still break -- a score that overflows -- and it is an `Err`, never a
+    /// non-finite number (F04e).
+    pub(crate) fn score_validated(&self, code: &PolarCode, rotated_query: &[f32]) -> Result<f32> {
         let pairs = self.dim / 2;
-        let trig = trig_table(self.bits);
+        // Every quantizer has 1..=16 bits and every index is below `2^bits`: the table
+        // of that width exists and holds the entry.
+        let trig = trig_table(self.bits).expect("a cos/sin table exists for every quantizer");
         let mut estimate = 0.0f32;
         for i in 0..pairs {
             let r = code.radii[i];
             let q_a = rotated_query[2 * i];
             let q_b = rotated_query[2 * i + 1];
-            let index = code.angle_indices[i];
-            let [cos, sin] = trig
-                .and_then(|table| table.get(index as usize).copied())
-                .unwrap_or_else(|| {
-                    // An index outside [0, 2^bits) (a malformed code is not rejected
-                    // before scoring) or a bit width without a table: the direct value,
-                    // never a new panic.
-                    let theta = PolarCode::dequantize_index(index, self.bits);
-                    [theta.cos(), theta.sin()]
-                });
+            let [cos, sin] = trig[code.angle_indices[i] as usize];
             estimate += r * (q_a * cos + q_b * sin);
+        }
+        if !estimate.is_finite() {
+            return Err(QuantError::NonFiniteScore);
         }
         Ok(estimate)
     }
@@ -238,7 +379,12 @@ impl PolarQuantizer {
         PolarCode::trig_table_bytes(self.bits)
     }
 
-    fn validate_code(&self, code: &PolarCode) -> Result<()> {
+    /// Every invariant a code must satisfy before any of its fields is indexed or
+    /// scored: the dimension and the bit width of this quantizer, then `check_fields` on
+    /// its vectors. Every public path that decodes or scores a code goes through here --
+    /// the fields are public, so a code built by hand never reaches an index unchecked
+    /// (F04e; until c2c6206 only the dimension and the bit width were compared).
+    pub(crate) fn validate_code(&self, code: &PolarCode) -> Result<()> {
         if code.dim != self.dim {
             return Err(QuantError::DimensionMismatch {
                 expected: self.dim,
@@ -251,7 +397,8 @@ impl PolarQuantizer {
                 code.bits, self.bits
             )));
         }
-        Ok(())
+        check_fields(&code.radii, &code.angle_indices, self.bits, self.dim / 2)
+            .map_err(QuantError::MalformedCode)
     }
 }
 
