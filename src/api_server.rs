@@ -2221,9 +2221,15 @@ fn refresh_dataset_snapshot(
     if n == 0 {
         *snapshot = None;
     } else if stale {
-        if let Some(mu) = s.get_mu() {
-            let dim = mu.ncols();
-            let data = mu.iter().copied().collect::<Vec<f32>>();
+        // F06a: ONE owned copy, taken from a view of the active rows, and the
+        // previous snapshot is dropped BEFORE the new one is allocated.
+        // Before, `get_mu()` copied the dataset and the collect copied it
+        // again, on top of the old snapshot: up to 3× ~30 MB resident at
+        // 10000×768.
+        if let Some(view) = s.mu_view() {
+            let dim = view.ncols();
+            *snapshot = None;
+            let data = view.iter().copied().collect::<Vec<f32>>();
             // get_alpha/get_kappa solo devuelven None con n_active==0 (caso
             // ya descartado arriba): los defaults son inalcanzables hoy.
             // Alineados a la init real del store (kappa: Array1::ones) para
