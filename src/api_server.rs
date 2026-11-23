@@ -188,8 +188,10 @@ pub struct AppState {
     /// Campo splat (celdas con radio) para /field-search exacto. None si no
     /// hay field/ persistido en el data-dir.
     pub field: Option<Arc<FieldData>>,
-    /// Tamaño del corpus que atiende /search: field.raw si hay field/ (los
-    /// ids de resultados son chunks), o el shard cargado (los ids son splats).
+    /// Filas del dataset que subió al fast path GPU en el arranque (la clave
+    /// `GpuIndexKey` lo coteja): los splats del shard, nunca los chunks de
+    /// field/ (ver `serve_corpus`). Sólo lo lee el fast path (feature cuda).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub corpus_n: usize,
     /// Directorio de datos del server (flag --data-dir). /recall lo usa para
     /// abrir {data_dir}/sidecar.db en mode=ro y loggear fires. None en tests.
@@ -897,24 +899,21 @@ async fn search_memories(
 
 /// Enriquece resultados con tópico (splat) y confianza espacial
 /// (1 − d/R del tópico). Solo llamado con scores de distancia L2 reales
-/// (no con gaussian rescore ni texto-hash). `squared` = score es d² (GPU).
+/// (no con gaussian rescore ni texto-hash). `squared` = score es d² (todas las rutas L2 de hoy).
+///
+/// Los ids de `/search` son SIEMPRE ids de splat —el espacio de la referencia
+/// CPU (`find_neighbors_fused`), del batch worker y de `/store`—, nunca ids
+/// de chunk de `field.raw` (ese es el contrato de `/field-search`). Antes el
+/// espacio se infería de `corpus_n`, que con field/ era siempre el del corpus
+/// de chunks: un id de splat se buscaba en `chunk_cluster` como si fuera un
+/// chunk y el tópico (y el radio de la confianza) eran los de OTRO splat.
 fn enrich_topics(state: &AppState, results: &mut [SearchResult], squared: bool) {
     let Some(field) = &state.field else {
         return;
     };
-    // Si el corpus activo ES field.raw, los ids del índice son chunks:
-    // topic = splat al que pertenece el chunk. Si el corpus son los splats
-    // (μ), el id ya es un tópico y la confianza mide qué tan cerca del
-    // centro de ese tópico cayó la query.
-    let ids_are_chunks = field.raw.nrows() == state.corpus_n;
     for r in results.iter_mut() {
-        let (c, radius) = if ids_are_chunks && r.index < field.chunk_cluster.len() {
-            let c = field.chunk_cluster[r.index] as usize;
-            (c, field.radii[c])
-        } else {
-            (r.index, field.radii.get(r.index).copied().unwrap_or(0.0))
-        };
-        r.topic = Some(c as u32);
+        let radius = field.radii.get(r.index).copied().unwrap_or(0.0);
+        r.topic = Some(r.index as u32);
         if radius > 0.0 {
             let dist = if squared {
                 r.score.max(0.0).sqrt()
@@ -2519,9 +2518,8 @@ fn is_loopback_addr(addr: &str) -> bool {
 /// `data_dir` (if present) into `store`, so `serve` boots with the vectors
 /// indexed by the CLI instead of an empty store and honours the CLI --dim
 /// flag instead of SplatsDBConfig::default() (issue #3); then the `field/`
-/// corpus for /search — si hay field/, el índice busca el corpus completo
-/// (field.raw — exacto sobre TODOS los chunks); si no, el shard cargado
-/// (splats/μ — en stores planos son los propios vectores).
+/// corpus for /field-search and for the topic/confidence of /search —
+/// /search itself always searches the shard's splats (F02d: `serve_corpus`).
 ///
 /// Extracted from `run_server` (repowise plan `refac4_829dc22e97478fcffcab`);
 /// messages and behavior identical. Returns the field corpus, if any.
@@ -2548,35 +2546,26 @@ fn load_serve_inputs(data_dir: &str, store: &mut SplatStore) -> anyhow::Result<O
     Ok(field_data)
 }
 
-/// Flat copy of the corpus `/search` serves: the `field/` chunks if the
-/// data-dir has a field, else the store's mu (splats/μ — in flat stores the
-/// vectors themselves). Returns `(row-major data, n, dim)`, `None` when
-/// empty.
-fn serve_corpus(
-    field_data: &Option<FieldData>,
-    store: &SplatStore,
-) -> Option<(Vec<f32>, usize, usize)> {
-    if let Some(f) = field_data {
-        let (n, d) = f.raw.dim();
-        let slice = f
-            .raw
-            .as_slice()
-            .map(<[f32]>::to_vec)
-            .unwrap_or_else(|| f.raw.iter().copied().collect());
-        Some((slice, n, d))
-    } else {
-        store.get_mu().and_then(|mu| {
-            if mu.nrows() == 0 || mu.ncols() == 0 {
-                return None;
-            }
-            let (n, d) = (mu.nrows(), mu.ncols());
-            let slice = mu
-                .as_slice()
-                .map(<[f32]>::to_vec)
-                .unwrap_or_else(|| mu.iter().copied().collect());
-            Some((slice, n, d))
-        })
+/// Flat copy of the corpus the startup GPU fast path of `/search` serves:
+/// the store's mu (splats/μ — in flat stores the vectors themselves), the
+/// SAME rows and id space as the CPU reference and the batch worker.
+///
+/// F02d: with a `field/` corpus this returned `field.raw` (chunks), so
+/// `serve --gpu` answered chunk ids until the first `/store` and splat ids
+/// from then on, while CPU and `rescore=gaussian` always answered splat
+/// ids. Chunk ids stay the contract of `/field-search`. Returns
+/// `(row-major data, n, dim)`, `None` when empty.
+fn serve_corpus(store: &SplatStore) -> Option<(Vec<f32>, usize, usize)> {
+    let mu = store.get_mu()?;
+    if mu.nrows() == 0 || mu.ncols() == 0 {
+        return None;
     }
+    let (n, d) = (mu.nrows(), mu.ncols());
+    let slice = mu
+        .as_slice()
+        .map(<[f32]>::to_vec)
+        .unwrap_or_else(|| mu.iter().copied().collect());
+    Some((slice, n, d))
 }
 
 pub async fn run_server(
@@ -2608,7 +2597,7 @@ pub async fn run_server(
     let _data_dir_lock = DataDirLock::acquire(std::path::Path::new(data_dir))?;
     let field_data = load_serve_inputs(data_dir, &mut store)?;
     #[cfg(not(feature = "cuda"))]
-    let corpus_n = serve_corpus(&field_data, &store).map(|c| c.1).unwrap_or(0);
+    let corpus_n = serve_corpus(&store).map(|c| c.1).unwrap_or(0);
 
     // ── Durabilidad: el shard "default" ya lo cargó load_serve_inputs. Se
     // abre el WAL, se re-aplica lo no compactado y queda listo para
@@ -2643,7 +2632,7 @@ pub async fn run_server(
     let (gpu_index, corpus_n) = if gpu_enabled {
         match (
             crate::gpu::cuda_kernel::GpuIndex::new(),
-            serve_corpus(&field_data, &store),
+            serve_corpus(&store),
         ) {
             (None, corpus) => {
                 eprintln!("[splatsdb] serve: GPU no disponible (--gpu ignorado); búsqueda en CPU");
@@ -2674,10 +2663,7 @@ pub async fn run_server(
             }
         }
     } else {
-        (
-            None,
-            serve_corpus(&field_data, &store).map(|c| c.1).unwrap_or(0),
-        )
+        (None, serve_corpus(&store).map(|c| c.1).unwrap_or(0))
     };
 
     let store = Arc::new(Mutex::new(store));
