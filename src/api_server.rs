@@ -2176,20 +2176,78 @@ fn gpu_batch_path(
         .as_ref()
         .ok_or_else(|| "store is empty".to_string())?;
 
-    let n_queries = queries.len();
-
     let (gauss_out, l2_out) = split_and_run_gpu_kernels(snap, queries, ks, rescore)?;
 
-    // ── Reassemble rows in original request order.
-    let mut per_query = Vec::with_capacity(n_queries);
+    // ── Reassemble rows in original request order (shape-validated).
+    let per_query = reassemble_gpu_rows(snap.n, ks, rescore, gauss_out, l2_out)?;
+
+    // Feed access frequencies for tiering under a second brief lock.
+    let touched: Vec<usize> = per_query
+        .iter()
+        .flat_map(|r| r.iter().map(|s| s.index))
+        .collect();
+    store.blocking_lock().touch(&touched);
+
+    Ok(per_query)
+}
+
+/// Validate the GPU kernel outputs against the batch they were requested
+/// for and reassemble one row per query, in request order.
+///
+/// `gpu::batch_search_cached` answers an empty `Vec` when it declines the
+/// shape, and a kernel may return fewer — or shorter — rows than requested.
+/// Indexing `l2_out[l]` on such an answer panicked inside the batch worker
+/// (JoinError → 500 for the whole batch; an abort under `panic=abort`), and
+/// `zip` over mismatched idx/dist arrays silently truncated a row. Any shape
+/// violation is a controlled `Err`: never 200 with truncated or fabricated
+/// results. Valid rows keep exactly the previous mapping.
+fn reassemble_gpu_rows(
+    n: usize,
+    ks: &[usize],
+    rescore: &[bool],
+    gauss_out: Vec<Vec<(usize, f32)>>,
+    l2_out: Vec<(Vec<usize>, Vec<f32>)>,
+) -> Result<Vec<Vec<SearchResult>>, String> {
+    let n_gauss = rescore.iter().filter(|&&r| r).count();
+    let n_l2 = rescore.len() - n_gauss;
+    if ks.len() != rescore.len() {
+        return Err(format!(
+            "gpu batch: {} k values for {} queries",
+            ks.len(),
+            rescore.len()
+        ));
+    }
+    if gauss_out.len() != n_gauss {
+        return Err(format!(
+            "gpu batch: gaussian kernel returned {} rows for {n_gauss} queries",
+            gauss_out.len()
+        ));
+    }
+    if l2_out.len() != n_l2 {
+        return Err(format!(
+            "gpu batch: l2 kernel returned {} rows for {n_l2} queries",
+            l2_out.len()
+        ));
+    }
+    for (q, (idxs, dists)) in l2_out.iter().enumerate() {
+        if idxs.len() != dists.len() {
+            return Err(format!(
+                "gpu batch: l2 row {q} has {} indices for {} distances",
+                idxs.len(),
+                dists.len()
+            ));
+        }
+    }
+
+    let mut per_query = Vec::with_capacity(ks.len());
     let mut g = 0usize; // cursor into gauss_out
     let mut l = 0usize; // cursor into l2_out
-    for (i, (&k, &want_rescore)) in ks.iter().zip(rescore.iter()).enumerate() {
+    for (&k, &want_rescore) in ks.iter().zip(rescore.iter()) {
         let row: Vec<SearchResult> = if want_rescore {
             let src = &gauss_out[g];
             g += 1;
             src.iter()
-                .filter(|&&(ix, _)| ix < snap.n)
+                .filter(|&&(ix, _)| ix < n)
                 .take(k)
                 .map(|&(ix, score)| SearchResult {
                     index: ix,
@@ -2205,7 +2263,7 @@ fn gpu_batch_path(
             l += 1;
             idxs.iter()
                 .zip(dists.iter())
-                .filter(|(&ix, _)| ix < snap.n)
+                .filter(|(&ix, _)| ix < n)
                 .take(k)
                 .map(|(&ix, &d)| SearchResult {
                     index: ix,
@@ -2223,16 +2281,7 @@ fn gpu_batch_path(
                 .collect()
         };
         per_query.push(row);
-        let _ = i; // index kept for clarity in debug
     }
-
-    // Feed access frequencies for tiering under a second brief lock.
-    let touched: Vec<usize> = per_query
-        .iter()
-        .flat_map(|r| r.iter().map(|s| s.index))
-        .collect();
-    store.blocking_lock().touch(&touched);
-
     Ok(per_query)
 }
 
@@ -3916,6 +3965,99 @@ mod tests {
                 "store #{i} is invisible to /search (stale snapshot): {body}"
             );
         }
+    }
+
+    // ─── GPU batch shape contract (F03a/F02b borders) ─────────────────────
+
+    fn row_key(row: &[SearchResult]) -> Vec<(usize, f32)> {
+        row.iter().map(|r| (r.index, r.score)).collect()
+    }
+
+    fn err_of(r: Result<Vec<Vec<SearchResult>>, String>) -> String {
+        match r {
+            Ok(rows) => panic!("expected a shape error, got {} rows", rows.len()),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn gpu_batch_reassembly_returns_every_query_in_request_order() {
+        let rows = reassemble_gpu_rows(
+            4,
+            &[2, 1, 3],
+            &[false, true, false],
+            vec![vec![(1, 0.9), (0, 0.5)]],
+            vec![
+                (vec![2, 0], vec![0.1, 0.4]),
+                (vec![3, 9, 1], vec![0.0, 0.0, 0.2]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(row_key(&rows[0]), vec![(2, 0.1), (0, 0.4)]); // take(k=2)
+        assert_eq!(row_key(&rows[1]), vec![(1, 0.9)]); // take(k=1)
+        assert_eq!(row_key(&rows[2]), vec![(3, 0.0), (1, 0.2)]); // index 9 >= n dropped
+    }
+
+    #[test]
+    fn gpu_batch_reassembly_rejects_a_declined_l2_kernel_instead_of_panicking() {
+        // batch_search_cached answered Vec::new() for 2 l2 queries.
+        let err = err_of(reassemble_gpu_rows(
+            4,
+            &[2, 2],
+            &[false, false],
+            vec![],
+            vec![],
+        ));
+        assert_eq!(err, "gpu batch: l2 kernel returned 0 rows for 2 queries");
+        // ... and a partial answer (1 row for 2 queries).
+        let err = err_of(reassemble_gpu_rows(
+            4,
+            &[2, 2],
+            &[false, false],
+            vec![],
+            vec![(vec![1], vec![0.5])],
+        ));
+        assert_eq!(err, "gpu batch: l2 kernel returned 1 rows for 2 queries");
+    }
+
+    #[test]
+    fn gpu_batch_reassembly_rejects_a_declined_gaussian_kernel() {
+        let err = err_of(reassemble_gpu_rows(
+            4,
+            &[1, 1],
+            &[false, true],
+            vec![],
+            vec![(vec![1], vec![0.5])],
+        ));
+        assert_eq!(
+            err,
+            "gpu batch: gaussian kernel returned 0 rows for 1 queries"
+        );
+    }
+
+    #[test]
+    fn gpu_batch_reassembly_rejects_mismatched_idx_and_dist_lengths() {
+        let err = err_of(reassemble_gpu_rows(
+            4,
+            &[2],
+            &[false],
+            vec![],
+            vec![(vec![1, 2], vec![0.5])],
+        ));
+        assert_eq!(err, "gpu batch: l2 row 0 has 2 indices for 1 distances");
+    }
+
+    #[test]
+    fn gpu_batch_reassembly_rejects_k_and_query_counts_that_disagree() {
+        let err = err_of(reassemble_gpu_rows(
+            4,
+            &[2],
+            &[false, false],
+            vec![],
+            vec![],
+        ));
+        assert_eq!(err, "gpu batch: 1 k values for 2 queries");
     }
 
     // ─── Auth (A05-F10) ───────────────────────────────────────────────────
