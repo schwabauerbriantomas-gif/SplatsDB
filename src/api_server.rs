@@ -51,6 +51,9 @@ use tower_http::cors::CorsLayer;
 use crate::config::SplatsDBConfig;
 use crate::splats::SplatStore;
 use crate::storage::persistence::{SplatsDBPersistence, StorageBackend};
+use crate::storage::shard_guard::{
+    fingerprint, read_wal_base, write_wal_base, DataDirLock, WalBase, WAL_BASE_FILE,
+};
 use crate::storage::wal::WriteAheadLog;
 
 // ─── Security constants ──────────────────────────────────
@@ -106,28 +109,50 @@ pub struct AppState {
     pub durability: Option<Arc<Durability>>,
 }
 
-/// Durabilidad del `serve` cuando hay --data-dir: cada /store agregado se
-/// escribe en un WAL append-only (bajo el lock del store, así el orden del
-/// WAL == orden de índices y el replay reconstruye el dataset idéntico), y
-/// cada COMPACT_EVERY stores — y en el shutdown — se persiste el shard
-/// "default" completo y se trunca el WAL. Un crash de proceso pierde a lo
-/// sumo los últimos stores bufferados, no el dataset entero.
+/// Durabilidad del `serve` con --data-dir: cada /store aceptado se escribe
+/// en un WAL append-only (bajo el lock del store, así el orden del WAL ==
+/// orden de índices y el replay reconstruye el dataset idéntico), y cada
+/// COMPACT_EVERY stores — y en el shutdown — se persiste el shard
+/// "default" completo y se trunca el WAL.
+///
+/// Contrato explícito de durabilidad (dos niveles, nunca mezclados):
+/// - **aceptado**: la entrada llegó al archivo del WAL (`log_store` → Ok).
+///   Sobrevive a un crash del proceso; `/store` responde 200 con
+///   `durable:false`.
+/// - **duradero**: además `sync_all` del WAL terminó después de esa entrada
+///   (cada CHECKPOINT_EVERY, al compactar o al apagar). Recién entonces
+///   `/store` y `/status` reportan `durable:true`.
 pub struct Durability {
     wal: WriteAheadLog,
     persist: SplatsDBPersistence,
+    /// Sidecar `wal/store.wal.base` de este data-dir.
+    base_path: std::path::PathBuf,
+    /// Shard "default" contra el que abrió esta generación del WAL.
+    /// `compact` se niega a sobrescribir el shard si en disco ya no es este
+    /// (lost update, A03-F12).
+    base: std::sync::Mutex<WalBase>,
+    /// Entradas "store" del WAL que el replay NO pudo aplicar: su única
+    /// copia. Mientras haya, `compact` no trunca el WAL.
+    unapplied: std::sync::Mutex<Vec<u64>>,
+    last_compact_error: std::sync::Mutex<Option<String>>,
     /// Último LSN asignado a un "store" (fetch_max: monotónico).
     last_lsn: AtomicU64,
-    /// Stores loggeados desde la última compactación.
+    /// Stores aceptados que todavía no pasaron por `sync_all`.
+    pending: AtomicU64,
+    /// Stores loggeados desde el arranque.
     since_compact: AtomicUsize,
 }
 
 impl Durability {
     /// Stores entre compactaciones (persistir shard + truncar WAL).
     const COMPACT_EVERY: usize = 1000;
-    /// Stores entre checkpoints del WAL (flush + fsync — protege contra
-    /// corte de luz; el flush por store ya protege contra crash de proceso).
+    /// Stores entre `sync_all` del WAL (group commit). No hay fsync por
+    /// operación: hasta CHECKPOINT_EVERY-1 stores aceptados pueden ser
+    /// todavía `durable:false`.
     const CHECKPOINT_EVERY: u32 = 32;
 
+    /// Abre el WAL de `data_dir`. Devuelve `Err` si el WAL no se puede abrir
+    /// ni leer, o si el shard cambió debajo de un WAL con stores sin compactar.
     fn open(data_dir: &str) -> anyhow::Result<Self> {
         let persist = SplatsDBPersistence::with_backend(
             data_dir,
@@ -135,19 +160,74 @@ impl Durability {
             false, // WAL propio: {data_dir}/wal/store.wal, no el interno del persistence
         )
         .map_err(|e| anyhow::anyhow!("persistence init falló: {e}"))?;
+        let shard_path = Self::shard_path(&persist)?;
+        let current = fingerprint(&shard_path)?;
+        let base_path = std::path::Path::new(data_dir)
+            .join("wal")
+            .join(WAL_BASE_FILE);
         // sync_interval=1: flush del WAL en CADA store (page cache: un kill
         // -9 no lo pierde; el fsync real viene con CHECKPOINT_EVERY).
         let wal = WriteAheadLog::new(&format!("{data_dir}/wal/store.wal"), 1)?;
+        let pending = Self::count_stores(&wal)?;
+        // El replay deduplica por `idx` suponiendo que el shard en disco es
+        // el mismo contra el que se escribió el WAL. Si cambió (la CLI u
+        // otro proceso lo reescribió con entradas sin compactar) no se
+        // adivina cuáles ya están: fail-closed.
+        if let Some(recorded) = read_wal_base(&base_path)? {
+            if recorded.shard != current && pending > 0 {
+                anyhow::bail!(
+                    "shard 'default' de {data_dir} cambió en disco mientras el WAL tenía {pending} \
+                     store(s) sin compactar: replay por idx no es seguro. Restaurá el shard contra \
+                     el que se escribió el WAL, o respaldá y reconciliá wal/store.wal a mano \
+                     (borrar wal/store.wal.base acepta el replay por idx bajo tu propio riesgo)"
+                );
+            }
+        }
+        write_wal_base(&base_path, &WalBase { shard: current })?;
+        // Lo que haya en el WAL queda fsyncado antes de aceptar tráfico.
+        wal.checkpoint()?;
         Ok(Self {
             wal,
             persist,
+            base_path,
+            base: std::sync::Mutex::new(WalBase { shard: current }),
+            unapplied: std::sync::Mutex::new(Vec::new()),
+            last_compact_error: std::sync::Mutex::new(None),
             last_lsn: AtomicU64::new(0),
+            pending: AtomicU64::new(0),
             since_compact: AtomicUsize::new(0),
         })
     }
 
+    /// `data/vectors/default.bin` del data-dir (mismo layout que
+    /// `SplatsDBPersistence::save_vectors`).
+    fn shard_path(persist: &SplatsDBPersistence) -> std::io::Result<std::path::PathBuf> {
+        Ok(persist
+            .storage_path
+            .join("data")
+            .join("vectors")
+            .join("default.bin"))
+    }
+
+    fn count_stores(wal: &WriteAheadLog) -> std::io::Result<usize> {
+        Ok(wal
+            .recover()?
+            .iter()
+            .filter(|e| e.operation == "store")
+            .count())
+    }
+
+    fn lock<'a, T>(
+        slot: &'a std::sync::Mutex<T>,
+        what: &str,
+    ) -> std::io::Result<std::sync::MutexGuard<'a, T>> {
+        slot.lock()
+            .map_err(|_| std::io::Error::other(format!("lock de {what} envenenado")))
+    }
+
     /// Loggea un store YA insertado en el store en memoria. DEBE llamarse
-    /// con el lock del store tomado (ver orden WAL == orden índices).
+    /// con el lock del store tomado (ver orden WAL == orden de índices).
+    /// `Ok` = aceptado: la entrada llegó al archivo del WAL.
     fn log_store(
         &self,
         id: &str,
@@ -163,37 +243,97 @@ impl Durability {
         });
         let lsn = self.wal.log_operation("store", data)?;
         self.last_lsn.fetch_max(lsn, Ordering::SeqCst);
+        self.pending.fetch_add(1, Ordering::SeqCst);
         let n = self.since_compact.fetch_add(1, Ordering::SeqCst) + 1;
         if (n as u32).is_multiple_of(Self::CHECKPOINT_EVERY) {
-            self.wal.checkpoint()?;
+            self.checkpoint_now()?;
         }
         Ok(())
+    }
+
+    /// `sync_all` del WAL: todo lo aceptado hasta acá pasa a ser duradero.
+    fn checkpoint_now(&self) -> std::io::Result<()> {
+        self.wal.checkpoint()?;
+        self.pending.store(0, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// `true` sii todo lo aceptado ya pasó por `sync_all`.
+    fn is_durable(&self) -> bool {
+        self.wal_pending() == 0
+    }
+
+    /// Entradas aceptadas que todavía no pasaron por `sync_all`.
+    fn wal_pending(&self) -> u64 {
+        self.pending.load(Ordering::SeqCst)
     }
 
     fn stores_since_compact(&self) -> usize {
         self.since_compact.load(Ordering::SeqCst)
     }
 
-    /// Flush + fsync del WAL. Solo tests: simular un crash determinista
-    /// (el flush por store de `log_store` ya cubre el caso real).
+    fn last_compact_error(&self) -> Option<String> {
+        self.last_compact_error.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Flush + fsync del WAL. Solo tests.
     #[cfg(test)]
     fn flush(&self) -> std::io::Result<()> {
-        self.wal.checkpoint()
+        self.checkpoint_now()
     }
 
     /// Persiste el shard "default" con el estado ACTUAL del store y trunca
     /// el WAL (todo lo loggeado ya quedó en el shard). Llamar con el lock
     /// del store tomado. Devuelve la cantidad de splats persistidos.
     ///
-    /// Orden shard→WAL: el shard se escribe con `atomic_write` (fsync del
-    /// tmp → rename → fsync del directorio) y recién cuando eso terminó se
-    /// trunca el WAL; si el shard falla, el WAL sigue intacto.
-    ///
-    /// Con el store vacío NO trunca: si el WAL todavía tiene entradas
-    /// "store" son la única copia de datos no recuperados (p.ej. salteados
-    /// por el replay) y se conservan — devuelve `Err` para que se vea.
+    /// Se niega (Err, WAL intacto) si el shard en disco ya no es el que esta
+    /// generación del WAL vio al arrancar (lost update) o si el WAL todavía
+    /// tiene entradas que no se pudieron aplicar.
     fn compact(&self, store: &SplatStore) -> std::io::Result<usize> {
+        let outcome = self.compact_checked(store);
+        if let Err(e) = &outcome {
+            if let Ok(mut slot) = self.last_compact_error.lock() {
+                *slot = Some(e.to_string());
+            }
+        }
+        outcome
+    }
+
+    fn compact_checked(&self, store: &SplatStore) -> std::io::Result<usize> {
+        // (1) Lost update (A03-F12): el shard en disco tiene que seguir
+        // siendo el que esta generación del WAL vio al arrancar.
+        let shard_path = Self::shard_path(&self.persist)?;
+        let current = fingerprint(&shard_path)?;
+        let base = *Self::lock(&self.base, "base de WAL")?;
+        let pending = Self::count_stores(&self.wal)?;
+        if current != base.shard {
+            return Err(std::io::Error::other(format!(
+                "shard 'default' ({}) cambió en disco desde el arranque de este serve: NO se \
+                 sobrescribe con el estado stale en memoria; {pending} store(s) aceptados se \
+                 conservan en wal/store.wal",
+                shard_path.display()
+            )));
+        }
+        // (2) Entradas del WAL que el replay no pudo aplicar son la única
+        // copia de esos datos: no se trunca el WAL mientras existan.
+        let unapplied = Self::lock(&self.unapplied, "unapplied")?.clone();
         let n = store.n_active();
+        if n > 0 && !unapplied.is_empty() {
+            return Err(std::io::Error::other(format!(
+                "{} entrada(s) 'store' del WAL (lsn {:?}) no se aplicaron al store: no se trunca \
+                 el WAL, se conserva",
+                unapplied.len(),
+                &unapplied[..unapplied.len().min(8)]
+            )));
+        }
+        //
+        // Orden shard→WAL: el shard se escribe con `atomic_write` (fsync del
+        // tmp → rename → fsync del directorio) y recién cuando eso terminó se
+        // trunca el WAL; si el shard falla, el WAL sigue intacto.
+        //
+        // Con el store vacío NO trunca: si el WAL todavía tiene entradas
+        // "store" son la única copia de datos no recuperados (p.ej. salteados
+        // por el replay) y se conservan — devuelve `Err` para que se vea.
         if n > 0 {
             let Some(mu) = store.get_mu() else {
                 return Err(std::io::Error::other(
@@ -202,12 +342,7 @@ impl Durability {
             };
             self.persist.save_vectors(&mu, "default")?;
         } else {
-            let unrecovered = self
-                .wal
-                .recover()?
-                .iter()
-                .filter(|e| e.operation == "store")
-                .count();
+            let unrecovered = Self::count_stores(&self.wal)?;
             if unrecovered > 0 {
                 return Err(std::io::Error::other(format!(
                     "store vacío (n_active=0) con {unrecovered} entrada(s) 'store' aún en el WAL: \
@@ -217,12 +352,29 @@ impl Durability {
         }
         let before = self.last_lsn.load(Ordering::SeqCst).saturating_add(1);
         self.wal.truncate(before)?;
+        // (3) Nueva generación: el WAL arranca vacío contra el shard recién
+        // escrito. El sidecar se reescribe DESPUÉS del truncate: si el
+        // proceso muere entre ambos, el WAL ya está vacío y un sidecar viejo
+        // no afirma nada (se refresca en el próximo open).
+        let fresh = WalBase {
+            shard: fingerprint(&shard_path)?,
+        };
+        *Self::lock(&self.base, "base de WAL")? = fresh;
+        self.last_lsn.store(0, Ordering::SeqCst);
+        self.pending.store(0, Ordering::SeqCst);
+        if let Err(e) = write_wal_base(&self.base_path, &fresh) {
+            eprintln!(
+                "[splatsdb] WAL: no se pudo actualizar {}: {e}",
+                self.base_path.display()
+            );
+        }
         Ok(n)
     }
 }
 
-/// Al dropear (panic, exit() sin TERM, tests): flush del WAL — lo mismo que
-/// un kill -9 respeta vía el flush por store de `log_store`.
+/// Al dropear (panic, exit() sin TERM, tests): flush + fsync del WAL, así lo
+/// aceptado sin compactar queda duradero en el WAL aunque el compact del
+/// shutdown se haya negado (lost update) o fallado.
 impl Drop for Durability {
     fn drop(&mut self) {
         let _ = self.wal.checkpoint();
@@ -2069,21 +2221,27 @@ fn is_loopback_addr(addr: &str) -> bool {
 ///
 /// Extracted from `run_server` (repowise plan `refac4_829dc22e97478fcffcab`);
 /// messages and behavior identical. Returns the field corpus, if any.
-fn load_serve_inputs(data_dir: &str, store: &mut SplatStore) -> Option<FieldData> {
+fn load_serve_inputs(data_dir: &str, store: &mut SplatStore) -> anyhow::Result<Option<FieldData>> {
     match load_default_shard(store, data_dir) {
         Ok(n) if n > 0 => eprintln!(
             "[splatsdb] serve: loaded {n} vectors (dim {}) from {data_dir}",
             store.get_statistics().embedding_dim
         ),
         Ok(_) => eprintln!("[splatsdb] serve: no existing data in {data_dir}, starting empty"),
-        Err(e) => eprintln!("[splatsdb] serve: failed to load {data_dir}: {e}"),
+        // Fail-closed (A03-F06): seguir con un store vacío haría que el
+        // compact del shutdown reemplazara el shard existente por un
+        // subconjunto (sólo lo que traje el WAL) o por un default.bin vacío.
+        Err(e) => anyhow::bail!(
+            "serve: fail-closed, el shard 'default' de {data_dir} no se puede cargar \
+             (nada se modificó en disco): {e}"
+        ),
     }
 
     let field_data = load_field(data_dir);
     if field_data.is_some() {
         eprintln!("[splatsdb] serve: campo splat cargado (/field-search disponible)");
     }
-    field_data
+    Ok(field_data)
 }
 
 pub async fn run_server(
@@ -2097,7 +2255,13 @@ pub async fn run_server(
     let hnsw_on = config.enable_hnsw;
     let mut store = SplatStore::new(config);
 
-    let field_data = load_serve_inputs(data_dir, &mut store);
+    // Fail-closed (A03-F12): lock exclusivo del data-dir por toda la vida del
+    // serve, para que dos `serve` no reescriban el shard uno encima del otro.
+    // Es un flock del kernel: muere con el proceso, así que un lockfile viejo
+    // nunca bloquea.
+    std::fs::create_dir_all(data_dir)?;
+    let _data_dir_lock = DataDirLock::acquire(std::path::Path::new(data_dir))?;
+    let field_data = load_serve_inputs(data_dir, &mut store)?;
     let corpus: Option<(Vec<f32>, usize, usize)> = if let Some(f) = &field_data {
         let (n, d) = f.raw.dim();
         let slice = f
@@ -2157,29 +2321,27 @@ pub async fn run_server(
     // ── Durabilidad: el shard "default" ya lo cargó load_serve_inputs. Se
     // abre el WAL, se re-aplica lo no compactado y queda listo para
     // persistir por chunks (COMPACT_EVERY) y en el shutdown.
-    let durability = match Durability::open(data_dir) {
+    //
+    // Fail-closed (A03-F01): con --data-dir un WAL que no se puede abrir ni
+    // replayear ABORTA el arranque. Arrancar "sin durabilidad" devolvería
+    // 200 `stored` sobre un store que se pierde al salir.
+    let (durability, next_id_seed) = match Durability::open(data_dir) {
         Ok(d) => match replay_wal(&mut store, &d) {
             Ok((n, max_auto)) => {
                 if n > 0 {
                     eprintln!("[splatsdb] WAL replay: {n} stores re-aplicados desde el WAL");
                 }
-                Some((Arc::new(d), max_auto))
+                (Some(Arc::new(d)), max_auto)
             }
-            Err(e) => {
-                eprintln!("[splatsdb] WAL replay falló (arrancando sin replay): {e}");
-                None
-            }
+            Err(e) => anyhow::bail!(
+                "serve: fail-closed, el WAL de {data_dir} no se pudo replayear (nada se acepta): {e}"
+            ),
         },
-        Err(e) => {
-            eprintln!("[splatsdb] durabilidad desactivada: {e}");
-            None
-        }
+        Err(e) => anyhow::bail!(
+            "serve: fail-closed, la durabilidad de {data_dir} no está disponible; no se arranca un \
+             server efímero sobre un data-dir: {e}"
+        ),
     };
-    let next_id_seed = durability
-        .as_ref()
-        .map(|(_, max_auto)| *max_auto)
-        .unwrap_or(0);
-    let durability = durability.map(|(d, _)| d);
 
     let store = Arc::new(Mutex::new(store));
     let (batch_tx, batch_rx) = mpsc::channel(BATCH_CHANNEL_CAP);
@@ -2228,20 +2390,41 @@ pub async fn run_server(
     // dataset entero desde disco.
     let shutdown_store = store.clone();
     let shutdown_durability = durability.clone();
-    Ok(axum::serve(listener, app)
+    let shutdown_result: Arc<std::sync::Mutex<Option<Result<usize, String>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let shutdown_slot = shutdown_result.clone();
+    axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             wait_shutdown_signal().await;
-            if let Some(d) = shutdown_durability.as_ref() {
+            let outcome = if let Some(d) = shutdown_durability.as_ref() {
                 let store = shutdown_store.lock().await;
-                match d.compact(&store) {
-                    Ok(n) => eprintln!(
-                        "[splatsdb] shutdown: shard 'default' persistido ({n} splats), WAL truncado"
-                    ),
-                    Err(e) => eprintln!("[splatsdb] shutdown: compact falló: {e}"),
-                }
+                Some(d.compact(&store).map_err(|e| e.to_string()))
+            } else {
+                None
+            };
+            if let Ok(mut slot) = shutdown_slot.lock() {
+                *slot = outcome;
             }
         })
-        .await?)
+        .await?;
+    match shutdown_result.lock().ok().and_then(|g| g.clone()) {
+        Some(Ok(n)) => {
+            eprintln!("[splatsdb] shutdown: shard 'default' persistido ({n} splats), WAL truncado")
+        }
+        Some(Err(e)) => {
+            // Lo aceptado sigue en el WAL (fsync abajo): no se pierde, pero el
+            // shard NO se actualizó → el proceso no termina con exit 0.
+            if let Some(d) = durability.as_ref() {
+                let _ = d.checkpoint_now();
+            }
+            anyhow::bail!(
+                "shutdown: compact falló, el shard 'default' NO se actualizó (los stores aceptados \
+                 quedan en wal/store.wal): {e}"
+            );
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 /// Bloquea hasta SIGINT o SIGTERM (shutdown graceful del serve).
@@ -2276,6 +2459,7 @@ fn replay_wal(store: &mut SplatStore, d: &Durability) -> anyhow::Result<(usize, 
     let shard_n = store.n_active();
     let mut applied = 0usize;
     let mut max_auto = 0usize;
+    let mut unapplied = Vec::new();
     for e in entries {
         if e.operation != "store" {
             continue;
@@ -2291,6 +2475,7 @@ fn replay_wal(store: &mut SplatStore, d: &Durability) -> anyhow::Result<(usize, 
         }
         let Some(vals) = e.data.get("vector").and_then(|v| v.as_array()) else {
             eprintln!("[splatsdb] WAL: entrada {} sin vector, salteada", e.lsn);
+            unapplied.push(e.lsn);
             continue;
         };
         let vec: Vec<f32> = vals
@@ -2304,18 +2489,31 @@ fn replay_wal(store: &mut SplatStore, d: &Durability) -> anyhow::Result<(usize, 
                 e.lsn,
                 vec.len()
             );
+            unapplied.push(e.lsn);
             continue;
         }
         let Ok(arr) = Array2::from_shape_vec((1, dim), vec) else {
+            unapplied.push(e.lsn);
             continue;
         };
         if store.add_splat(&arr) {
             store.hnsw_sync_incremental();
             applied += 1;
+        } else {
+            eprintln!(
+                "[splatsdb] WAL: entrada {} no entra al store (capacidad), salteada",
+                e.lsn
+            );
+            unapplied.push(e.lsn);
         }
         if let Some(a) = e.data.get("auto_id").and_then(|v| v.as_u64()) {
             max_auto = max_auto.max(a as usize + 1);
         }
+    }
+    // Las entradas no aplicadas son la única copia de esos datos: `compact`
+    // no trunca el WAL mientras existan (extiende A03-F09 a n_active > 0).
+    if let Ok(mut slot) = d.unapplied.lock() {
+        slot.extend(unapplied);
     }
     Ok((applied, max_auto))
 }
@@ -3554,5 +3752,100 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    // ── F02b: ciclo de vida storage ───────────────────────────
+
+    /// Data-dir scratch único (TMPDIR).
+    fn f02b_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "splatdb-f02b-unit-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn f02b_compact_refuses_to_overwrite_a_shard_changed_outside_the_server() {
+        let dir = f02b_dir("guard");
+        let persist = SplatsDBPersistence::new(dir.to_str().unwrap(), false).unwrap();
+        let original = Array2::from_shape_fn((3, 32), |(i, j)| (i * 32 + j) as f32);
+        persist.save_vectors(&original, "default").unwrap();
+        // mismo orden que run_server: shard -> WAL -> replay
+        let mut store = SplatStore::new(test_config());
+        load_default_shard(&mut store, dir.to_str().unwrap()).unwrap();
+        let d = Durability::open(dir.to_str().unwrap()).unwrap();
+        replay_wal(&mut store, &d).unwrap();
+
+        // mutación externa válida del shard mientras el server corre
+        let external = Array2::from_shape_fn((5, 32), |(i, j)| 100.0 + (i * 32 + j) as f32);
+        persist.save_vectors(&external, "default").unwrap();
+        let shard = dir.join("data").join("vectors").join("default.bin");
+        let external_bytes = std::fs::read(&shard).unwrap();
+
+        // un store aceptado y el compact del shutdown
+        d.log_store("mem_0", Some(0), 3, &[0.5f32; 32]).unwrap();
+        let err = d.compact(&store).err().expect("compact must refuse");
+        assert!(err.to_string().contains("cambió en disco"), "{err}");
+        assert_eq!(
+            std::fs::read(&shard).unwrap(),
+            external_bytes,
+            "the external shard must survive byte for byte"
+        );
+        assert_eq!(
+            d.wal
+                .recover()
+                .unwrap()
+                .iter()
+                .filter(|e| e.operation == "store")
+                .count(),
+            1,
+            "the accepted store must stay in the WAL"
+        );
+
+        // reapertura sobre ese data-dir: fail-closed, no se adivina por idx
+        let err = Durability::open(dir.to_str().unwrap())
+            .err()
+            .expect("reopen must fail closed");
+        assert!(err.to_string().contains("cambió en disco"), "{err}");
+        assert_eq!(std::fs::read(&shard).unwrap(), external_bytes);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn f02b_compact_keeps_the_wal_while_entries_could_not_be_applied() {
+        let dir = f02b_dir("unapplied");
+        let d = Durability::open(dir.to_str().unwrap()).unwrap();
+        // una entrada cuya dimensión no coincide con el store no se puede aplicar
+        d.log_store("wide", None, 0, &[0.25f32; 64]).unwrap();
+        let mut store = SplatStore::new(test_config());
+        let (applied, _) = replay_wal(&mut store, &d).unwrap();
+        assert_eq!(applied, 0);
+        // una entrada aplicable posterior y un store no vacío
+        d.log_store("ok", None, 0, &[0.75f32; 32]).unwrap();
+        assert!(store.add_splat(&Array2::from_shape_fn((1, 32), |(_, j)| j as f32)));
+        let err = d
+            .compact(&store)
+            .err()
+            .expect("compact must not truncate the WAL");
+        assert!(err.to_string().contains("no se aplicaron"), "{err}");
+        let ops: Vec<String> = d
+            .wal
+            .recover()
+            .unwrap()
+            .iter()
+            .map(|e| e.operation.clone())
+            .collect();
+        assert_eq!(
+            ops.iter().filter(|o| *o == "store").count(),
+            2,
+            "WAL untouched, operations: {ops:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
