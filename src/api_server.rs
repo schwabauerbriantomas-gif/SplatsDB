@@ -184,6 +184,14 @@ impl Durability {
     /// Persiste el shard "default" con el estado ACTUAL del store y trunca
     /// el WAL (todo lo loggeado ya quedó en el shard). Llamar con el lock
     /// del store tomado. Devuelve la cantidad de splats persistidos.
+    ///
+    /// Orden shard→WAL: el shard se escribe con `atomic_write` (fsync del
+    /// tmp → rename → fsync del directorio) y recién cuando eso terminó se
+    /// trunca el WAL; si el shard falla, el WAL sigue intacto.
+    ///
+    /// Con el store vacío NO trunca: si el WAL todavía tiene entradas
+    /// "store" son la única copia de datos no recuperados (p.ej. salteados
+    /// por el replay) y se conservan — devuelve `Err` para que se vea.
     fn compact(&self, store: &SplatStore) -> std::io::Result<usize> {
         let n = store.n_active();
         if n > 0 {
@@ -193,6 +201,19 @@ impl Durability {
                 ));
             };
             self.persist.save_vectors(&mu, "default")?;
+        } else {
+            let unrecovered = self
+                .wal
+                .recover()?
+                .iter()
+                .filter(|e| e.operation == "store")
+                .count();
+            if unrecovered > 0 {
+                return Err(std::io::Error::other(format!(
+                    "store vacío (n_active=0) con {unrecovered} entrada(s) 'store' aún en el WAL: \
+                     no se persiste ni se trunca, el WAL se conserva"
+                )));
+            }
         }
         let before = self.last_lsn.load(Ordering::SeqCst).saturating_add(1);
         self.wal.truncate(before)?;
@@ -2578,6 +2599,82 @@ mod tests {
         let hits = store.find_neighbors(&ndarray::ArrayView1::from(&query_vec), 1);
         assert_eq!(hits[0].index, 3);
         assert!(hits[0].distance < 1e-3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A03-F09 — compact() con el store vacío NO debe truncar un WAL que
+    /// todavía contiene stores no recuperados (p.ej. un replay que salteó
+    /// todo por --dim incorrecto): es la única copia duradera.
+    #[test]
+    fn compact_with_empty_store_keeps_unrecovered_wal_entries() {
+        let dir = temp_wal_dir("compact-empty");
+        let d = Durability::open(dir.to_str().unwrap()).expect("durability");
+        for axis in 0..5 {
+            d.log_store(
+                &format!("mem_{axis}"),
+                Some(axis),
+                axis,
+                &unit_vec(32, axis),
+            )
+            .expect("wal log");
+        }
+        d.flush().expect("wal flush");
+        let mut store = SplatStore::new(test_config());
+        assert_eq!(store.n_active(), 0);
+        let _ = d.compact(&store);
+
+        let store_entries = d
+            .wal
+            .recover()
+            .expect("recover")
+            .iter()
+            .filter(|e| e.operation == "store")
+            .count();
+        assert_eq!(
+            store_entries, 5,
+            "compact truncó el WAL sin haber persistido nada"
+        );
+        // The entries are still replayable on the next start.
+        let (applied, _) = replay_wal(&mut store, &d).expect("replay");
+        assert_eq!(applied, 5);
+        assert_eq!(store.n_active(), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A03-F09 — the other side of the guard: an empty store with nothing
+    /// at stake in the WAL keeps the old, harmless behaviour (Ok(0)).
+    #[test]
+    fn compact_with_empty_store_and_no_store_entries_is_a_noop() {
+        let dir = temp_wal_dir("compact-empty-noop");
+        let d = Durability::open(dir.to_str().unwrap()).expect("durability");
+        d.flush().expect("wal checkpoint");
+        let store = SplatStore::new(test_config());
+        let n = d.compact(&store).expect("compact without stores");
+        assert_eq!(n, 0);
+        assert!(!dir.join("data/vectors/default.bin").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A03-F02 — traced at integration time with the LD_PRELOAD fsync
+    /// tracer: compact() must fsync the shard temp file, rename, fsync
+    /// `data/vectors`, and only THEN rewrite the WAL and fsync `wal/`.
+    #[test]
+    fn fsync_probe_compact_persists_shard_before_touching_the_wal() {
+        let dir = temp_wal_dir("fsync-probe");
+        let config = test_config();
+        let d = Durability::open(dir.to_str().unwrap()).expect("durability");
+        let mut store = SplatStore::new(config);
+        for axis in 0..2 {
+            let arr = Array2::from_shape_vec((1, 32), unit_vec(32, axis)).unwrap();
+            assert!(store.add_splat(&arr));
+            store.hnsw_sync_incremental();
+            let idx = store.n_active() - 1;
+            d.log_store(&format!("mem_{axis}"), Some(axis), idx, &unit_vec(32, axis))
+                .expect("wal log");
+        }
+        assert_eq!(d.compact(&store).expect("compact"), 2);
+        assert!(dir.join("data/vectors/default.bin").is_file());
+        assert_eq!(d.wal.recover().expect("recover").len(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
