@@ -991,6 +991,18 @@ fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String
         metadata_json.insert("category".into(), json!(cat));
     }
 
+    // A04-F14: wing/room/hall given to `splatsdb_store` are persisted in
+    // the SQLite metadata exactly like `doc_add` does, so the spatial index
+    // can be rebuilt from SQLite after a restart.
+    for (key, value) in [
+        ("wing", params["wing"].as_str()),
+        ("room", params["room"].as_str()),
+        ("hall", params["hall"].as_str()),
+    ] {
+        if let Some(v) = value {
+            metadata_json.insert(key.into(), json!(v));
+        }
+    }
     let record = DocumentRecord {
         id: id.clone(),
         shard_idx: 0,
