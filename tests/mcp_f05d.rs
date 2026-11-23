@@ -916,7 +916,6 @@ fn x04_in_flight_request_bounds_its_completion_and_no_new_request_runs_after_sig
     eprintln!("SIGTERM (request in flight): graceful exit after {took:?}; {lines:?}");
 }
 
-
 // ---------------------------------------------------------------------------
 // F05e — deterministic shutdown, a real warm start, a no-op graph and invalid
 // legacy nodes, all against real `splatsdb mcp` processes (same harness).
@@ -963,8 +962,7 @@ fn spawn_counting_vector_server(
                     let head = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
                     break (
                         pos + 4,
-                        head
-                            .lines()
+                        head.lines()
                             .find_map(|l| l.strip_prefix("content-length:"))
                             .and_then(|v| v.trim().parse::<usize>().ok())
                             .unwrap_or(0),
@@ -1014,7 +1012,7 @@ fn seed_docs(db: &Path, with_vector: usize, legacy: usize) {
     let store = splatsdb::storage::sqlite_store::SqliteMetadataStore::new(db.to_path_buf())
         .expect("open sqlite store");
     {
-        use splatsdb::storage::splatsdb::storage::MetadataStore as _;
+        use splatsdb::storage::MetadataStore as _;
         for i in 0..legacy {
             let (mut record, _) = doc_record(i, dim);
             record.id = format!("legacy_{i}");
@@ -1067,9 +1065,16 @@ fn f05e_w01_legacy_rows_are_embedded_by_real_calls_and_the_vectors_are_stored() 
         2,
         "`reembedded` must equal the real service calls"
     );
-    let r = srv.ok(2, "splatsdb_search", json!({ "query": "text of legacy", "top_k": 5 }));
+    let r = srv.ok(
+        2,
+        "splatsdb_search",
+        json!({ "query": "text of legacy", "top_k": 5 }),
+    );
     let ids = ids_of(&r);
-    assert!(ids.contains(&"legacy_0".into()) && ids.contains(&"legacy_1".into()), "{r}");
+    assert!(
+        ids.contains(&"legacy_0".into()) && ids.contains(&"legacy_1".into()),
+        "{r}"
+    );
     srv.shutdown();
 
     // Restart with the service DOWN: the stored vectors are used, nothing is
@@ -1155,7 +1160,11 @@ fn f05e_w03_legacy_row_in_a_corpus_past_the_10k_cache_is_embedded_once_and_keeps
     assert_eq!(ws["reembedded"], json!(1), "{ws}");
     assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
     // 10_002 documents > the 10K text cache: the text comes from SQLite.
-    let r = srv.ok(2, "splatsdb_search", json!({ "query": "text of legacy", "top_k": 100 }));
+    let r = srv.ok(
+        2,
+        "splatsdb_search",
+        json!({ "query": "text of legacy", "top_k": 100 }),
+    );
     let hit = r["results"]
         .as_array()
         .expect("results")
@@ -1221,7 +1230,11 @@ fn assert_legacy_quarantine(dir_tag: &str, bad_embedding: &str) {
         json!("durable"),
         "one invalid node must not brick the whole graph: {status}"
     );
-    assert_eq!(status["graph_persistence"]["quarantined_nodes"], json!([3]), "{status}");
+    assert_eq!(
+        status["graph_persistence"]["quarantined_nodes"],
+        json!([3]),
+        "{status}"
+    );
     let stats = srv.stats(2);
     assert_eq!(stats["total_nodes"], json!(2), "{stats}");
     assert_eq!(
@@ -1230,7 +1243,11 @@ fn assert_legacy_quarantine(dir_tag: &str, bad_embedding: &str) {
         "the edge to the refused node goes with it: {stats}"
     );
     // The graph is usable: a new node joins and is persisted.
-    let added = srv.ok(3, "splatsdb_graph_add_doc", json!({ "text": "after the quarantine" }));
+    let added = srv.ok(
+        3,
+        "splatsdb_graph_add_doc",
+        json!({ "text": "after the quarantine" }),
+    );
     assert_eq!(added["persisted"], json!(true), "{added}");
     // The ORIGINAL bytes survive before anything could overwrite them.
     let backup = dir.join("graph_state.json.pre-quarantine");
@@ -1244,7 +1261,9 @@ fn assert_legacy_quarantine(dir_tag: &str, bad_embedding: &str) {
         srv.err_log.join("\n")
     );
     assert!(
-        srv.err_log.iter().any(|l| l.contains("QUARANTINED") && l.contains("ids=[3]")),
+        srv.err_log
+            .iter()
+            .any(|l| l.contains("QUARANTINED") && l.contains("ids=[3]")),
         "{}",
         srv.err_log.join("\n")
     );
@@ -1254,7 +1273,10 @@ fn assert_legacy_quarantine(dir_tag: &str, bad_embedding: &str) {
     assert!(again.wait_ready(), "{}", again.err_log.join("\n"));
     assert_eq!(again.stats(1)["total_nodes"], json!(3));
     assert_eq!(again.stats(2)["total_edges"], json!(1));
-    assert_eq!(again.status(3)["graph_persistence"]["quarantined_nodes"], json!([]));
+    assert_eq!(
+        again.status(3)["graph_persistence"]["quarantined_nodes"],
+        json!([])
+    );
     again.shutdown();
 }
 
@@ -1283,7 +1305,11 @@ fn f05e_g03_repeated_relation_is_a_no_op_no_rewrite_no_spurious_outofsync() {
         "{}",
         srv.err_log.join("\n")
     );
-    let persisted_before = srv.err_log.iter().filter(|l| l.contains("graph persisted")).count();
+    let persisted_before = srv
+        .err_log
+        .iter()
+        .filter(|l| l.contains("graph persisted"))
+        .count();
     let on_disk = std::fs::read(state_path(&dir)).expect("state file");
 
     // The repeat answers created=false from the live graph: no file write.
@@ -1294,8 +1320,15 @@ fn f05e_g03_repeated_relation_is_a_no_op_no_rewrite_no_spurious_outofsync() {
         "{}",
         srv.err_log.join("\n")
     );
-    let persisted_after = srv.err_log.iter().filter(|l| l.contains("graph persisted")).count();
-    assert_eq!(persisted_after, persisted_before, "the no-op re-wrote the state file");
+    let persisted_after = srv
+        .err_log
+        .iter()
+        .filter(|l| l.contains("graph persisted"))
+        .count();
+    assert_eq!(
+        persisted_after, persisted_before,
+        "the no-op re-wrote the state file"
+    );
     assert_eq!(
         std::fs::read(state_path(&dir)).unwrap(),
         on_disk,
@@ -1312,15 +1345,25 @@ fn f05e_g03_repeated_relation_is_a_no_op_no_rewrite_no_spurious_outofsync() {
         "splatsdb_graph_add_relation",
         json!({ "source_id": a, "target_id": b, "relation_type": "CITES", "weight": 0.9 }),
     );
-    assert!(!is_error, "a no-op was refused because of another writer: {repeat}");
+    assert!(
+        !is_error,
+        "a no-op was refused because of another writer: {repeat}"
+    );
     assert_eq!(repeat["created"], json!(false));
     let err = srv.error(
         43,
         "splatsdb_graph_add_relation",
         json!({ "source_id": b, "target_id": a, "relation_type": "CITES", "weight": 0.9 }),
     );
-    assert!(err.contains("persisted"), "a real mutation must fail closed: {err}");
-    assert_eq!(std::fs::read(state_path(&dir)).unwrap(), foreign, "the foreign file was overwritten");
+    assert!(
+        err.contains("persisted"),
+        "a real mutation must fail closed: {err}"
+    );
+    assert_eq!(
+        std::fs::read(state_path(&dir)).unwrap(),
+        foreign,
+        "the foreign file was overwritten"
+    );
     srv.shutdown();
 }
 
@@ -1355,7 +1398,8 @@ fn f05e_x05_sigterm_during_a_large_warm_start_exits_cleanly_and_the_store_is_int
     let err = stderr_until_closed(&srv, Duration::from_secs(5));
     assert!(srv.pipes_closed(Duration::from_secs(2)), "pipes left open");
     assert!(
-        err.iter().any(|l| l.contains("Warm start interrupted by shutdown signal")),
+        err.iter()
+            .any(|l| l.contains("Warm start interrupted by shutdown signal")),
         "the signal did not land inside the warm start: {err:#?}"
     );
     assert!(
@@ -1376,7 +1420,12 @@ fn f05e_x05_sigterm_during_a_large_warm_start_exits_cleanly_and_the_store_is_int
 /// itself, gracefully, inside `SIGNAL_EXIT_BOUND` (= the 2 s contract), with
 /// both pipes closed, nothing answered for an incomplete request, and both
 /// mutations still on disk after a restart.
-fn run_signal_cell(db: &Path, sig: i32, state: StdinState, reps: usize) -> (usize, Vec<String>, u128) {
+fn run_signal_cell(
+    db: &Path,
+    sig: i32,
+    state: StdinState,
+    reps: usize,
+) -> (usize, Vec<String>, u128) {
     let mut failures = 0;
     let mut notes = Vec::new();
     let mut max_ms = 0;
@@ -1387,7 +1436,11 @@ fn run_signal_cell(db: &Path, sig: i32, state: StdinState, reps: usize) -> (usiz
             notes.push(format!("rep {rep}: never ready"));
             continue;
         }
-        srv.ok(1, "splatsdb_doc_add", json!({ "id": "mem_kept", "text": "kept across the signal" }));
+        srv.ok(
+            1,
+            "splatsdb_doc_add",
+            json!({ "id": "mem_kept", "text": "kept across the signal" }),
+        );
         srv.add_doc(2, "graph node kept across the signal");
         if state == StdinState::PartialLine {
             let stdin = srv.stdin.as_mut().expect("stdin");
@@ -1430,7 +1483,9 @@ fn run_signal_cell(db: &Path, sig: i32, state: StdinState, reps: usize) -> (usiz
         let answered = srv.stdout_until_closed(Duration::from_secs(2));
         if !answered.is_empty() {
             ok = false;
-            notes.push(format!("rep {rep}: answered after the signal: {answered:?}"));
+            notes.push(format!(
+                "rep {rep}: answered after the signal: {answered:?}"
+            ));
         }
         if !srv.pipes_closed(Duration::from_secs(2)) {
             ok = false;
@@ -1457,33 +1512,64 @@ fn signal_table(db_tag: &str, sig: i32, state: StdinState, reps: usize) {
     let db = scratch(db_tag).join("docs.db");
     let (failures, notes, max_ms) = run_signal_cell(&db, sig, state, reps);
     let (sig_name, case) = (
-        if sig == libc::SIGINT { "SIGINT" } else { "SIGTERM" },
-        if state == StdinState::PartialLine { "partial-line" } else { "idle" },
+        if sig == libc::SIGINT {
+            "SIGINT"
+        } else {
+            "SIGTERM"
+        },
+        if state == StdinState::PartialLine {
+            "partial-line"
+        } else {
+            "idle"
+        },
     );
     eprintln!(
         "[F05e signal table] sig={sig_name} case={case} N={reps} failures={failures} max_exit_ms={max_ms} rc=0 notes={notes:?}"
     );
-    assert!(failures == 0 && notes.is_empty(), "{sig_name} {case}: {failures}/{reps} failed: {notes:#?}");
+    assert!(
+        failures == 0 && notes.is_empty(),
+        "{sig_name} {case}: {failures}/{reps} failed: {notes:#?}"
+    );
 }
 
 #[test]
 fn f05e_x10a_signal_table_idle_sigint() {
-    signal_table("f05e-t-idle-int", libc::SIGINT, StdinState::Idle, SIGNAL_REPS);
+    signal_table(
+        "f05e-t-idle-int",
+        libc::SIGINT,
+        StdinState::Idle,
+        SIGNAL_REPS,
+    );
 }
 
 #[test]
 fn f05e_x10b_signal_table_idle_sigterm() {
-    signal_table("f05e-t-idle-term", libc::SIGTERM, StdinState::Idle, SIGNAL_REPS);
+    signal_table(
+        "f05e-t-idle-term",
+        libc::SIGTERM,
+        StdinState::Idle,
+        SIGNAL_REPS,
+    );
 }
 
 #[test]
 fn f05e_x10c_signal_table_partial_line_sigint() {
-    signal_table("f05e-t-partial-int", libc::SIGINT, StdinState::PartialLine, SIGNAL_REPS);
+    signal_table(
+        "f05e-t-partial-int",
+        libc::SIGINT,
+        StdinState::PartialLine,
+        SIGNAL_REPS,
+    );
 }
 
 #[test]
 fn f05e_x10d_signal_table_partial_line_sigterm() {
-    signal_table("f05e-t-partial-term", libc::SIGTERM, StdinState::PartialLine, SIGNAL_REPS);
+    signal_table(
+        "f05e-t-partial-term",
+        libc::SIGTERM,
+        StdinState::PartialLine,
+        SIGNAL_REPS,
+    );
 }
 
 #[test]
@@ -1507,16 +1593,25 @@ fn f05e_x07_in_flight_mutation_is_abandoned_after_a_bounded_wait_and_never_acked
     let lines = srv.stdout_until_closed(Duration::from_secs(2));
     let err = stderr_until_closed(&srv, Duration::from_secs(2));
     assert!(srv.pipes_closed(Duration::from_secs(2)), "pipes left open");
-    assert!(lines.is_empty(), "an abandoned request was answered: {lines:?}");
+    assert!(
+        lines.is_empty(),
+        "an abandoned request was answered: {lines:?}"
+    );
     assert!(
         err.iter().any(|l| l.contains("NO response")),
         "stderr must say the in-flight request was not acknowledged: {err:#?}"
     );
-    eprintln!("[F05e] SIGTERM with a mutation in flight: exit after {took:?}, nothing acknowledged");
+    eprintln!(
+        "[F05e] SIGTERM with a mutation in flight: exit after {took:?}, nothing acknowledged"
+    );
     // Nothing was persisted for the unacknowledged mutation.
     let mut again = spawn(&db, &[]);
     assert!(again.wait_ready(), "{}", again.err_log.join("\n"));
-    assert_eq!(again.stats(1)["total_nodes"], json!(0), "an unacknowledged mutation was persisted");
+    assert_eq!(
+        again.stats(1)["total_nodes"],
+        json!(0),
+        "an unacknowledged mutation was persisted"
+    );
     again.shutdown();
 }
 
@@ -1604,7 +1699,9 @@ fn f05e_x11_signal_delivered_to_a_non_main_thread_still_ends_the_server() {
         .collect();
     tids.sort_unstable();
     if tids.is_empty() {
-        eprintln!("[F05e] SKIP: the server has one thread only; nothing but the main thread to target");
+        eprintln!(
+            "[F05e] SKIP: the server has one thread only; nothing but the main thread to target"
+        );
         srv.shutdown();
         return;
     }
@@ -1621,5 +1718,8 @@ fn f05e_x11_signal_delivered_to_a_non_main_thread_still_ends_the_server() {
     assert_eq!(rc, 0, "tgkill");
     let (status, took) = srv.exit_within(t0, SIGNAL_EXIT_BOUND, libc::SIGINT);
     assert!(status.success(), "{status:?}");
-    eprintln!("[F05e] SIGINT delivered to thread {tid} (of {} threads): graceful exit after {took:?}", tids.len() + 1);
+    eprintln!(
+        "[F05e] SIGINT delivered to thread {tid} (of {} threads): graceful exit after {took:?}",
+        tids.len() + 1
+    );
 }
