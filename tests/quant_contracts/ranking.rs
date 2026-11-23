@@ -6,6 +6,7 @@
 //! * `ip` ranks by the unbiased inner product and keeps the F04a unbiasedness property;
 //!   the heuristic is shown NOT to be an unbiased estimator (control).
 //! * PolarQuant has no QJL stage: both modes are the same (legacy) order.
+//! * A NaN/±Inf query is rejected before anything is ranked.
 //! * `probe_modes` (ignored): recall per mode against exact-L2 and exact-IP ground truths
 //!   on the same 4 datasets as `d18_probe`, plus a hash of the full ranking per mode.
 
@@ -14,7 +15,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, StandardNormal};
 use serde_json::json;
-use splatsdb::quant::{PolarQuantizer, QjlQuantizer, TurboQuantizer};
+use splatsdb::quant::{PolarQuantizer, QjlQuantizer, QuantError, TurboQuantizer};
 use splatsdb::quantization::{QuantAlgorithm, QuantConfig, QuantizedStore, ScoreMode};
 use std::f32::consts::PI;
 
@@ -392,6 +393,77 @@ fn ip_mode_keeps_the_unbiased_property_and_the_default_is_flagged_as_heuristic()
         (mean_l2 - exact).abs() > tolerance,
         "turbo l2_heuristic: {mean_l2:.5} vs {exact:.5}"
     );
+}
+
+/// A NaN/±Inf query is rejected BEFORE anything is ranked: `search_scored` returns the
+/// error naming the index, the compatibility `search` returns nothing (never NaN
+/// scores), and a finite query still ranks every code.
+#[test]
+fn non_finite_query_is_rejected_before_ranking() {
+    let dim = 16;
+    for config in three_configs(dim) {
+        let mut store = QuantizedStore::new(dim, config.clone()).unwrap();
+        let good = Array2::from_shape_fn((6, dim), |(r, c)| {
+            (r as f32 + 1.0) * 0.1 + (c as f32) * 0.01
+        });
+        store.add_batch(&good, 0).unwrap();
+        for (value, name) in [
+            (f32::NAN, "NaN"),
+            (f32::INFINITY, "+Inf"),
+            (f32::NEG_INFINITY, "-Inf"),
+        ] {
+            for pos in [0usize, dim / 2, dim - 1] {
+                let mut query: Vec<f32> = good.row(0).to_vec();
+                query[pos] = value;
+                let view = ndarray::ArrayView1::from(&query);
+                for mode in [ScoreMode::L2Heuristic, ScoreMode::InnerProduct] {
+                    match store.search_scored(&view, 5, mode) {
+                        Err(QuantError::NonFiniteValue { index }) => assert_eq!(index, pos),
+                        other => {
+                            panic!("{name} at {pos} {mode:?}: must be rejected, got {other:?}")
+                        }
+                    }
+                }
+                assert!(
+                    store.search(&view, 5).is_empty(),
+                    "{name} at {pos}: `search` must not rank a non-finite query"
+                );
+            }
+        }
+        // The other rejection: a query of the wrong dimension is an error, not a ranking.
+        let short_vec = vec![0.5f32; dim - 1];
+        let short = ndarray::ArrayView1::from(&short_vec);
+        assert!(matches!(
+            store.search_scored(&short, 5, ScoreMode::L2Heuristic),
+            Err(QuantError::DimensionMismatch {
+                expected,
+                got
+            }) if expected == dim && got == dim - 1
+        ));
+        assert!(store.search(&short, 5).is_empty());
+        // Finite queries are unaffected; a non-finite query row in measure_recall
+        // contributes zero instead of panicking.
+        let hits = store
+            .search_scored(&good.row(0), usize::MAX, ScoreMode::L2Heuristic)
+            .unwrap();
+        assert_eq!(hits.len(), 6);
+        assert!(hits.iter().all(|h| h.score.is_finite()));
+        let mut bad = good.row(1).to_owned();
+        bad[0] = f32::NAN;
+        let bad_queries =
+            Array2::from_shape_fn(
+                (2, dim),
+                |(r, c)| {
+                    if r == 0 {
+                        bad[c]
+                    } else {
+                        good[(2, c)]
+                    }
+                },
+            );
+        let recall = store.measure_recall(&bad_queries, &good, 2);
+        assert!((0.0..=0.5).contains(&recall), "recall={recall}");
+    }
 }
 
 // --- Evidence probe -------------------------------------------------------------

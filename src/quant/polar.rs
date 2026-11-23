@@ -143,13 +143,17 @@ impl PolarQuantizer {
     }
 
     /// Rotate a query once (`R·query`) so that many codes can be scored against it
-    /// without repeating the O(d²) rotation per code (A02-F02).
+    /// without repeating the O(d²) rotation per code (A02-F02). A NaN/±Inf query is
+    /// rejected here, before anything is ranked.
     pub fn rotated_query(&self, query: &[f32]) -> Result<Vec<f32>> {
         if query.len() != self.dim {
             return Err(QuantError::DimensionMismatch {
                 expected: self.dim,
                 got: query.len(),
             });
+        }
+        if let Some(index) = query.iter().position(|v| !v.is_finite()) {
+            return Err(QuantError::NonFiniteValue { index });
         }
         let mut rotated = vec![0.0f32; self.dim];
         self.rotation.apply(query, &mut rotated)?;

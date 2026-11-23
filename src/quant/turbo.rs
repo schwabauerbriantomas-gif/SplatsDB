@@ -176,7 +176,7 @@ impl TurboQuantizer {
     }
 
     /// Score of `code` against `query` under `mode` (see the module docs and
-    /// [`ScoreMode`]).
+    /// [`ScoreMode`]). A NaN/±Inf query is rejected before it is scored.
     pub fn score(&self, code: &TurboCode, query: &[f32], mode: ScoreMode) -> Result<f32> {
         let context = self.prepare_query(query)?;
         self.score_projected(code, &context, mode)
@@ -337,5 +337,18 @@ mod tests {
                 q.score(&code, &query, mode).unwrap().to_bits()
             );
         }
+    }
+
+    #[test]
+    fn non_finite_query_is_rejected() {
+        let q = TurboQuantizer::new(16, 4, 16, 0).unwrap();
+        let code = q.encode(&vec![1.0f32; 16]).unwrap();
+        let mut query = vec![0.25f32; 16];
+        query[3] = f32::NEG_INFINITY;
+        assert!(matches!(
+            q.score(&code, &query, ScoreMode::InnerProduct),
+            Err(QuantError::NonFiniteValue { index: 3 })
+        ));
+        assert!(q.prepare_query(&query).is_err());
     }
 }

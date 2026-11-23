@@ -308,6 +308,10 @@ impl QjlQuantizer {
                 got: query.len(),
             });
         }
+        // A NaN/Inf query has no meaningful score: reject it before anything is ranked.
+        if let Some(index) = query.iter().position(|v| !v.is_finite()) {
+            return Err(QuantError::NonFiniteValue { index });
+        }
         Ok(self
             .projection
             .chunks_exact(self.dim)
@@ -468,5 +472,25 @@ mod tests {
                 .to_bits()
         );
         assert_eq!(back.projection_bytes(), q.projection_bytes());
+    }
+
+    #[test]
+    fn non_finite_query_is_rejected() {
+        let q = QjlQuantizer::new(8, 16, 0).unwrap();
+        let sketch = q.sketch(&vec![1.0f32; 8]).unwrap();
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut query = vec![0.5f32; 8];
+            query[6] = value;
+            for mode in [ScoreMode::L2Heuristic, ScoreMode::InnerProduct] {
+                assert!(matches!(
+                    q.score(&sketch, &query, mode),
+                    Err(QuantError::NonFiniteValue { index: 6 })
+                ));
+            }
+            assert!(matches!(
+                q.inner_product_estimate(&sketch, &query),
+                Err(QuantError::NonFiniteValue { index: 6 })
+            ));
+        }
     }
 }

@@ -16,7 +16,7 @@
 //! versions <= 2.11.0 (`estimate / ||x||`: a heuristic for L2 candidate generation, not
 //! an unbiased estimator); [`ScoreMode::InnerProduct`] ranks by the unbiased inner-product
 //! estimate and is selected on purpose. `search` is the default mode;
-//! `search_scored` takes the mode.
+//! `search_scored` takes the mode and rejects a NaN/±Inf query before ranking.
 
 pub use crate::quant::qjl::ScoreMode;
 use crate::quant::{PolarCode, PolarQuantizer, QjlSketch, QuantError, TurboCode, TurboQuantizer};
@@ -236,8 +236,9 @@ impl QuantizedStore {
     /// Top-k neighbours of `query` under [`Self::default_score_mode`], as
     /// `(id, score)` pairs sorted by score (descending).
     ///
-    /// Compatibility wrapper: a query of the wrong dimension yields an empty result.
-    /// Use [`Self::search_scored`] to get the error.
+    /// Compatibility wrapper: a query of the wrong dimension or with a NaN/±Inf entry
+    /// yields an empty result (it is rejected before anything is ranked — never NaN
+    /// scores). Use [`Self::search_scored`] to get the rejection as an error.
     pub fn search(&self, query: &ArrayView1<f32>, k: usize) -> Vec<(u64, f32)> {
         self.search_scored(query, k, Self::default_score_mode())
             .unwrap_or_default()
@@ -250,8 +251,9 @@ impl QuantizedStore {
     /// insertion order).
     ///
     /// The query-dependent work is done once per call — the rotation `R·q` and the
-    /// projections `g_i·q` are shared by every code (A02-F02). A query of the wrong
-    /// dimension is an `Err`, not an empty ranking.
+    /// projections `g_i·q` are shared by every code (A02-F02) — and the query is
+    /// validated before anything is ranked: a wrong dimension or a NaN/±Inf entry is
+    /// an `Err`, not a ranking with NaN scores.
     pub fn search_scored(
         &self,
         query: &ArrayView1<f32>,
@@ -263,6 +265,9 @@ impl QuantizedStore {
                 expected: self.dim,
                 got: query.len(),
             });
+        }
+        if let Some(index) = query.iter().position(|v| !v.is_finite()) {
+            return Err(QuantError::NonFiniteValue { index });
         }
         let q: Vec<f32> = query.to_vec();
         let n = self.ids.len();
