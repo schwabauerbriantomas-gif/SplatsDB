@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use splatsdb::{
     loaders::load_energy_landscape,
     storage::persistence::{SplatsDBPersistence, StorageBackend},
+    storage::shard_guard::{try_lock_data_dir, DataDirLock},
     SplatStore, SplatsDBConfig,
 };
 
@@ -115,6 +116,33 @@ pub fn try_load_shard_store(
             Ok((store, Some(persist)))
         }
         Err(e) => Err(format!("failed to load shard '{}': {}", shard, e)),
+    }
+}
+
+/// Exit status of a CLI writer refused because another process holds the
+/// data-dir lock (a live `serve`, another writer).
+pub const EXIT_DATA_DIR_LOCKED: u8 = 3;
+
+/// Take the data-dir lock a CLI writer must hold for its whole read→write
+/// window — the same `flock` `serve` holds (F02e1). While another process
+/// holds it, this prints why and exits with [`EXIT_DATA_DIR_LOCKED`] BEFORE
+/// anything was read or modified; the lock is released with the process.
+pub fn exit_if_data_dir_locked(data_dir: &str, writer: &str) -> DataDirLock {
+    let path = Path::new(data_dir);
+    if let Err(e) = std::fs::create_dir_all(path) {
+        eprintln!("Error: cannot create data-dir '{}': {}", data_dir, e);
+        std::process::exit(1);
+    }
+    match try_lock_data_dir(path, writer) {
+        Ok(lock) => lock,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            eprintln!("Error: {}", e);
+            std::process::exit(EXIT_DATA_DIR_LOCKED.into());
+        }
+        Err(e) => {
+            eprintln!("Error: cannot lock data-dir '{}': {}", data_dir, e);
+            std::process::exit(1);
+        }
     }
 }
 

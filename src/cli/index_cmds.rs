@@ -13,6 +13,10 @@ pub fn cmd_index(
     input: PathBuf,
     shard: String,
 ) {
+    // F02f: a writer holds the data-dir lock (the same `serve` holds) for
+    // its whole read→write window, or exits 3 before touching anything.
+    let _data_dir_lock = crate::cli::helpers::exit_if_data_dir_locked(&data_dir, "index");
+
     let vectors = match load_vectors_bin(&input) {
         Ok(v) => v,
         Err(e) => {
@@ -77,6 +81,10 @@ pub fn cmd_append(
     input: PathBuf,
     shard: String,
 ) {
+    // F02f: a writer holds the data-dir lock (the same `serve` holds) for
+    // its whole read→write window, or exits 3 before touching anything.
+    let _data_dir_lock = crate::cli::helpers::exit_if_data_dir_locked(&data_dir, "append");
+
     let vectors = match load_vectors_bin(&input) {
         Ok(v) => v,
         Err(e) => {
@@ -175,6 +183,10 @@ pub fn cmd_ingest(
     n_clusters: Option<usize>,
     seed: u64,
 ) {
+    // F02f: a writer holds the data-dir lock (the same `serve` holds) for
+    // its whole read→write window, or exits 3 before touching anything.
+    let _data_dir_lock = crate::cli::helpers::exit_if_data_dir_locked(&data_dir, "ingest");
+
     let vectors = match load_vectors_bin(&input) {
         Ok(v) => v,
         Err(e) => {
@@ -261,6 +273,10 @@ pub fn cmd_ingest_hierarchical(
     min_cluster_size: usize,
     seed: u64,
 ) {
+    // F02f: a writer holds the data-dir lock (the same `serve` holds) for
+    // its whole read→write window, or exits 3 before touching anything.
+    let _data_dir_lock = crate::cli::helpers::exit_if_data_dir_locked(&data_dir, "ingest-hierarchical");
+
     let vectors = match load_vectors_bin(&input) {
         Ok(v) => v,
         Err(e) => {

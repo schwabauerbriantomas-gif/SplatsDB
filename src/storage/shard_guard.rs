@@ -142,10 +142,7 @@ impl DataDirLock {
             Err(e) => {
                 let e: std::io::Error = e.into();
                 if e.kind() == ErrorKind::WouldBlock {
-                    let holder = std::fs::read_to_string(&path)
-                        .ok()
-                        .and_then(|s| s.lines().next().map(str::trim).map(str::to_string))
-                        .unwrap_or_else(|| "holder unknown".to_string());
+                    let holder = lock_holder(&path);
                     return Err(std::io::Error::new(
                         ErrorKind::WouldBlock,
                         format!(
@@ -180,6 +177,41 @@ impl Drop for DataDirLock {
         // Also released by the kernel when the process dies.
         let _ = self.file.unlock();
     }
+}
+
+/// Who holds the lock, as `.splatsdb.lock` names it: informational only.
+fn lock_holder(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.lines().next().map(str::trim).map(str::to_string))
+        .unwrap_or_else(|| "holder unknown".to_string())
+}
+
+/// The lock a CLI *writer* (`index`, `append`, `ingest`, `save`, …) takes on
+/// a data-dir: the very [`DataDirLock`] `serve` holds, so a CLI writer and a
+/// live server — or two CLI writers — can never rewrite the same shard, WAL,
+/// energy state or metadata. While another process holds it this fails with
+/// [`ErrorKind::WouldBlock`] and the caller must not touch the data-dir; the
+/// kernel releases the lock with the process, so a stale `.splatsdb.lock`
+/// never blocks anyone.
+pub fn try_lock_data_dir(data_dir: &Path, writer: &str) -> std::io::Result<DataDirLock> {
+    DataDirLock::acquire(data_dir).map_err(|e| {
+        if e.kind() != ErrorKind::WouldBlock {
+            return e;
+        }
+        std::io::Error::new(
+            ErrorKind::WouldBlock,
+            format!(
+                "data-dir {} está bloqueado (locked) por otro proceso ({}): `{}` modifica el \
+                 data-dir (shard / WAL / energy / metadata) y no corre contra un data-dir en \
+                 uso — dos escritores se sobrescriben el estado del otro. Nada fue modificado. \
+                 Detené ese proceso (SIGTERM y esperar el compact) y reintentá",
+                data_dir.display(),
+                lock_holder(&DataDirLock::path(data_dir)),
+                writer
+            ),
+        )
+    })
 }
 
 #[cfg(test)]
