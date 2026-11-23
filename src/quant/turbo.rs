@@ -139,6 +139,12 @@ impl TurboQuantizer {
         self.polar.rotation_memory_bytes()
     }
 
+    /// Heap bytes of the cos/sin table the polar stage scores through (`bits - 1` angle
+    /// bits): process-wide, one per bit width, built on the first score.
+    pub fn trig_table_bytes(&self) -> usize {
+        self.polar.trig_table_bytes()
+    }
+
     /// Encode a vector into a TurboCode.
     pub fn encode(&self, vector: &[f32]) -> Result<TurboCode> {
         if vector.len() != self.dim {
