@@ -810,3 +810,58 @@ fn hostile_payloads_of_codes_and_quantizers_are_rejected_when_read() {
         );
     }
 }
+
+/// A persisted rotation is applied without a per-entry bounds check (`apply` slices the
+/// `dim`-wide row, `apply_inverse` indexes the matrix), so a payload is a rotation only if
+/// its matrix holds exactly `dim * dim` finite entries. Until the fail-closed read of the
+/// rotation (V2_quant fix) the derived `Deserialize` of `StoredRotation` accepted a
+/// truncated matrix: the quantizer read from it panicked on its first `encode` /
+/// `rotated_query` (probe p11 at 62a9f1e2) instead of being an `Err` at read, here and
+/// inside the `TurboQuantizer` that nests it.
+#[test]
+fn a_persisted_rotation_with_a_truncated_or_non_finite_matrix_is_rejected_when_read() {
+    let dim = 8;
+    let polar = PolarQuantizer::new(dim, 3, 7).unwrap();
+    let turbo = TurboQuantizer::new(dim, 4, 16, 11).unwrap();
+    // `1e39` is a finite JSON number above `f32::MAX`: it reads as +Inf in the matrix.
+    type MatrixEdit = fn(&mut Vec<serde_json::Value>);
+    let edits: [(&str, MatrixEdit); 4] = [
+        ("truncated to 3 entries", |matrix| matrix.truncate(3)),
+        ("one entry short", |matrix| {
+            matrix.pop();
+        }),
+        ("one entry too many", |matrix| {
+            matrix.push(serde_json::json!(0.5))
+        }),
+        ("a non-finite entry", |matrix| {
+            matrix[0] = serde_json::json!(1e39)
+        }),
+    ];
+    for (what, edit) in edits {
+        let mut hostile = serde_json::to_value(&polar).unwrap();
+        edit(hostile["rotation"]["matrix"].as_array_mut().unwrap());
+        let err = serde_json::from_value::<PolarQuantizer>(hostile)
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("malformed rotation")),
+            "PolarQuantizer read with a rotation matrix {what}: {err:?}"
+        );
+
+        let mut hostile = serde_json::to_value(&turbo).unwrap();
+        edit(
+            hostile["polar"]["rotation"]["matrix"]
+                .as_array_mut()
+                .unwrap(),
+        );
+        let err = serde_json::from_value::<TurboQuantizer>(hostile)
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("malformed rotation")),
+            "TurboQuantizer read with a rotation matrix {what}: {err:?}"
+        );
+    }
+}
