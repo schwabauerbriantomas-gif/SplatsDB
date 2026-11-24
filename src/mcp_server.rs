@@ -10,14 +10,14 @@ use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::config::SplatsDBConfig;
 use crate::splats::SplatStore;
 use crate::storage::metadata_store::{DocumentRecord, MetadataStore};
-use crate::storage::sqlite_store::SqliteMetadataStore;
+use crate::storage::sqlite_store::{EmbeddingProvenance, SqliteMetadataStore};
 
 // ============================================================================
 // Embedding client — real model via HTTP, SimCos fallback
@@ -26,6 +26,11 @@ use crate::storage::sqlite_store::SqliteMetadataStore;
 const EMBEDDING_SERVICE_URL_DEFAULT: &str = "http://127.0.0.1:8788/embed";
 static EMBED_SERVICE_AVAILABLE: AtomicBool = AtomicBool::new(true);
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Explicit opt-in for the SimCos text-hash fallback (`SPLATSDB_ALLOW_SIMCOS=1`),
+/// read once at startup. OFF by default: without it every text-embedding
+/// entry point fails closed when the real service is unavailable.
+static SIMCOS_ALLOWED: AtomicBool = AtomicBool::new(false);
+static SIMCOS_WARNED: AtomicBool = AtomicBool::new(false);
 const MAX_DOC_TEXT_CACHE: usize = 10_000;
 const MAX_WARM_START_DOCS: usize = 50_000;
 
@@ -42,9 +47,169 @@ fn embedding_service_url() -> String {
         .unwrap_or_else(|_| EMBEDDING_SERVICE_URL_DEFAULT.to_string())
 }
 
+/// SIGINT and SIGTERM (A03-F15). The handler records the request in the two
+/// ways the request loop could miss it (F05e): the flag AND one byte on the
+/// wake pipe.
+///
+/// The flag alone was not enough: a signal that lands between the loop's
+/// flag check and its `read()` — or that the kernel delivers on another
+/// thread (HTTP client, SQLite, dispatcher) — leaves the loop blocked on an
+/// idle stdin with nothing left to wake it. The loop therefore only ever
+/// waits in `poll()` on stdin + the wake pipe (see `StdinReader`).
+///
+/// The SECOND signal forces the exit (`_exit`, async-signal-safe): whatever
+/// is in flight is abandoned and never acknowledged; the durable state is
+/// whatever the atomic writes already committed.
 #[cfg(unix)]
-extern "C" fn handle_sigint(_: i32) {
-    SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+extern "C" fn handle_sigint(sig: i32) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    if SIGNALS_SEEN.fetch_add(1, Ordering::SeqCst) >= 1 {
+        // SAFETY: `_exit` is async-signal-safe.
+        unsafe { libc::_exit(128 + sig) };
+    }
+    wake_loop();
+}
+
+#[cfg(unix)]
+static SIGNALS_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Read / write ends of the wake pipe (`-1` until `install_shutdown_handlers`).
+#[cfg(unix)]
+static WAKE_READ_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+#[cfg(unix)]
+static WAKE_WRITE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// One byte on the wake pipe. Both ends are non-blocking: a full pipe means
+/// the loop already holds a pending wakeup. Async-signal-safe (`write`).
+#[cfg(unix)]
+fn wake_loop() {
+    let fd = WAKE_WRITE_FD.load(Ordering::SeqCst);
+    if fd >= 0 {
+        let byte = 1u8;
+        // SAFETY: `write` on a valid, non-blocking fd; a failed write can
+        // only mean the wakeup is already pending.
+        unsafe {
+            libc::write(fd, std::ptr::from_ref(&byte).cast(), 1);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn wake_loop() {}
+
+/// Empty the wake pipe without blocking: a stale byte would make the next
+/// `poll` return at once.
+#[cfg(unix)]
+fn drain_wake_pipe() {
+    let fd = WAKE_READ_FD.load(Ordering::SeqCst);
+    if fd < 0 {
+        return;
+    }
+    let mut sink = [0u8; 64];
+    // SAFETY: `read` on a valid, non-blocking fd.
+    while unsafe { libc::read(fd, sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
+}
+
+/// `poll()` on the wake pipe for at most `timeout` (`None` = forever).
+/// Returns as soon as a wakeup byte lands, the deadline passes or a signal
+/// lands on this thread — the caller decides; nothing sleeps through a
+/// pending exit request unchecked.
+#[cfg(unix)]
+fn poll_wake(timeout: Option<std::time::Duration>) {
+    let fd = WAKE_READ_FD.load(Ordering::SeqCst);
+    if fd < 0 {
+        if let Some(t) = timeout {
+            std::thread::sleep(t.min(std::time::Duration::from_millis(50)));
+        }
+        return;
+    }
+    let mut fds = [libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    let ms = match timeout {
+        None => -1,
+        Some(t) => (t.as_millis() as i32).max(0),
+    };
+    // SAFETY: `fds` is valid for exactly one entry.
+    let ready = unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) };
+    if ready < 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            if let Some(t) = timeout {
+                std::thread::sleep(t.min(std::time::Duration::from_millis(50)));
+            }
+            return;
+        }
+    }
+    drain_wake_pipe();
+}
+
+#[cfg(not(unix))]
+fn poll_wake(timeout: Option<std::time::Duration>) {
+    if let Some(t) = timeout {
+        std::thread::sleep(t);
+    }
+}
+
+/// Block SIGINT/SIGTERM around `f` so a forced exit (second signal) can
+/// never cut a response line in half: the signal stays pending and is
+/// delivered — and acted on — right after the line is written.
+#[cfg(unix)]
+fn with_shutdown_signals_blocked<R>(f: impl FnOnce() -> R) -> R {
+    // SAFETY: plain sigset_t handling; the previous mask is restored.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        let mut previous: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigprocmask(libc::SIG_BLOCK, &set, &mut previous);
+        let out = f();
+        libc::sigprocmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        out
+    }
+}
+
+#[cfg(not(unix))]
+fn with_shutdown_signals_blocked<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
+/// First thing `run_mcp_server` does (A03-F15): from here on SIGINT and
+/// SIGTERM request a clean exit instead of killing the process — SIGTERM had
+/// no handler at all and terminated the server mid-request.
+///
+/// `sigaction` WITHOUT `SA_RESTART`, unlike the former `signal()` (BSD
+/// semantics: restart): a read blocked on an idle stdin returns EINTR instead
+/// of silently going back to sleep. That alone cannot close the check-then-
+/// read window, so the wake pipe is created first: a signal landing before
+/// the loop polls still leaves its byte there.
+#[cfg(unix)]
+fn install_shutdown_handlers() {
+    // SAFETY: raw fd handling through libc only. A failed `pipe` leaves
+    // `-1` in the statics and the EINTR path keeps working on its own.
+    unsafe {
+        let mut fds = [0i32; 2];
+        if libc::pipe(fds.as_mut_ptr()) == 0 {
+            for fd in fds {
+                let flags = libc::fcntl(fd, libc::F_GETFL);
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            WAKE_READ_FD.store(fds[0], Ordering::SeqCst);
+            WAKE_WRITE_FD.store(fds[1], Ordering::SeqCst);
+        }
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        // The handler slot of the union (`sighandler_t`).
+        sa.sa_sigaction = handle_sigint as *const () as usize;
+        // Deliberately no SA_RESTART.
+        sa.sa_flags = 0;
+        libc::sigemptyset(&mut sa.sa_mask);
+        for sig in [libc::SIGINT, libc::SIGTERM] {
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
 }
 
 /// Embedding from the service only: None when the service is unavailable or
@@ -58,8 +223,127 @@ fn get_embedding_strict(text: &str, dim: usize) -> Option<Vec<f32>> {
     }
 }
 
-fn get_embedding(text: &str, dim: usize) -> Vec<f32> {
-    get_embedding_strict(text, dim).unwrap_or_else(|| simcos_embedding(text, dim))
+/// Explicit opt-in parser for the SimCos fallback (`SPLATSDB_ALLOW_SIMCOS`).
+/// Pure (no env access) so it is directly testable.
+fn simcos_opt_in(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Where an embedding came from. Always reported to the client, which never
+/// has to guess whether ranking is semantic or a text hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EmbeddingSource {
+    /// The real embedding service answered.
+    Real,
+    /// SimCos text-hash fallback — only ever under explicit opt-in.
+    SimCos,
+    /// Supplied by the client in the request.
+    Provided,
+}
+
+impl EmbeddingSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Real => "real",
+            Self::SimCos => "simcos",
+            Self::Provided => "provided",
+        }
+    }
+}
+
+/// How the provenance of an indexed vector is reported per search result:
+/// `real`/`simcos`/`provided` when the vector was produced in this session,
+/// `stored_real`/`stored_simcos`/`stored_provided` when the warm start
+/// loaded it from SQLite (A03-F10, persistence half). The label travels
+/// with the vector: a SimCos vector is never reported as real.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VectorProvenance {
+    Live(EmbeddingSource),
+    Stored(EmbeddingProvenance),
+}
+
+impl VectorProvenance {
+    fn label(self) -> String {
+        match self {
+            Self::Live(src) => src.label().to_string(),
+            Self::Stored(src) => format!("stored_{}", src.label()),
+        }
+    }
+}
+
+/// Provenance label persisted next to a vector in SQLite.
+fn provenance_of(src: EmbeddingSource) -> EmbeddingProvenance {
+    match src {
+        EmbeddingSource::Real => EmbeddingProvenance::Real,
+        EmbeddingSource::SimCos => EmbeddingProvenance::SimCos,
+        EmbeddingSource::Provided => EmbeddingProvenance::Provided,
+    }
+}
+
+/// Accounting of one warm start (logged and exported by `splatsdb_status`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WarmStartStats {
+    /// Live documents found in SQLite.
+    documents: usize,
+    /// Vectors loaded straight from SQLite — no embedding was computed.
+    vectors_loaded: usize,
+    stored_real: usize,
+    stored_simcos: usize,
+    stored_provided: usize,
+    /// Documents WITHOUT a stored vector (legacy rows) that were embedded
+    /// and indexed in this warm start.
+    reembedded: usize,
+    /// Documents without a stored vector that could not be embedded.
+    unindexed: usize,
+    /// Rows whose stored vector was refused (left untouched on disk).
+    quarantined: usize,
+    /// Legacy rows whose vector came from a real embed call but could not
+    /// be written back to SQLite (indexed for this session only, F05e).
+    backfill_failed: usize,
+}
+
+/// Everything `run_mcp_server` builds its state from after a warm start.
+struct WarmStartOutcome {
+    vector_to_doc: HashMap<usize, String>,
+    doc_texts: DocTextCache,
+    next_id: usize,
+    spatial: WarmStartSpatial,
+    stats: WarmStartStats,
+    /// Docs whose indexed vector came from SQLite, with the provenance they
+    /// were originally stored with.
+    sources: HashMap<String, EmbeddingProvenance>,
+}
+
+const EMBEDDING_UNAVAILABLE: &str = "embedding unavailable: embed service unreachable or returned an unusable vector (dimension mismatch / non-finite values) and the SimCos fallback is not authorized (start the embed server, send a pre-computed 'embedding', or opt in explicitly with SPLATSDB_ALLOW_SIMCOS=1)";
+
+/// Embedding for `text`, never silent (A03-F10): the real service first;
+/// SimCos only when explicitly authorized via `SPLATSDB_ALLOW_SIMCOS`, and
+/// then labelled as such. Anything else is a controlled error.
+fn get_embedding_labeled(text: &str, dim: usize) -> Result<(Vec<f32>, EmbeddingSource), String> {
+    if let Some(vec) = get_embedding_strict(text, dim) {
+        return Ok((vec, EmbeddingSource::Real));
+    }
+    if SIMCOS_ALLOWED.load(Ordering::Relaxed) {
+        if !SIMCOS_WARNED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[mcp] WARNING: embed service unavailable; using the AUTHORIZED SimCos fallback (SPLATSDB_ALLOW_SIMCOS): ranking is text-hash, not semantic — every response is labelled embedding=simcos"
+            );
+        }
+        return Ok((simcos_embedding(text, dim), EmbeddingSource::SimCos));
+    }
+    Err(EMBEDDING_UNAVAILABLE.to_string())
+}
+
+/// Optional client-provided embedding (`embedding` array argument).
+fn parse_embedding_param(params: &Value) -> Option<Vec<f32>> {
+    params["embedding"].as_array().map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_f64().map(|f| f as f32))
+            .collect::<Vec<_>>()
+    })
 }
 
 fn fetch_real_embedding(text: &str, target_dim: usize) -> Option<Vec<f32>> {
@@ -79,10 +363,15 @@ fn fetch_real_embedding(text: &str, target_dim: usize) -> Option<Vec<f32>> {
         .iter()
         .filter_map(|v: &Value| v.as_f64().map(|f| f as f32))
         .collect();
-    if vec.len() < target_dim {
-        vec.resize(target_dim, 0.0f32);
-    } else {
-        vec.truncate(target_dim);
+    // A service answering with another dimension is a configuration error:
+    // zero-padding or truncating would index a different vector space as if
+    // it were valid (A03-F13, same contract as HTTP /recall).
+    if vec.len() != target_dim {
+        eprintln!(
+            "[mcp] embedding service returned {} dims, expected {target_dim}; rejecting",
+            vec.len()
+        );
+        return None;
     }
     let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 1e-8 {
@@ -91,9 +380,9 @@ fn fetch_real_embedding(text: &str, target_dim: usize) -> Option<Vec<f32>> {
         }
     }
     // A hostile/broken embedding service returning NaN/inf must not poison
-    // the index: reject and fall back to the SimCos embedding.
+    // the index: reject the vector (any SimCos fallback is opt-in + labelled).
     if !all_finite(&vec) {
-        eprintln!("[mcp] embedding service returned non-finite values; falling back to simcos");
+        eprintln!("[mcp] embedding service returned non-finite values; rejecting");
         return None;
     }
     Some(vec)
@@ -106,16 +395,41 @@ fn fetch_real_embedding(text: &str, target_dim: usize) -> Option<Vec<f32>> {
 struct McpState {
     store: SplatStore,
     doc_store: SqliteMetadataStore,
+    /// False when `doc_store` fell back to `:memory:` (A03-F13): writes
+    /// succeed but persist nothing, and the client must see that.
+    doc_store_persistent: bool,
     /// Maps vector index → doc_id for retrieval
     vector_to_doc: HashMap<usize, String>,
+    /// Inverse index, doc_id → its ONLY live vector (A03-F11).
+    doc_to_vec: HashMap<String, usize>,
+    /// Vector indices whose doc was deleted or re-stored. The splat stays
+    /// in the store (the ANN index has no delete), so every search path
+    /// drops them and refills top-k from the next candidates.
+    tombstones: std::collections::HashSet<usize>,
     /// Maps doc_id → text content (in-memory cache with eviction)
     doc_texts: DocTextCache,
     next_id: usize,
     /// Knowledge graph store (Gaussian splat graph)
     graph: crate::graph_splat::GaussianGraphStore,
+    /// Durable home of the graph (A04-F10): with `Some(dir)` every graph
+    /// mutation is saved to `<dir>/graph_state.json` BEFORE the tool
+    /// answers, and a failed save rolls the mutation back. `None` →
+    /// in-memory only, reported as ephemeral.
+    graph_dir: Option<std::path::PathBuf>,
+    /// A persisted graph exists but could not be loaded (corrupt, foreign
+    /// version): fail closed — mutators refuse and the file is never written.
+    graph_load_error: Option<String>,
     /// Spatial memory: maps (wing, room, hall) → vector indices for pre-filter search.
     /// Updated when docs are stored/loaded with spatial metadata.
     spatial_index: crate::spatial::SpatialIndex,
+    /// Provenance of every live doc's indexed vector (A03-F10, persistence
+    /// half): how the vector that sits in the ANN was produced, and whether
+    /// the warm start loaded it from SQLite (`Stored`) or this session made
+    /// it (`Live`). Reported per search result; a SimCos vector is never
+    /// promoted to `real`.
+    doc_sources: HashMap<String, VectorProvenance>,
+    /// Accounting of the warm start that built this state (`splatsdb_status`).
+    warm_start: WarmStartStats,
 }
 
 /// LRU cache of doc_id → text with O(1) insert / O(1) remove via lazy
@@ -158,7 +472,6 @@ impl DocTextCache {
     fn len(&self) -> usize {
         self.map.len()
     }
-
     /// Insert/replace a text, evicting oldest-inserted entries over the cap.
     ///
     /// Replacement (id already cached) refreshes the text in place without
@@ -212,6 +525,323 @@ impl DocTextCache {
 }
 
 impl McpState {
+    /// Assemble the live state around an (optionally persistent) doc store.
+    fn new(store: SplatStore, doc_store: SqliteMetadataStore, doc_store_persistent: bool) -> Self {
+        Self {
+            store,
+            doc_store,
+            doc_store_persistent,
+            vector_to_doc: HashMap::new(),
+            doc_to_vec: HashMap::new(),
+            tombstones: std::collections::HashSet::new(),
+            doc_texts: DocTextCache::default(),
+            next_id: 0,
+            graph: crate::graph_splat::GaussianGraphStore::new(),
+            graph_dir: None,
+            graph_load_error: None,
+            spatial_index: crate::spatial::SpatialIndex::new(),
+            doc_sources: HashMap::new(),
+            warm_start: WarmStartStats::default(),
+        }
+    }
+
+    /// Register `vector_idx` as THE live vector of `id`. Any previous
+    /// mapping of `id` is retired first, so a doc never has two live
+    /// vectors (re-store used to leave the old one matching).
+    fn map_vector(&mut self, vector_idx: usize, id: &str) {
+        self.unmap_doc(id);
+        self.vector_to_doc.insert(vector_idx, id.to_string());
+        self.doc_to_vec.insert(id.to_string(), vector_idx);
+    }
+
+    /// Retire the mapping of `id`, tombstoning its vector. Returns whether
+    /// `id` had a live vector.
+    fn unmap_doc(&mut self, id: &str) -> bool {
+        let Some(idx) = self.doc_to_vec.remove(id) else {
+            return false;
+        };
+        self.vector_to_doc.remove(&idx);
+        self.tombstones.insert(idx);
+        self.doc_sources.remove(id);
+        true
+    }
+
+    /// A vector is searchable iff a live doc maps to it.
+    fn is_live(&self, idx: usize) -> bool {
+        !self.tombstones.contains(&idx) && self.vector_to_doc.contains_key(&idx)
+    }
+
+    /// Live (searchable) vectors.
+    fn live_vectors(&self) -> usize {
+        self.vector_to_doc.len()
+    }
+
+    /// k to request from the ANN so that `top_k` LIVE results remain after
+    /// dropping the dead vectors (deleted / re-stored) it still returns.
+    fn fetch_k(&self, top_k: usize, n_active: usize) -> usize {
+        let dead = n_active.saturating_sub(self.live_vectors());
+        top_k.saturating_add(dead).min(n_active)
+    }
+
+    /// Text of a doc for a search result: the text cache first, else the
+    /// persisted `document` column. The cache is capped (FIFO, 10K) while
+    /// warm start loads up to 50K docs — a live doc evicted from the cache
+    /// must never come back as `"text": ""` (A03-F14).
+    fn doc_text(&self, id: &str) -> String {
+        if let Some(t) = self.doc_texts.get(id).filter(|t| !t.is_empty()) {
+            return t.clone();
+        }
+        self.doc_store
+            .get(id)
+            .ok()
+            .flatten()
+            .and_then(|r| r.document)
+            .filter(|t| !t.is_empty())
+            .unwrap_or_default()
+    }
+
+    /// (text, metadata) of a doc for a search result, from ONE SQLite read
+    /// (cached statement) — no extra roundtrip for the text fallback.
+    fn result_text_and_metadata(&self, id: &str) -> (String, Value) {
+        let cached = self.doc_texts.get(id).filter(|t| !t.is_empty()).cloned();
+        match self.doc_store.get(id) {
+            Ok(Some(record)) => {
+                let text = cached
+                    .or(record.document)
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_default();
+                (text, record.metadata.unwrap_or(json!(null)))
+            }
+            _ => (cached.unwrap_or_default(), json!(null)),
+        }
+    }
+
+    /// Explicit provenance of a result's indexed vector.
+    fn vector_label(&self, id: &str) -> String {
+        self.doc_sources
+            .get(id)
+            .map_or_else(|| "unknown".to_string(), |p| p.label())
+    }
+
+    /// Persistence / provenance block of `splatsdb_status`.
+    fn vector_persistence_json(&self) -> Value {
+        json!({
+            "schema_ready": self.doc_store.embedding_schema_ready(),
+            "stored_vectors": self.doc_store.stored_vector_count().unwrap_or(0),
+            "warm_start": {
+                "documents": self.warm_start.documents,
+                "vectors_loaded": self.warm_start.vectors_loaded,
+                "stored_real": self.warm_start.stored_real,
+                "stored_simcos": self.warm_start.stored_simcos,
+                "stored_provided": self.warm_start.stored_provided,
+                "reembedded": self.warm_start.reembedded,
+                "backfill_failed": self.warm_start.backfill_failed,
+                "unindexed": self.warm_start.unindexed,
+                "quarantined": self.warm_start.quarantined,
+            }
+        })
+    }
+
+    /// Live state built from a warm start (production path and tests).
+    fn from_warm_start(
+        store: SplatStore,
+        doc_store: SqliteMetadataStore,
+        doc_store_persistent: bool,
+        outcome: &mut WarmStartOutcome,
+    ) -> Self {
+        let mut state = Self::new(store, doc_store, doc_store_persistent);
+        state.vector_to_doc = std::mem::take(&mut outcome.vector_to_doc);
+        state.doc_to_vec = state
+            .vector_to_doc
+            .iter()
+            .map(|(idx, id)| (id.clone(), *idx))
+            .collect();
+        state.doc_texts = std::mem::take(&mut outcome.doc_texts);
+        state.next_id = outcome.next_id;
+        state.warm_start = outcome.stats;
+        state.doc_sources = std::mem::take(&mut outcome.sources)
+            .into_iter()
+            .map(|(id, src)| (id, VectorProvenance::Stored(src)))
+            .collect();
+        state
+    }
+
+    /// Attach the durable home of the knowledge graph and load what a
+    /// previous process persisted there (A04-F10). `None` keeps the graph in
+    /// memory only (explicitly ephemeral).
+    ///
+    /// A state file that exists but cannot be loaded is NEVER treated as "no
+    /// graph": the in-memory graph stays empty, every mutation is refused and
+    /// the file is not written — overwriting it would destroy the only copy
+    /// of the state the operator still has to repair.
+    fn init_graph_persistence(&mut self, dir: Option<std::path::PathBuf>) {
+        self.graph_dir = dir;
+        self.graph_load_error = None;
+        let Some(dir) = self.graph_dir.clone() else {
+            return;
+        };
+        match crate::graph_splat::GaussianGraphStore::load_or_empty(dir.as_path()) {
+            Ok(graph) => self.graph = graph,
+            Err(e) => self.graph_load_error = Some(e.to_string()),
+        }
+    }
+
+    /// Startup line that says where the graph lives — or that it is lost on
+    /// exit.
+    fn report_graph_persistence(&self) {
+        match (&self.graph_dir, &self.graph_load_error) {
+            (None, _) => eprintln!(
+                "[splatsdb] graph state: EPHEMERAL (no data dir) — knowledge-graph nodes and edges are lost when the process exits; set SPLATSDB_GRAPH_DIR, or a persistent SPLATSDB_DOC_PATH, to persist them"
+            ),
+            (Some(_), Some(err)) => eprintln!(
+                "[splatsdb] graph state file is UNREADABLE: {err} — graph mutations are REFUSED and the file was left untouched (fix or remove it, then restart); graph reads see an EMPTY graph until then"
+            ),
+            (Some(dir), None) => {
+                let path = dir.join(crate::graph_splat::GRAPH_STATE_FILENAME);
+                let quarantined = self.graph.quarantined_nodes();
+                if !quarantined.is_empty() {
+                    let ids: Vec<usize> = quarantined.iter().map(|q| q.id).collect();
+                    eprintln!(
+                        "[splatsdb] graph state: QUARANTINED {} node(s) of the state file (embedding empty or non-finite — a defect of those nodes alone; the rest of the graph is loaded and mutable): ids={ids:?} reasons={:?}; {} edge(s) pointing at them were dropped with them. The original file is preserved byte-for-byte as {} and the next save writes the graph without the refused nodes",
+                        quarantined.len(),
+                        quarantined.iter().map(|q| q.reason.as_str()).collect::<Vec<_>>(),
+                        self.graph.n_quarantined_edges(),
+                        dir.join(crate::graph_splat::GRAPH_LEGACY_BACKUP_FILENAME).display()
+                    );
+                }
+                if path.exists() {
+                    eprintln!(
+                        "[splatsdb] graph state: {} (loaded {} nodes / {} edges; durable: every graph mutation is saved here before it is answered)",
+                        path.display(),
+                        self.graph.n_nodes(),
+                        self.graph.n_edges()
+                    );
+                } else {
+                    eprintln!(
+                        "[splatsdb] graph state: {} (no state file yet; the graph is saved here on the first mutation)",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Apply one graph mutation so that it is acknowledged only once it is
+    /// persisted (A04-F10). Without a data dir the mutation is in-memory only
+    /// (ephemeral by configuration). Otherwise the mutation is applied to a
+    /// copy, the copy is saved — atomically — and only then does it become the
+    /// live graph: a failed save leaves the live graph equal to the last
+    /// persisted state (the failed node is invisible and its id unused) and
+    /// answers with an error instead of a node id that nobody stored.
+    const GRAPH_UNREADABLE: &str = "graph state file is unreadable ({err}): the mutation was NOT applied — the file was left untouched and is never overwritten; fix or remove it and restart the server";
+
+    fn graph_mutate<T>(
+        &mut self,
+        mutation: impl FnOnce(
+            &mut crate::graph_splat::GaussianGraphStore,
+        ) -> Result<T, crate::graph_splat::GraphError>,
+    ) -> Result<T, String> {
+        if let Some(err) = &self.graph_load_error {
+            return Err(Self::GRAPH_UNREADABLE.replace("{err}", err));
+        }
+        let Some(dir) = self.graph_dir.clone() else {
+            return mutation(&mut self.graph).map_err(|e| e.to_string());
+        };
+        let mut next = self.graph.clone();
+        let outcome = mutation(&mut next).map_err(|e| e.to_string())?;
+        self.persist_graph(next, dir)?;
+        Ok(outcome)
+    }
+
+    /// `graph_mutate` for a mutation that may be a NO-OP (F05e). `probe`
+    /// runs against the LIVE graph and returns `Some(value)` when the
+    /// mutation would change nothing: that value is answered at once — no
+    /// clone, no file write. (A repeated `add_relation` used to clone and
+    /// rewrite the whole state file: O(file) per no-op, and a spurious
+    /// OutOfSync refusal whenever another writer had touched the file.)
+    /// `None` → apply `mutation` exactly like `graph_mutate`.
+    fn graph_mutate_probed<T>(
+        &mut self,
+        probe: impl FnOnce(
+            &crate::graph_splat::GaussianGraphStore,
+        ) -> Result<Option<T>, crate::graph_splat::GraphError>,
+        mutation: impl FnOnce(
+            &mut crate::graph_splat::GaussianGraphStore,
+        ) -> Result<T, crate::graph_splat::GraphError>,
+    ) -> Result<T, String> {
+        if let Some(err) = &self.graph_load_error {
+            return Err(Self::GRAPH_UNREADABLE.replace("{err}", err));
+        }
+        let Some(dir) = self.graph_dir.clone() else {
+            return mutation(&mut self.graph).map_err(|e| e.to_string());
+        };
+        if let Some(value) = probe(&self.graph).map_err(|e| e.to_string())? {
+            return Ok(value);
+        }
+        let mut next = self.graph.clone();
+        let outcome = mutation(&mut next).map_err(|e| e.to_string())?;
+        self.persist_graph(next, dir)?;
+        Ok(outcome)
+    }
+
+    /// Save `next` atomically and only then make it the live graph (see
+    /// `graph_mutate`): a failed save leaves the live graph equal to the
+    /// last persisted state.
+    fn persist_graph(
+        &mut self,
+        next: crate::graph_splat::GaussianGraphStore,
+        dir: std::path::PathBuf,
+    ) -> Result<(), String> {
+        match next.save_to_dir(dir.as_path()) {
+            Ok(path) => {
+                eprintln!(
+                    "[mcp] graph persisted: {} ({} nodes / {} edges)",
+                    path.display(),
+                    next.n_nodes(),
+                    next.n_edges()
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[mcp] graph save FAILED — mutation rolled back, previous state intact: {e}"
+                );
+                return Err(format!(
+                    "graph mutation was not persisted and was rolled back (the in-memory graph still equals the last persisted state): {e}"
+                ));
+            }
+        }
+        self.graph = next;
+        Ok(())
+    }
+
+    /// Whether graph mutations are persisted before they are answered.
+    fn graph_is_durable(&self) -> bool {
+        self.graph_dir.is_some() && self.graph_load_error.is_none()
+    }
+
+    fn graph_persistence_json(&self) -> Value {
+        let state = if self.graph_dir.is_none() {
+            "ephemeral"
+        } else if self.graph_load_error.is_some() {
+            "corrupt"
+        } else {
+            "durable"
+        };
+        json!({
+            "persisted": self.graph_is_durable(),
+            "ephemeral": self.graph_dir.is_none(),
+            "state": state,
+            "path": self.graph_dir.as_ref().map(|dir| {
+                dir.join(crate::graph_splat::GRAPH_STATE_FILENAME)
+                    .display()
+                    .to_string()
+            }),
+            "error": self.graph_load_error,
+            "quarantined_nodes": self.graph.quarantined_nodes().iter().map(|q| q.id).collect::<Vec<_>>(),
+            "quarantined_edges": self.graph.n_quarantined_edges(),
+        })
+    }
+
     fn cache_doc_text(&mut self, id: String, text: String) {
         self.doc_texts.insert(id, text);
     }
@@ -354,7 +984,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "splatsdb_graph_add_relation",
-            "description": "Add a directed edge between two nodes in the knowledge graph.",
+            "description": "Add a directed edge between two nodes in the knowledge graph. Idempotent on (source_id, target_id, relation_type): repeating an existing relation changes nothing (created=false) and never inflates the degree.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -380,12 +1010,13 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "splatsdb_graph_search",
-            "description": "Hybrid search over the knowledge graph (vector similarity + graph context boost). Auto-embeds query.",
+            "description": "Search over the document nodes of the knowledge graph. `score` is the RAW cosine similarity (score_mode=cosine): results rank by similarity to the query, never by popularity. Each result also reports `graph_boost`, a degree prior min(0.05 x outgoing edges, 0.2) that is an annotation only — it reorders results solely under the explicit opt-in boost=true (score_mode=cosine+graph_boost, score = cosine + graph_boost). Auto-embeds query.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search query text" },
-                    "k": { "type": "number", "description": "Number of results (default: 10)" }
+                    "k": { "type": "number", "description": "Number of results (default: 10)" },
+                    "boost": { "type": "boolean", "description": "Opt in to rank by cosine + graph_boost (degree prior). Default false: raw cosine only." }
                 },
                 "required": ["query"]
             }
@@ -421,6 +1052,7 @@ fn tool_definitions() -> Vec<Value> {
                         "type": "string",
                         "description": "Search query text"
                     },
+                    "embedding": { "type": "array", "items": { "type": "number" }, "description": "Optional pre-computed query embedding" },
                     "wing": {
                         "type": "string",
                         "description": "Filter by wing (project/persona/domain). E.g. 'project-x', 'personal'"
@@ -456,6 +1088,7 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "embedding": { "type": "array", "items": { "type": "number" }, "description": "Optional pre-computed query embedding" },
                     "query": { "type": "string", "description": "Search query text" },
                     "top_k": { "type": "number", "description": "Number of results (default: 10)" }
                 },
@@ -644,8 +1277,12 @@ fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String
         s.store.get_statistics().embedding_dim
     }; // lock dropped here
 
-    // Use provided embedding, or get real embedding (MiniLM or SimCos fallback)
-    let embedding = embedding_opt.unwrap_or_else(|| get_embedding(text, dim));
+    // Provided embedding, or a real one — or SimCos under explicit opt-in.
+    // Never a silent fallback: an unauthorized fallback is a controlled error.
+    let (embedding, embedding_src) = match embedding_opt {
+        Some(e) => (e, EmbeddingSource::Provided),
+        None => get_embedding_labeled(text, dim)?,
+    };
 
     if embedding.len() != dim {
         return Err(format!(
@@ -659,7 +1296,7 @@ fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String
         return Err("Embedding contains non-finite values (NaN/inf)".into());
     }
 
-    let arr = Array2::from_shape_vec((1, dim), embedding)
+    let arr = Array2::from_shape_vec((1, dim), embedding.clone())
         .map_err(|e| format!("bad embedding shape: {}", e))?;
 
     // Re-acquire lock only for state mutation
@@ -688,8 +1325,10 @@ fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String
         .unwrap_or_else(|| format!("mem_{}", s.next_id));
 
     // Store text and mapping
-    s.vector_to_doc.insert(vector_idx, id.clone());
+    s.map_vector(vector_idx, &id);
     s.cache_doc_text(id.clone(), text.to_string());
+    s.doc_sources
+        .insert(id.clone(), VectorProvenance::Live(embedding_src));
 
     // Persist to SQLite
     let now = std::time::SystemTime::now()
@@ -703,6 +1342,18 @@ fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String
         metadata_json.insert("category".into(), json!(cat));
     }
 
+    // A04-F14: wing/room/hall given to `splatsdb_store` are persisted in
+    // the SQLite metadata exactly like `doc_add` does, so the spatial index
+    // can be rebuilt from SQLite after a restart.
+    for (key, value) in [
+        ("wing", params["wing"].as_str()),
+        ("room", params["room"].as_str()),
+        ("hall", params["hall"].as_str()),
+    ] {
+        if let Some(v) = value {
+            metadata_json.insert(key.into(), json!(v));
+        }
+    }
     let record = DocumentRecord {
         id: id.clone(),
         shard_idx: 0,
@@ -717,13 +1368,19 @@ fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String
     // Persistence failure must be visible to the client (17-nov EGM audit):
     // a swallowed upsert error made "stored" a lie after a restart wiped the
     // doc from warm start.
-    let persisted = match s.doc_store.upsert(&record) {
-        Ok(()) => true,
-        Err(e) => {
-            eprintln!("[mcp] warning: SQLite upsert failed: {}", e);
-            false
-        }
-    };
+    // Document, metadata, vector and its provenance in ONE SQLite
+    // statement (F05b): a failed write leaves neither behind.
+    let persisted =
+        match s
+            .doc_store
+            .upsert_with_embedding(&record, &embedding, provenance_of(embedding_src))
+        {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("[mcp] warning: SQLite upsert failed: {}", e);
+                false
+            }
+        };
 
     // Register spatial metadata if present
     let wing = params["wing"].as_str();
@@ -731,6 +1388,10 @@ fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String
     let hall = params["hall"].as_str();
     if wing.is_some() || room.is_some() || hall.is_some() {
         s.spatial_index.register_doc(&id, wing, room, hall);
+    } else {
+        // Re-store without spatial keys: the previous registration
+        // described the OLD content — drop it.
+        s.spatial_index.remove_doc(&id);
     }
 
     eprintln!(
@@ -739,7 +1400,16 @@ fn handle_store(state: &Mutex<McpState>, params: &Value) -> Result<Value, String
         vector_idx,
         text.len()
     );
-    Ok(json!({ "id": id, "status": "stored", "persisted": persisted }))
+    // `persisted` must be false when the store itself is in memory (A03-F13):
+    // a successful upsert into `:memory:` survives nothing.
+    let persisted = persisted && s.doc_store_persistent;
+    Ok(json!({
+        "id": id,
+        "status": "stored",
+        "persisted": persisted,
+        "ephemeral": !s.doc_store_persistent,
+        "embedding": embedding_src.label()
+    }))
 }
 
 fn handle_search(state: &Mutex<McpState>, params: &Value) -> Result<Value, String> {
@@ -768,20 +1438,18 @@ fn handle_search(state: &Mutex<McpState>, params: &Value) -> Result<Value, Strin
         return Ok(json!({ "results": [] }));
     }
 
-    let k = top_k.min(n_active);
     let embedding_opt = params["embedding"].as_array().map(|arr| {
         arr.iter()
             .filter_map(|v| v.as_f64().map(|f| f as f32))
             .collect::<Vec<_>>()
     });
-    let embedding = match embedding_opt {
-        Some(e) => e,
+    let (embedding, embedding_src) = match embedding_opt {
+        Some(e) => (e, EmbeddingSource::Provided),
         // fa1e528 parity (HTTP /search answers 400 without embedding): no
-        // text-hash fallback here either — SimCos noise with a 200-equivalent
-        // response is silent garbage ranking. Fail closed (17-nov EGM audit).
-        None => get_embedding_strict(query, dim).ok_or_else(|| {
-            "embedding unavailable: embed service unreachable — send an 'embedding' argument or start the embed server".to_string()
-        })?,
+        // SILENT text-hash fallback — SimCos noise reported with a success
+        // status is garbage ranking. It is allowed only under explicit
+        // opt-in and is then labelled `embedding: simcos` (A03-F10).
+        None => get_embedding_labeled(query, dim)?,
     };
 
     if embedding.len() != dim {
@@ -804,25 +1472,20 @@ fn handle_search(state: &Mutex<McpState>, params: &Value) -> Result<Value, Strin
         "internal server error".to_string()
     })?;
 
-    let k = k.min(s.store.n_active());
+    // Over-fetch by the number of dead vectors (deleted / re-stored),
+    // drop them, and keep `top_k` live results.
+    let k = s.fetch_k(top_k, s.store.n_active());
     let neighbors = s.store.find_neighbors_fast(&query_vec.view(), k);
 
     let results: Vec<Value> = neighbors
         .into_iter()
+        .filter(|n| s.is_live(n.index))
+        .take(top_k)
         .map(|n| {
-            // Look up doc_id from vector index
-            let doc_id = s
-                .vector_to_doc
-                .get(&n.index)
-                .cloned()
-                .unwrap_or_else(|| format!("vec_{}", n.index));
-            let text = s.doc_texts.get(&doc_id).cloned().unwrap_or_default();
-
-            // Try to get metadata from SQLite
-            let metadata: Value = match s.doc_store.get(&doc_id) {
-                Ok(Some(record)) => record.metadata.clone().unwrap_or(json!(null)),
-                _ => json!(null),
-            };
+            // is_live() guarantees a mapping: anonymous `vec_N` hits can no
+            // longer be produced.
+            let doc_id = s.vector_to_doc.get(&n.index).cloned().unwrap_or_default();
+            let (text, metadata) = s.result_text_and_metadata(&doc_id);
 
             json!({
                 "id": doc_id,
@@ -830,6 +1493,7 @@ fn handle_search(state: &Mutex<McpState>, params: &Value) -> Result<Value, Strin
                 "score": n.distance,
                 "text": text,
                 "metadata": metadata,
+                "embedding_source": s.vector_label(&doc_id),
             })
         })
         .collect();
@@ -842,7 +1506,7 @@ fn handle_search(state: &Mutex<McpState>, params: &Value) -> Result<Value, Strin
     // backend marker: scores are HRM2 engine distances (approximate path for
     // large stores), NOT the exact d² the HTTP /search emits — clients must
     // not reuse HTTP band calibrations against them (17-nov EGM audit).
-    Ok(json!({ "results": results, "backend": "hrm2" }))
+    Ok(json!({ "results": results, "backend": "hrm2", "embedding": embedding_src.label() }))
 }
 
 fn handle_status(state: &Mutex<McpState>) -> Result<Value, String> {
@@ -856,9 +1520,16 @@ fn handle_status(state: &Mutex<McpState>) -> Result<Value, String> {
 
     Ok(json!({
         "n_active": s.store.n_active(),
+        "live_vectors": s.live_vectors(),
+        "tombstoned_vectors": s.tombstones.len(),
         "max_splats": s.store.max_splats(),
         "dimension": stats.embedding_dim,
         "doc_count": doc_count,
+        "persisted": s.doc_store_persistent,
+        "ephemeral": !s.doc_store_persistent,
+        "embedding_fallback": if SIMCOS_ALLOWED.load(Ordering::Relaxed) { "simcos" } else { "none" },
+        "vector_persistence": s.vector_persistence_json(),
+        "graph_persistence": s.graph_persistence_json(),
         "has_hnsw": s.store.has_hnsw(),
         "has_lsh": s.store.has_lsh(),
         "has_quantization": s.store.has_quantization(),
@@ -887,9 +1558,8 @@ fn handle_doc_add(state: &Mutex<McpState>, params: &Value) -> Result<Value, Stri
         s.store.get_statistics().embedding_dim
     }; // lock dropped here
 
-    // Compute embedding (real model or SimCos fallback)
-    let embedding = get_embedding(text, dim);
-    let arr = Array2::from_shape_vec((1, dim), embedding)
+    let (embedding, embedding_src) = get_embedding_labeled(text, dim)?;
+    let arr = Array2::from_shape_vec((1, dim), embedding.clone())
         .map_err(|e| format!("embedding error: {}", e))?;
 
     // Re-acquire lock for state mutation
@@ -905,8 +1575,10 @@ fn handle_doc_add(state: &Mutex<McpState>, params: &Value) -> Result<Value, Stri
     s.store.hnsw_sync_incremental();
 
     // Update mappings
-    s.vector_to_doc.insert(vector_idx, id.to_string());
+    s.map_vector(vector_idx, id);
     s.cache_doc_text(id.to_string(), text.to_string());
+    s.doc_sources
+        .insert(id.to_string(), VectorProvenance::Live(embedding_src));
 
     // Persist to SQLite
     let now = std::time::SystemTime::now()
@@ -939,11 +1611,18 @@ fn handle_doc_add(state: &Mutex<McpState>, params: &Value) -> Result<Value, Stri
         updated_at: now,
     };
 
-    s.doc_store.upsert(&record).map_err(|e| {
+    if let Err(e) =
+        s.doc_store
+            .upsert_with_embedding(&record, &embedding, provenance_of(embedding_src))
+    {
         // Internal detail stays server-side; the client gets a generic error.
         eprintln!("[mcp] doc_add SQLite error for id={id}: {e}");
-        "internal error".to_string()
-    })?;
+        // No persisted row → the new vector must not stay searchable as an
+        // anonymous hit (A03-F11).
+        s.unmap_doc(id);
+        s.uncache_doc_text(id);
+        return Err("internal error".to_string());
+    }
 
     eprintln!(
         "[mcp] doc_add: id={}, vec_idx={}, text_len={}, has_meta={}",
@@ -952,7 +1631,7 @@ fn handle_doc_add(state: &Mutex<McpState>, params: &Value) -> Result<Value, Stri
         text.len(),
         metadata.is_some()
     );
-    Ok(json!({ "ok": true, "id": id }))
+    Ok(json!({ "ok": true, "id": id, "embedding": embedding_src.label() }))
 }
 
 fn handle_doc_get(state: &Mutex<McpState>, params: &Value) -> Result<Value, String> {
@@ -996,15 +1675,11 @@ fn handle_doc_del(state: &Mutex<McpState>, params: &Value) -> Result<Value, Stri
         Ok(true) => {
             // Remove from in-memory caches
             s.uncache_doc_text(id);
-            // Find and remove the vector_to_doc mapping for this doc id
-            if let Some(idx) = s
-                .vector_to_doc
-                .iter()
-                .find(|(_, v)| *v == id)
-                .map(|(k, _)| *k)
-            {
-                s.vector_to_doc.remove(&idx);
-            }
+            // The splat stays in the ANN index (no delete): tombstone its
+            // vector so every search path filters it and refills top-k,
+            // and drop it from the spatial index too (A03-F11).
+            s.unmap_doc(id);
+            s.spatial_index.remove_doc(id);
             eprintln!("[mcp] doc_del: id={} (soft deleted)", id);
             Ok(json!({ "ok": true, "id": id }))
         }
@@ -1036,24 +1711,24 @@ fn handle_graph_add_doc(state: &Mutex<McpState>, params: &Value) -> Result<Value
         s.store.get_statistics().embedding_dim
     }; // lock dropped here
 
-    let embedding = get_embedding(text, dim);
+    let (embedding, embedding_src) = get_embedding_labeled(text, dim)?;
 
     let mut s = state.lock().map_err(|e| {
         eprintln!("[mcp] mutex poisoned: {}", e);
         "internal server error".to_string()
     })?;
 
-    let node_id = s
-        .graph
-        .add_document(text, &embedding)
-        .map_err(|e| e.to_string())?;
+    let node_id = s.graph_mutate(|g| g.add_document(text, &embedding))?;
 
     eprintln!(
-        "[mcp] graph_add_doc: node_id={}, text_len={}",
+        "[mcp] graph_add_doc: node_id={}, text_len={}, persisted={}",
         node_id,
-        text.len()
+        text.len(),
+        s.graph_is_durable()
     );
-    Ok(json!({ "node_id": node_id, "node_type": "document" }))
+    Ok(
+        json!({ "node_id": node_id, "node_type": "document", "embedding": embedding_src.label(), "persisted": s.graph_is_durable() }),
+    )
 }
 
 fn handle_graph_add_entity(state: &Mutex<McpState>, params: &Value) -> Result<Value, String> {
@@ -1078,17 +1753,14 @@ fn handle_graph_add_entity(state: &Mutex<McpState>, params: &Value) -> Result<Va
         s.store.get_statistics().embedding_dim
     }; // lock dropped here
 
-    let embedding = get_embedding(name, dim);
+    let (embedding, embedding_src) = get_embedding_labeled(name, dim)?;
 
     let mut s = state.lock().map_err(|e| {
         eprintln!("[mcp] mutex poisoned: {}", e);
         "internal server error".to_string()
     })?;
 
-    let node_id = s
-        .graph
-        .add_entity(name, &embedding, entity_type)
-        .map_err(|e| e.to_string())?;
+    let node_id = s.graph_mutate(|g| g.add_entity(name, &embedding, entity_type))?;
 
     eprintln!(
         "[mcp] graph_add_entity: node_id={}, name_len={}, type='{}'",
@@ -1096,7 +1768,9 @@ fn handle_graph_add_entity(state: &Mutex<McpState>, params: &Value) -> Result<Va
         name.len(),
         entity_type
     );
-    Ok(json!({ "node_id": node_id, "name": name, "entity_type": entity_type }))
+    Ok(
+        json!({ "node_id": node_id, "name": name, "entity_type": entity_type, "embedding": embedding_src.label(), "persisted": s.graph_is_durable() }),
+    )
 }
 
 fn handle_graph_add_relation(state: &Mutex<McpState>, params: &Value) -> Result<Value, String> {
@@ -1117,20 +1791,29 @@ fn handle_graph_add_relation(state: &Mutex<McpState>, params: &Value) -> Result<
         eprintln!("[mcp] mutex poisoned: {}", e);
         "internal server error".to_string()
     })?;
-    s.graph
-        .add_relation(source_id, target_id, relation_type, weight)
-        .map_err(|e| e.to_string())?;
+    // Idempotent: a relation that already exists is not inserted again —
+    // and (F05e) not SAVED again either: the repeat is answered from the
+    // live graph without cloning or rewriting the state file.
+    let created = s.graph_mutate_probed(
+        |g| {
+            g.check_relation(source_id, target_id, relation_type, weight)
+                .map(|exists| exists.then_some(false))
+        },
+        |g| g.add_relation(source_id, target_id, relation_type, weight),
+    )?;
 
     eprintln!(
-        "[mcp] graph_add_relation: {} --{}--> {} (w={})",
-        source_id, relation_type, target_id, weight
+        "[mcp] graph_add_relation: {} --{}--> {} (w={}, created={})",
+        source_id, relation_type, target_id, weight, created
     );
     Ok(json!({
         "ok": true,
+        "created": created,
         "source_id": source_id,
         "target_id": target_id,
         "relation_type": relation_type,
-        "weight": weight
+        "weight": weight,
+        "persisted": s.graph_is_durable()
     }))
 }
 
@@ -1177,6 +1860,15 @@ fn handle_graph_search(state: &Mutex<McpState>, params: &Value) -> Result<Value,
         return Err("query too long".into());
     }
     let k = params["k"].as_u64().unwrap_or(10).min(1000) as usize;
+    // A04-F11: raw cosine by default. The degree prior reorders only under
+    // this explicit opt-in, and `score_mode` tells the client which one it
+    // got.
+    use crate::graph_splat::ScoreMode;
+    let score_mode = if params["boost"].as_bool().unwrap_or(false) {
+        ScoreMode::CosinePlusGraphBoost
+    } else {
+        ScoreMode::Cosine
+    };
 
     let s = state.lock().map_err(|e| {
         eprintln!("[mcp] mutex poisoned: {}", e);
@@ -1185,14 +1877,19 @@ fn handle_graph_search(state: &Mutex<McpState>, params: &Value) -> Result<Value,
     let dim = s.store.get_statistics().embedding_dim;
     drop(s); // release lock before potentially blocking HTTP call
 
-    let embedding = get_embedding(query, dim);
+    let (embedding, embedding_src) = get_embedding_labeled(query, dim)?;
 
     let s = state.lock().map_err(|e| {
         eprintln!("[mcp] mutex poisoned: {}", e);
         "internal server error".to_string()
     })?;
 
-    let results = s.graph.hybrid_search(&embedding, k);
+    // A graph of another dimension than the query is a controlled error
+    // (A04-F12) — never "the most similar" nodes at a silent 0.0.
+    let results = s
+        .graph
+        .hybrid_search_with(&embedding, k, score_mode)
+        .map_err(|e| e.to_string())?;
 
     let out: Vec<Value> = results
         .iter()
@@ -1201,17 +1898,24 @@ fn handle_graph_search(state: &Mutex<McpState>, params: &Value) -> Result<Value,
                 "node_id": r.node_id,
                 "content": r.content,
                 "score": r.score,
+                "score_mode": r.score_mode.label(),
+                "graph_boost": r.graph_boost,
                 "node_type": format!("{:?}", r.node_type).to_lowercase(),
             })
         })
         .collect();
 
     eprintln!(
-        "[mcp] graph_search: query_len={}, results={}",
+        "[mcp] graph_search: query_len={}, score_mode={}, results={}",
         query.len(),
+        score_mode.label(),
         out.len()
     );
-    Ok(json!({ "results": out }))
+    Ok(json!({
+        "results": out,
+        "embedding": embedding_src.label(),
+        "score_mode": score_mode.label(),
+    }))
 }
 
 fn handle_graph_search_entities(state: &Mutex<McpState>, params: &Value) -> Result<Value, String> {
@@ -1228,14 +1932,17 @@ fn handle_graph_search_entities(state: &Mutex<McpState>, params: &Value) -> Resu
     let dim = s.store.get_statistics().embedding_dim;
     drop(s); // release lock before potentially blocking HTTP call
 
-    let embedding = get_embedding(query, dim);
+    let (embedding, embedding_src) = get_embedding_labeled(query, dim)?;
 
     let s = state.lock().map_err(|e| {
         eprintln!("[mcp] mutex poisoned: {}", e);
         "internal server error".to_string()
     })?;
 
-    let results = s.graph.search_entities(&embedding, k);
+    let results = s
+        .graph
+        .search_entities(&embedding, k)
+        .map_err(|e| e.to_string())?;
 
     let out: Vec<Value> = results
         .iter()
@@ -1253,7 +1960,7 @@ fn handle_graph_search_entities(state: &Mutex<McpState>, params: &Value) -> Resu
         query.len(),
         out.len()
     );
-    Ok(json!({ "results": out }))
+    Ok(json!({ "results": out, "embedding": embedding_src.label() }))
 }
 
 fn handle_graph_stats(state: &Mutex<McpState>) -> Result<Value, String> {
@@ -1279,6 +1986,7 @@ fn handle_graph_stats(state: &Mutex<McpState>) -> Result<Value, String> {
 /// Spatial search: uses SpatialIndex for O(|candidates|×dim) pre-filter search.
 ///
 /// Pipeline:
+///
 ///   1. SpatialIndex.filter() → candidate doc IDs (in-memory, no SQLite)
 ///   2. doc_id → vector_idx mapping (in-memory HashMap)
 ///   3. SplatStore.find_neighbors_filtered() → distance only against candidates
@@ -1311,12 +2019,8 @@ fn handle_spatial_search(state: &Mutex<McpState>, params: &Value) -> Result<Valu
         return Ok(json!({ "results": [], "total": 0, "filter": "no documents" }));
     }
 
-    // Build inverted index: doc_id → vector_idx
-    let mut doc_to_vec: HashMap<String, usize> = HashMap::new();
-    for (&vec_idx, doc_id) in &s.vector_to_doc {
-        doc_to_vec.insert(doc_id.clone(), vec_idx);
-    }
-
+    // doc_id → vector_idx comes from the persistent inverse index
+    // (`McpState::doc_to_vec`), which only ever holds live mappings.
     // Get candidate vector indices via SpatialIndex (pre-filter)
     let candidate_vec_indices: Vec<usize> = if has_filter {
         let spatial_filter = crate::spatial::SpatialFilter {
@@ -1327,7 +2031,7 @@ fn handle_spatial_search(state: &Mutex<McpState>, params: &Value) -> Result<Valu
         let candidate_ids = s.spatial_index.filter(&spatial_filter);
         candidate_ids
             .iter()
-            .filter_map(|id| doc_to_vec.get(id).copied())
+            .filter_map(|id| s.doc_to_vec.get(id).copied())
             .collect()
     } else {
         // No spatial filter — search all vectors
@@ -1346,8 +2050,12 @@ fn handle_spatial_search(state: &Mutex<McpState>, params: &Value) -> Result<Valu
 
     drop(s); // release lock before potentially blocking HTTP call
 
-    // Get embedding for query (may make HTTP call)
-    let embedding = get_embedding(query, dim);
+    // Embedding for the query: client-provided when present, else the
+    // service — or SimCos only under explicit opt-in (may make an HTTP call).
+    let (embedding, embedding_src) = match parse_embedding_param(params) {
+        Some(e) => (e, EmbeddingSource::Provided),
+        None => get_embedding_labeled(query, dim)?,
+    };
     if embedding.len() != dim {
         return Err(format!(
             "Embedding dimension mismatch: expected {dim}, got {}",
@@ -1367,28 +2075,24 @@ fn handle_spatial_search(state: &Mutex<McpState>, params: &Value) -> Result<Valu
         s.store
             .find_neighbors_filtered(&query_vec.view(), &candidate_vec_indices, top_k)
     } else {
-        let k = top_k.min(s.store.n_active());
+        let k = s.fetch_k(top_k, s.store.n_active());
         s.store.find_neighbors_fast(&query_vec.view(), k)
     };
 
     let mut out = Vec::new();
     for n in neighbors {
-        let doc_id = s
-            .vector_to_doc
-            .get(&n.index)
-            .cloned()
-            .unwrap_or_else(|| format!("vec_{}", n.index));
-        let text = s.doc_texts.get(&doc_id).cloned().unwrap_or_default();
-        let metadata: Value = match s.doc_store.get(&doc_id) {
-            Ok(Some(record)) => record.metadata.clone().unwrap_or(json!(null)),
-            _ => json!(null),
-        };
+        if !s.is_live(n.index) {
+            continue;
+        }
+        let doc_id = s.vector_to_doc.get(&n.index).cloned().unwrap_or_default();
+        let (text, metadata) = s.result_text_and_metadata(&doc_id);
         out.push(json!({
             "id": doc_id,
             "index": n.index,
             "score": n.distance,
             "text": text,
             "metadata": metadata,
+            "embedding_source": s.vector_label(&doc_id),
         }));
         if out.len() >= top_k {
             break;
@@ -1407,6 +2111,7 @@ fn handle_spatial_search(state: &Mutex<McpState>, params: &Value) -> Result<Valu
     Ok(json!({
         "results": out,
         "total": out.len(),
+        "embedding": embedding_src.label(),
         "filter": filter_desc,
         "candidates_scanned": candidate_vec_indices.len(),
     }))
@@ -1556,8 +2261,10 @@ fn handle_verbatim_search(state: &Mutex<McpState>, params: &Value) -> Result<Val
         return Ok(json!({ "results": [], "message": "No documents in store" }));
     }
 
-    let k = top_k.min(n_active);
-    let embedding = get_embedding(query, dim);
+    let (embedding, embedding_src) = match parse_embedding_param(params) {
+        Some(e) => (e, EmbeddingSource::Provided),
+        None => get_embedding_labeled(query, dim)?,
+    };
     let query_vec = Array1::from_vec(embedding);
 
     // Re-acquire lock for the actual search and result assembly
@@ -1566,14 +2273,18 @@ fn handle_verbatim_search(state: &Mutex<McpState>, params: &Value) -> Result<Val
         "internal server error".to_string()
     })?;
 
-    let k = k.min(s.store.n_active());
+    // Over-fetch by the number of dead vectors (deleted / re-stored),
+    // drop them, and keep `top_k` live results.
+    let k = s.fetch_k(top_k, s.store.n_active());
     let neighbors = s.store.find_neighbors_fast(&query_vec.view(), k);
 
     let results: Vec<Value> = neighbors
         .into_iter()
+        .filter(|n| s.is_live(n.index))
+        .take(top_k)
         .map(|n| {
             let doc_id = s.vector_to_doc.get(&n.index).cloned().unwrap_or_default();
-            let text = s.doc_texts.get(&doc_id).cloned().unwrap_or_default();
+            let text = s.doc_text(&doc_id);
 
             // Confidence classification
             let (confidence, emoji, explanation) = if n.distance < 0.3 {
@@ -1620,6 +2331,7 @@ fn handle_verbatim_search(state: &Mutex<McpState>, params: &Value) -> Result<Val
     Ok(json!({
         "query": query,
         "results": results,
+        "embedding": embedding_src.label(),
         "summary": {
             "total": results.len(),
             "high": high_count,
@@ -1738,6 +2450,14 @@ fn dispatch_request(state: &Mutex<McpState>, req: &JsonRpcRequest) -> JsonRpcRes
             error: None,
         },
 
+        // MCP liveness probe answers an empty result object (was -32601).
+        "ping" => JsonRpcResponse {
+            jsonrpc: "2.0".into(),
+            id: req.id.clone(),
+            result: Some(json!({})),
+            error: None,
+        },
+
         "tools/list" => JsonRpcResponse {
             jsonrpc: "2.0".into(),
             id: req.id.clone(),
@@ -1773,7 +2493,19 @@ fn dispatch_request(state: &Mutex<McpState>, req: &JsonRpcRequest) -> JsonRpcRes
                 "splatsdb_verbatim_search" => handle_verbatim_search(state, &arguments),
                 "splatsdb_compress" => handle_compress(&arguments),
                 "splatsdb_decompress" => handle_decompress(&arguments),
-                _ => Err(format!("unknown tool: {}", tool_name)),
+                // An unknown tool is a PROTOCOL error (invalid params),
+                // not a tool execution error wrapped in `isError` (A03-F15).
+                _ => {
+                    return JsonRpcResponse {
+                        jsonrpc: "2.0".into(),
+                        id: req.id.clone(),
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32602,
+                            message: format!("Unknown tool: {}", tool_name),
+                        }),
+                    };
+                }
             };
 
             match result {
@@ -1818,93 +2550,194 @@ fn dispatch_request(state: &Mutex<McpState>, req: &JsonRpcRequest) -> JsonRpcRes
 /// are rejected and drained (see `read_request_line`).
 const MAX_JSONRPC_LINE_LEN: usize = 10_000_000;
 
+/// Where the MCP knowledge graph is persisted (A04-F10).
+///
+/// `SPLATSDB_GRAPH_DIR` decides explicitly: a directory, or an off-value
+/// (`memory`, `off`, `none`, `0`, `false`, empty) for an in-memory graph.
+/// Without it the graph follows the doc store: beside the SQLite file when
+/// that one is durable, in memory when the doc store itself fell back to
+/// `:memory:`. The file is `graph_state.json` — the name and format the CLI
+/// `graph` commands use in their working directory — so one directory holds
+/// one graph.
+fn graph_dir_for(
+    doc_db: &std::path::Path,
+    doc_store_persistent: bool,
+) -> Option<std::path::PathBuf> {
+    if let Ok(explicit) = std::env::var("SPLATSDB_GRAPH_DIR") {
+        let dir = explicit.trim();
+        if ["", "memory", "off", "none", "0", "false"]
+            .iter()
+            .any(|off| dir.eq_ignore_ascii_case(off))
+        {
+            return None;
+        }
+        return Some(std::path::PathBuf::from(dir));
+    }
+    if !doc_store_persistent || doc_db == std::path::Path::new(":memory:") {
+        return None;
+    }
+    Some(
+        doc_db
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from(".")),
+    )
+}
+
 pub fn run_mcp_server() {
+    // A03-F15: before anything slow (warm start), so a signal during the
+    // start-up is a shutdown request and not a kill.
+    #[cfg(unix)]
+    install_shutdown_handlers();
+
     eprintln!(
         "[splatsdb] MCP server v{} starting (stdio transport)...",
         env!("CARGO_PKG_VERSION")
+    );
+
+    SIMCOS_ALLOWED.store(
+        simcos_opt_in(&std::env::var("SPLATSDB_ALLOW_SIMCOS").unwrap_or_default()),
+        Ordering::Relaxed,
     );
 
     let config = SplatsDBConfig::mcp(None);
     let mut store = SplatStore::new(config);
 
     // Initialize SQLite doc store
-    let doc_store = init_doc_store();
+    let (doc_store, doc_store_persistent, doc_db_path) = init_doc_store();
 
     // Warm start: reload documents from SQLite into vector store.
     // SPLATDB_SPATIAL_WARMSTART=0|off|false skips the spatial registration
     // phase (and its metadata extraction) — useful for large stores where
     // spatial search is not used. Default: enabled.
     let spatial_warmstart_enabled = spatial_warmstart_enabled_from_env();
-    let mut vector_to_doc: HashMap<usize, String> = HashMap::new();
-    let mut doc_texts = DocTextCache::default();
-    let mut next_id: usize = 0;
     let warm_start_t0 = std::time::Instant::now();
 
-    let warm_start_spatial = warm_start_reload(
+    let mut outcome = warm_start_reload(
         &doc_store,
         &mut store,
-        &mut vector_to_doc,
-        &mut doc_texts,
-        &mut next_id,
         spatial_warmstart_enabled,
         warm_start_t0,
     );
 
-    let state = Mutex::new(McpState {
-        store,
-        doc_store,
-        vector_to_doc,
-        doc_texts,
-        next_id,
-        graph: crate::graph_splat::GaussianGraphStore::new(),
-        spatial_index: crate::spatial::SpatialIndex::new(),
-    });
+    let mut live_state =
+        McpState::from_warm_start(store, doc_store, doc_store_persistent, &mut outcome);
+    // Knowledge graph (A04-F10): load what a previous process persisted and
+    // attach its durable home BEFORE the first request. A state file that
+    // cannot be loaded is reported here and fail-closes the graph mutators.
+    live_state.init_graph_persistence(graph_dir_for(&doc_db_path, doc_store_persistent));
+    live_state.report_graph_persistence();
+    let state = std::sync::Arc::new(Mutex::new(live_state));
 
-    register_warm_start_spatial(
-        &state,
-        &warm_start_spatial,
-        spatial_warmstart_enabled,
-        warm_start_t0,
-    );
-
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    let mut reader = stdin.lock();
-
-    // Set up signal handler for graceful shutdown
-    #[cfg(unix)]
-    {
-        unsafe {
-            libc::signal(libc::SIGINT, handle_sigint as *const () as usize);
-        }
+    if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+        // F05e: leaving — registering what an interrupted warm start managed
+        // to load only delays the exit.
+        eprintln!("[splatsdb] Warm start: spatial registration skipped (exit requested)");
+    } else {
+        register_warm_start_spatial(
+            &state,
+            &outcome.spatial,
+            spatial_warmstart_enabled,
+            warm_start_t0,
+        );
     }
 
-    eprintln!("[splatsdb] MCP server ready. Waiting for JSON-RPC on stdin...");
+    #[cfg(unix)]
+    let mut reader = StdinReader::new();
+    #[cfg(not(unix))]
+    let mut reader = io::stdin().lock();
+    let mut stdout = io::stdout();
+
+    // F05e: an exit requested while the server was still starting (warm start,
+    // graph load, spatial registration) is a SHUTDOWN, not a start. Nothing is
+    // announced ready; the request loop below is never entered (its head looks
+    // at the flag), so nothing is read and nothing is answered; and the process
+    // leaves through the one shutdown route every other exit takes.
+    if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+        eprintln!(
+            "[splatsdb] Shutdown requested during start-up: the server does NOT become ready and accepts no request."
+        );
+    } else {
+        eprintln!("[splatsdb] MCP server ready. Waiting for JSON-RPC on stdin...");
+    }
     eprintln!(
-        "[splatsdb] Env vars: SPLATSDB_EMBED_URL={}, SPLATSDB_DOC_PATH={}",
+        "[splatsdb] Env vars: SPLATSDB_EMBED_URL={}, SPLATSDB_DOC_PATH={}, SPLATSDB_ALLOW_SIMCOS={}",
         std::env::var("SPLATSDB_EMBED_URL").unwrap_or_else(|_| "(default)".into()),
-        std::env::var("SPLATSDB_DOC_PATH").unwrap_or_else(|_| "(default)".into())
+        std::env::var("SPLATSDB_DOC_PATH").unwrap_or_else(|_| "(default)".into()),
+        if SIMCOS_ALLOWED.load(Ordering::Relaxed) { "1 (SimCos fallback AUTHORIZED)" } else { "0" }
     );
 
     // Bounded line reader (fix: `reader.lines()` buffers the ENTIRE line in
     // memory before the 10MB check below could reject it — one huge line
-    // could OOM the server). read_until under a take() cap bounds the buffer
-    // at MAX+1 bytes; the remainder of an oversized line is drained in 8KB
-    // chunks and skipped, never buffered whole.
+    // could OOM the server). `read_request_line` caps a line at MAX+1 bytes
+    // and drains the remainder of an oversized line in 8KB chunks.
     let mut raw_line: Vec<u8> = Vec::with_capacity(4096);
     // Bytes that followed an oversized line's '\n' inside a drained chunk:
     // they are the START of the next (valid) request and must NOT be thrown
-    // away, or the JSON-RPC stream desynchronizes and the next message is
-    // corrupted. They are seeded into the next line read instead.
+    // away, or the JSON-RPC stream desynchronizes. They are seeded into the
+    // next line read instead.
     let mut pending: Vec<u8> = Vec::new();
-    loop {
-        if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
-            eprintln!("[splatsdb] Shutdown requested, exiting main loop.");
-            break;
-        }
 
+    // F05e: requests run on a dispatcher thread, so an exit can bound how
+    // long a request in flight may hold the exit. Nothing else changes for
+    // the client: one request at a time, answered in order, a panic inside a
+    // handler is answered as an internal error instead of killing the stream.
+    let (request_tx, request_rx) = std::sync::mpsc::channel::<JsonRpcRequest>();
+    let (response_tx, response_rx) = std::sync::mpsc::channel::<Option<JsonRpcResponse>>();
+    let dispatch_state = state;
+    std::thread::Builder::new()
+        .name("mcp-dispatch".into())
+        .spawn(move || {
+            for req in request_rx {
+                // Defense-in-depth: a panic inside any tool handler must not
+                // kill the whole MCP stdio process — the client would lose
+                // the stream. `state` is a `&Mutex` (not UnwindSafe, by
+                // poisoning design) and `req` is not guaranteed UnwindSafe
+                // either → AssertUnwindSafe.
+                let resp = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    dispatch_request(&dispatch_state, &req)
+                })) {
+                    Ok(resp) => resp,
+                    Err(payload) => {
+                        let detail = panic_payload_detail(&payload);
+                        // Panic detail goes to server stderr only, never to
+                        // the client (same convention as api_server.rs).
+                        eprintln!(
+                            "[splatsdb] PANIC in dispatch_request (method={}): {}",
+                            req.method, detail
+                        );
+                        JsonRpcResponse {
+                            jsonrpc: "2.0".into(),
+                            id: req.id.clone(),
+                            result: None,
+                            error: Some(JsonRpcError {
+                                code: -32603,
+                                message: "Internal error".into(),
+                            }),
+                        }
+                    }
+                };
+                // The answer is queued BEFORE the wakeup byte: a loop woken
+                // by the byte always finds it.
+                if response_tx.send(Some(resp)).is_err() {
+                    break;
+                }
+                wake_loop();
+            }
+            // The dispatcher is gone: whatever waits for an answer must not hang.
+            let _ = response_tx.send(None);
+        })
+        .expect("spawn the MCP dispatcher thread");
+    let mut abandoned_in_flight = false;
+
+    while !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
         let line = match read_request_line(&mut reader, &mut raw_line, &mut pending) {
             LineRead::Eof => break,
+            // A03-F15: SIGINT/SIGTERM interrupted the read — the loop head
+            // looks at the flag and leaves. A partial line is never turned
+            // into a request by that.
+            LineRead::Interrupted => continue,
             LineRead::Skip => {
                 // The oversized line was drained inside read_request_line.
                 // Reply anyway: the client's request (undetectable → id:null)
@@ -1922,73 +2755,89 @@ pub fn run_mcp_server() {
             LineRead::Line(line) => line,
         };
 
-        {
-            if line.is_empty() {
-                continue;
+        if line.is_empty() {
+            continue;
+        }
+        if line.len() > MAX_JSONRPC_LINE_LEN {
+            eprintln!(
+                "[splatsdb] rejecting oversized JSON-RPC message ({} bytes)",
+                line.len()
+            );
+            write_rpc_error(
+                &mut stdout,
+                -32600,
+                &format!(
+                    "Invalid Request: message exceeds {} bytes",
+                    MAX_JSONRPC_LINE_LEN
+                ),
+            );
+            continue;
+        }
+
+        let req: JsonRpcRequest = match parse_jsonrpc_request(&line, &mut stdout) {
+            Ok(r) => r,
+            Err(()) => continue,
+        };
+
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            // F05e: read, but NOT run — an exit was requested while the line
+            // arrived. The client gets an explicit refusal, never a silent
+            // drop and never a success.
+            eprintln!(
+                "[splatsdb] Exit requested: '{}' (id={:?}) was read but not processed",
+                req.method, req.id
+            );
+            if req.id.is_some() {
+                let refused = JsonRpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id: req.id.clone(),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32000,
+                        message: "Server is shutting down: the request was not processed".into(),
+                    }),
+                };
+                write_response(&refused, &mut stdout);
             }
-            if line.len() > MAX_JSONRPC_LINE_LEN {
-                eprintln!(
-                    "[splatsdb] rejecting oversized JSON-RPC message ({} bytes)",
-                    line.len()
-                );
-                write_rpc_error(
-                    &mut stdout,
-                    -32600,
-                    &format!(
-                        "Invalid Request: message exceeds {} bytes",
-                        MAX_JSONRPC_LINE_LEN
-                    ),
-                );
-                continue;
-            }
+            break;
+        }
 
-            let req: JsonRpcRequest = match parse_jsonrpc_request(&line, &mut stdout) {
-                Ok(r) => r,
-                Err(()) => continue,
-            };
-
-            let is_notification = req.id.is_none() && req.method != "initialize";
-
-            // Defense-in-depth: a panic inside any tool handler must not kill
-            // the whole MCP stdio process — the client would lose the stream.
-            // `state` is a `&Mutex` (not UnwindSafe, by poisoning design) and
-            // `req` is not guaranteed UnwindSafe either → AssertUnwindSafe.
-            // dispatch_request returns JsonRpcResponse directly (handlers map
-            // their Result into error responses internally), so we only need
-            // to map the Err(panic-payload) arm. If a panic poisoned the
-            // mutex, later handlers already degrade via their
-            // `lock().map_err(...)` arms instead of panicking again.
-            let resp = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                dispatch_request(&state, &req)
-            })) {
-                Ok(resp) => resp,
-                Err(payload) => {
-                    let detail = panic_payload_detail(&payload);
-                    // Panic detail goes to server stderr only, never to the
-                    // client (same convention as api_server.rs).
-                    eprintln!(
-                        "[splatsdb] PANIC in dispatch_request (method={}): {}",
-                        req.method, detail
-                    );
-                    JsonRpcResponse {
-                        jsonrpc: "2.0".into(),
-                        id: req.id.clone(),
-                        result: None,
-                        error: Some(JsonRpcError {
-                            code: -32603,
-                            message: "Internal error".into(),
-                        }),
-                    }
+        let is_notification = req.id.is_none() && req.method != "initialize";
+        if request_tx.send(req).is_err() {
+            break; // the dispatcher is gone: nothing can be answered any more
+        }
+        match wait_for_response(&response_rx) {
+            Some(resp) => {
+                if !is_notification && resp.id.is_some() {
+                    // F05e: a forced exit (second signal) must not cut the
+                    // line in half — the signal is delivered right after it.
+                    with_shutdown_signals_blocked(|| write_response(&resp, &mut stdout));
                 }
-            };
-
-            if !is_notification && resp.id.is_some() {
-                write_response(&resp, &mut stdout);
+            }
+            None => {
+                abandoned_in_flight = true;
+                break;
             }
         }
     }
 
-    eprintln!("[splatsdb] MCP server shutting down (stdin closed.");
+    if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+        eprintln!("[splatsdb] Shutdown requested, exiting main loop.");
+    }
+    let _ = stdout.flush();
+    eprintln!(
+        "[splatsdb] MCP server shutting down ({}).",
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            "exit signal"
+        } else {
+            "stdin closed"
+        }
+    );
+    if abandoned_in_flight {
+        // The dispatcher may still be inside the abandoned request: leave
+        // at once instead of racing it for the process exit.
+        std::process::exit(0);
+    }
 }
 
 /// (doc_id, wing, room, hall) pairs collected during warm start for spatial
@@ -2008,7 +2857,15 @@ fn register_warm_start_spatial(
     spatial_warmstart_enabled: bool,
     warm_start_t0: std::time::Instant,
 ) {
-    let mut s = state.lock().unwrap();
+    // Never `unwrap()` a production lock (A05-F12): a poisoned mutex must
+    // degrade to a logged, controlled failure — not kill the stdio server.
+    let mut s = match state.lock() {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("[splatsdb] ERROR: state mutex poisoned, skipping spatial warm-start registration: {e}");
+            return;
+        }
+    };
     for (doc_id, wing, room, hall) in warm_start_spatial {
         s.spatial_index
             .register_doc(doc_id, wing.as_deref(), room.as_deref(), hall.as_deref());
@@ -2033,7 +2890,11 @@ fn register_warm_start_spatial(
 ///
 /// Extracted from `run_mcp_server`; messages and behavior identical,
 /// including the FATAL exit when even `:memory:` fails.
-fn init_doc_store() -> SqliteMetadataStore {
+fn init_doc_store() -> (
+    SqliteMetadataStore,
+    bool,               /* persistent */
+    std::path::PathBuf, /* the configured path, even after a fallback */
+) {
     let db_path = std::env::var("SPLATSDB_DOC_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
@@ -2043,109 +2904,162 @@ fn init_doc_store() -> SqliteMetadataStore {
     match SqliteMetadataStore::new(db_path.clone()) {
         Ok(ds) => {
             eprintln!("[splatsdb] SQLite doc store: {:?}", db_path);
-            ds
+            (ds, true, db_path)
         }
         Err(e) => {
             eprintln!(
-                "[splatsdb] WARNING: SQLite init failed ({}), docs won't persist",
+                "[splatsdb] WARNING: SQLite init failed ({}), docs won't persist — running on an in-memory store (ephemeral:true, persisted:false)",
                 e
             );
-            SqliteMetadataStore::new(std::path::PathBuf::from(":memory:")).unwrap_or_else(|e| {
-                eprintln!("[splatsdb] FATAL: in-memory SQLite failed: {}", e);
-                std::process::exit(1);
-            })
+            let ephemeral = SqliteMetadataStore::new(std::path::PathBuf::from(":memory:"))
+                .unwrap_or_else(|e| {
+                    eprintln!("[splatsdb] FATAL: in-memory SQLite failed: {}", e);
+                    std::process::exit(1);
+                });
+            (ephemeral, false, db_path)
         }
     }
 }
 
 /// Warm start: reload persisted documents from SQLite into the vector store.
 ///
-/// Extracted from `run_mcp_server`; behavior identical: caps at
-/// `MAX_WARM_START_DOCS`, honours the shutdown flag mid-loop, skips empty
-/// texts, extracts spatial metadata only when `spatial_warmstart_enabled`,
-/// re-embeds every document, advances `next_id` past any `mem_N` id, syncs
-/// HNSW once at the end, and reports progress/final timing on stderr.
+/// F05b (A03-F10, persistence half): a document that has a VALID stored
+/// vector is indexed from that vector — no embed service, no re-embedding —
+/// and keeps the provenance it was stored with (`stored_real` /
+/// `stored_simcos` / `stored_provided`; SimCos is never promoted).
 ///
-/// Returns the (doc_id, wing, room, hall) tuples collected for the later
-/// spatial registration pass.
-#[allow(clippy::too_many_arguments)]
+/// - No stored vector (legacy rows of the pre-vector schema): embedded only
+///   when the real service answers, or SimCos under explicit opt-in (the
+///   A03-F10 strictness is unchanged); the vector is then backfilled so the
+///   next restart needs no service. Without either the document stays
+///   readable but unindexed — counted and reported, never deleted.
+/// - Stored vector that fails validation (length ≠ dim·4, non-finite,
+///   another dimension, missing/unknown label): QUARANTINED — not indexed,
+///   not resized, not overwritten, reported with a per-document diagnostic.
+///
+/// Caps at `MAX_WARM_START_DOCS`, honours the shutdown flag mid-loop, skips
+/// empty texts, extracts spatial metadata only when
+/// `spatial_warmstart_enabled`, advances `next_id` past any `mem_N` id, syncs
+/// HNSW once at the end and reports the accounting on stderr.
 fn warm_start_reload(
     doc_store: &SqliteMetadataStore,
     store: &mut SplatStore,
-    vector_to_doc: &mut HashMap<usize, String>,
-    doc_texts: &mut DocTextCache,
-    next_id: &mut usize,
     spatial_warmstart_enabled: bool,
     warm_start_t0: std::time::Instant,
-) -> WarmStartSpatial {
-    let mut warm_start_spatial: WarmStartSpatial = Vec::new();
+) -> WarmStartOutcome {
+    let mut outcome = WarmStartOutcome {
+        vector_to_doc: HashMap::new(),
+        doc_texts: DocTextCache::default(),
+        next_id: 0,
+        spatial: Vec::new(),
+        stats: WarmStartStats::default(),
+        sources: HashMap::new(),
+    };
+    let stats = &mut outcome.stats;
+    let mut quarantined: Vec<String> = Vec::new();
+    // Legacy rows no real embed call could index (reported with their ids).
+    let mut unindexed_ids: Vec<String> = Vec::new();
     let dim = store.get_statistics().embedding_dim;
-    match doc_store.list_ids(false) {
-        Ok(ids) => {
-            let total = ids.len();
+    let total = doc_store.count(false).unwrap_or(0);
+    stats.documents = total;
+    match doc_store.list_with_embeddings(MAX_WARM_START_DOCS, dim) {
+        Ok(docs) => {
             if total > MAX_WARM_START_DOCS {
                 eprintln!(
                     "[splatsdb] Warm start: {} docs found, capping at {} for performance",
                     total, MAX_WARM_START_DOCS
                 );
             }
-            for (i, doc_id) in ids.iter().enumerate().take(MAX_WARM_START_DOCS) {
+            for (i, stored) in docs.iter().enumerate() {
                 if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
                     eprintln!("[splatsdb] Warm start interrupted by shutdown signal");
                     break;
                 }
-                if let Ok(Some(record)) = doc_store.get(doc_id) {
-                    let text = record.document.clone().unwrap_or_default();
-                    if text.is_empty() {
+                let doc_id = stored.record.id.as_str();
+                let text = stored.record.document.clone().unwrap_or_default();
+                if text.is_empty() {
+                    continue;
+                }
+
+                // Extract spatial metadata from the JSON metadata field
+                // (skipped entirely when spatial warm-start is disabled)
+                let meta = stored.record.metadata.as_ref();
+                let (meta_wing, meta_room, meta_hall) = if spatial_warmstart_enabled {
+                    let key = |k: &str| {
+                        meta.and_then(|m| m.get(k))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    };
+                    (key("wing"), key("room"), key("hall"))
+                } else {
+                    (None, None, None)
+                };
+
+                // Where the indexed vector comes from (see the doc comment).
+                let (embedding, source) = match (&stored.embedding, &stored.embedding_error) {
+                    (Some(kept), _) => {
+                        stats.vectors_loaded += 1;
+                        match kept.source {
+                            EmbeddingProvenance::Real => stats.stored_real += 1,
+                            EmbeddingProvenance::SimCos => stats.stored_simcos += 1,
+                            EmbeddingProvenance::Provided => stats.stored_provided += 1,
+                        }
+                        (kept.vector.clone(), kept.source)
+                    }
+                    (None, Some(why)) => {
+                        stats.quarantined += 1;
+                        quarantined.push(format!("{doc_id}: {why}"));
                         continue;
                     }
-
-                    // Extract spatial metadata from the JSON metadata field
-                    // (skipped entirely when spatial warm-start is disabled)
-                    let (meta_wing, meta_room, meta_hall) = if spatial_warmstart_enabled {
-                        (
-                            record.metadata.as_ref().and_then(|m| {
-                                m.get("wing")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string())
-                            }),
-                            record.metadata.as_ref().and_then(|m| {
-                                m.get("room")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string())
-                            }),
-                            record.metadata.as_ref().and_then(|m| {
-                                m.get("hall")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string())
-                            }),
-                        )
-                    } else {
-                        (None, None, None)
-                    };
-
-                    // Re-compute embedding and add to vector store
-                    let embedding = get_embedding(&text, dim);
-                    if let Ok(arr) = Array2::from_shape_vec((1, dim), embedding) {
-                        let vector_idx = store.n_active();
-                        if store.add_splat(&arr) {
-                            vector_to_doc.insert(vector_idx, doc_id.clone());
-                            doc_texts.insert(doc_id.clone(), text);
-                            *next_id = (*next_id).max(
-                                doc_id
-                                    .strip_prefix("mem_")
-                                    .and_then(|s| s.parse::<usize>().ok())
-                                    .unwrap_or(0),
-                            );
-                            // Save spatial metadata for later registration
-                            if meta_wing.is_some() || meta_room.is_some() || meta_hall.is_some() {
-                                warm_start_spatial.push((
-                                    doc_id.clone(),
-                                    meta_wing.clone(),
-                                    meta_room.clone(),
-                                    meta_hall.clone(),
-                                ));
+                    // F05e: a legacy row is re-embedded by the REAL service
+                    // or not at all — the SimCos text-hash is never written
+                    // into a stored vector behind the operator's back, and
+                    // `reembedded` only counts a vector that a real call
+                    // computed AND that was written back.
+                    (None, None) => match get_embedding_strict(&text, dim) {
+                        Some(vector) => {
+                            match doc_store.set_embedding(
+                                doc_id,
+                                &vector,
+                                provenance_of(EmbeddingSource::Real),
+                            ) {
+                                Ok(_) => stats.reembedded += 1,
+                                Err(e) => {
+                                    eprintln!(
+                                        "[splatsdb] WARNING: Warm start: could not persist the embedding of legacy doc {doc_id}: {e}"
+                                    );
+                                    stats.backfill_failed += 1;
+                                }
                             }
+                            (vector, provenance_of(EmbeddingSource::Real))
+                        }
+                        None => {
+                            stats.unindexed += 1;
+                            unindexed_ids.push(doc_id.to_string());
+                            continue;
+                        }
+                    },
+                };
+                if let Ok(arr) = Array2::from_shape_vec((1, dim), embedding) {
+                    let vector_idx = store.n_active();
+                    if store.add_splat(&arr) {
+                        outcome.vector_to_doc.insert(vector_idx, doc_id.to_string());
+                        outcome.doc_texts.insert(doc_id.to_string(), text);
+                        outcome.sources.insert(doc_id.to_string(), source);
+                        outcome.next_id = outcome.next_id.max(
+                            doc_id
+                                .strip_prefix("mem_")
+                                .and_then(|s| s.parse::<usize>().ok())
+                                .unwrap_or(0),
+                        );
+                        // Save spatial metadata for later registration
+                        if meta_wing.is_some() || meta_room.is_some() || meta_hall.is_some() {
+                            outcome.spatial.push((
+                                doc_id.to_string(),
+                                meta_wing.clone(),
+                                meta_room.clone(),
+                                meta_hall.clone(),
+                            ));
                         }
                     }
                 }
@@ -2157,25 +3071,230 @@ fn warm_start_reload(
                     );
                 }
             }
-            if !ids.is_empty() {
+            // F05e: leaving — indexing what an interrupted warm start loaded
+            // only delays the exit.
+            if !docs.is_empty() && !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
                 store.hnsw_sync_incremental();
+            }
+            if total > 0 {
+                let indexed = outcome.doc_texts.len();
                 eprintln!(
-                    "[splatsdb] Warm start: reloaded {}/{} documents from SQLite in {:.0} ms",
-                    doc_texts.len().min(MAX_WARM_START_DOCS),
-                    total,
-                    warm_start_t0.elapsed().as_secs_f64() * 1000.0
+                    "[splatsdb] Warm start: reloaded {indexed}/{total} documents from SQLite in {:.0} ms (stored vectors loaded: {} [real={} simcos={} provided={}], re-embedded: {}, not indexed: {}, quarantined: {})",
+                    warm_start_t0.elapsed().as_secs_f64() * 1000.0,
+                    stats.vectors_loaded,
+                    stats.stored_real,
+                    stats.stored_simcos,
+                    stats.stored_provided,
+                    stats.reembedded,
+                    stats.unindexed,
+                    stats.quarantined
                 );
             }
         }
-        Err(e) => eprintln!("[splatsdb] Warm start: could not list docs: {}", e),
+        Err(e) => eprintln!("[splatsdb] Warm start: could not list docs: {e}"),
     }
-    warm_start_spatial
+    if stats.unindexed > 0 {
+        eprintln!(
+            "[splatsdb] WARNING: Warm start: {} documents were NOT indexed — QUARANTINED legacy rows without a stored vector: the embed service did not answer, and a warm start never stores the SimCos text-hash as their vector (a restart with the service up makes one real call per row and stores it; until then they are invisible to search). Left untouched in SQLite. ids: {}",
+            stats.unindexed,
+            unindexed_ids
+                .iter()
+                .take(50)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if stats.quarantined > 0 {
+        eprintln!(
+            "[splatsdb] WARNING: Warm start: {} stored vectors QUARANTINED (refused, not indexed; the blobs were left untouched on disk — re-store the document to replace it): {}",
+            stats.quarantined,
+            quarantined
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+    if stats.stored_simcos > 0 {
+        eprintln!(
+            "[splatsdb] WARNING: Warm start: {} stored vectors are SimCos text-hash (labelled stored_simcos, never promoted): ranking for those documents is not semantic — re-store them once the embed service is up",
+            stats.stored_simcos
+        );
+    }
+    outcome
+}
+
+/// How long a request in flight may keep running after the exit signal
+/// before it is abandoned (F05e). Nothing abandoned is acknowledged.
+const IN_FLIGHT_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_millis(1900);
+
+/// Wait for the dispatcher's answer to the request just handed over (F05e).
+///
+/// Without an exit request this waits as long as the request takes. Once one
+/// is pending it waits at most `IN_FLIGHT_SHUTDOWN_WAIT`: a request still
+/// running then is abandoned — `None`, no response is written, so nothing
+/// that did not finish is ever acknowledged — and the loop leaves. An answer
+/// that does arrive is truthful by construction: every mutation is persisted
+/// before its handler returns it. `None` also when the dispatcher is gone.
+fn wait_for_response(
+    responses: &std::sync::mpsc::Receiver<Option<JsonRpcResponse>>,
+) -> Option<JsonRpcResponse> {
+    let mut give_up: Option<std::time::Instant> = None;
+    loop {
+        match responses.try_recv() {
+            Ok(resp) => return resp,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            let started = std::time::Instant::now();
+            let deadline = *give_up.get_or_insert_with(|| started + IN_FLIGHT_SHUTDOWN_WAIT);
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                eprintln!(
+                    "[splatsdb] Exit requested: the request in flight did not finish within {:?}; NO response is emitted for it — whatever it did not complete is not acknowledged",
+                    IN_FLIGHT_SHUTDOWN_WAIT
+                );
+                return None;
+            }
+            poll_wake(Some(left));
+        } else {
+            poll_wake(Some(std::time::Duration::from_millis(50)));
+        }
+    }
+}
+
+/// The JSON-RPC stdin as a `BufRead` that never blocks without a wakeup
+/// path (F05e, unix): bytes come straight from fd 0 and a `read` is only
+/// issued after `poll` reports the fd readable OR the wake pipe written.
+///
+/// * An exit request arriving at ANY moment — between the loop's flag check
+///   and the read, on another thread, in the middle of a line — ends the
+///   wait: it surfaces as `ErrorKind::Interrupted`, which
+///   `read_line_capped` turns into `LineRead::Interrupted`; the partial
+///   line stays in `raw_line` and is never taken for a complete request.
+/// * Any other interruption keeps waiting and keeps the partial line.
+#[cfg(unix)]
+struct StdinReader {
+    buf: Box<[u8]>,
+    pos: usize,
+    cap: usize,
+}
+
+#[cfg(unix)]
+impl StdinReader {
+    fn new() -> Self {
+        Self {
+            buf: vec![0u8; 8 * 1024].into_boxed_slice(),
+            pos: 0,
+            cap: 0,
+        }
+    }
+
+    /// One `read` on fd 0; `Err(Interrupted)` only for a pending exit.
+    fn fill(&mut self) -> io::Result<()> {
+        loop {
+            if WAKE_READ_FD.load(Ordering::SeqCst) >= 0 && !wait_for_stdin() {
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            // SAFETY: `read` on fd 0 into `buf`; the result is ≥ 0 and ≤ len.
+            let n = unsafe {
+                libc::read(
+                    libc::STDIN_FILENO,
+                    self.buf.as_mut_ptr().cast(),
+                    self.buf.len(),
+                )
+            };
+            if n >= 0 {
+                self.pos = 0;
+                self.cap = n as usize;
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+            // Interrupted by a signal: leave only when an exit is pending.
+            if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+        }
+    }
+}
+
+/// `poll` on stdin + the wake pipe; false when an exit is pending (the
+/// caller must not read on).
+#[cfg(unix)]
+fn wait_for_stdin() -> bool {
+    let mut fds = [
+        libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: WAKE_READ_FD.load(Ordering::SeqCst),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        // SAFETY: `fds` holds two valid entries for the call.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if ready >= 0 {
+            break;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return true; // let the read report it
+        }
+        drain_wake_pipe();
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            return false;
+        }
+    }
+    drain_wake_pipe();
+    !SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
+}
+
+#[cfg(unix)]
+impl std::io::Read for StdinReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.pos == self.cap {
+            if out.is_empty() {
+                return Ok(0);
+            }
+            self.fill()?;
+        }
+        let n = out.len().min(self.cap - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+#[cfg(unix)]
+impl std::io::BufRead for StdinReader {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.pos == self.cap {
+            self.fill()?;
+        }
+        Ok(&self.buf[self.pos..self.cap])
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.pos = (self.pos + n).min(self.cap);
+    }
 }
 
 /// Outcome of one bounded line read from the JSON-RPC stdin stream.
 enum LineRead {
     /// A complete (possibly empty after trimming) request line.
     Line(String),
+    /// Interrupted while a shutdown is pending — the line is left as it is.
+    Interrupted,
     /// Oversized line rejected and drained — skip to the next read.
     Skip,
     /// EOF or stdin error — leave the main loop.
@@ -2188,6 +3307,51 @@ enum LineRead {
 /// MAX+1 bytes; the remainder of an oversized line is drained in 8KB chunks
 /// and skipped, never buffered whole.
 ///
+/// `read_until(b'\n')` under a hard cap on the line length (A03-F15).
+///
+/// std's `read_until` swallows `ErrorKind::Interrupted` — it retries the
+/// read — so a signal arriving while the server was blocked on an idle stdin
+/// was never seen. With the shutdown handlers installed WITHOUT SA_RESTART
+/// the read returns EINTR and THIS is where it gets out: `Ok(None)` means
+/// "interrupted while a shutdown is pending". Any other interruption simply
+/// goes on reading and keeps the partial line (the stream stays in sync).
+/// `cap` bounds `raw_line.len()` exactly like the former `Take` bounded the
+/// bytes it read.
+fn read_line_capped(
+    reader: &mut impl std::io::BufRead,
+    raw_line: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<Option<usize>> {
+    let mut read = 0;
+    loop {
+        let room = cap.saturating_sub(raw_line.len());
+        if room == 0 {
+            return Ok(Some(read));
+        }
+        let available = match reader.fill_buf() {
+            Ok(buf) => buf,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
+                if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let taken = available.len().min(room);
+        let (used, done) = match available[..taken].iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (taken, false),
+        };
+        raw_line.extend_from_slice(&available[..used]);
+        reader.consume(used);
+        read += used;
+        if done || used == 0 {
+            return Ok(Some(read));
+        }
+    }
+}
+
 /// Extracted from `run_mcp_server`; behavior identical, including the
 /// `pending` seeding: bytes that followed an oversized line's '\n' inside a
 /// drained chunk are the START of the next (valid) request and must NOT be
@@ -2199,8 +3363,7 @@ fn read_request_line(
 ) -> LineRead {
     raw_line.clear();
     let read = if pending.is_empty() {
-        let mut capped = reader.take(MAX_JSONRPC_LINE_LEN as u64 + 1);
-        capped.read_until(b'\n', raw_line)
+        read_line_capped(reader, raw_line, MAX_JSONRPC_LINE_LEN + 1)
     } else if let Some(pos) = pending.iter().position(|&b| b == b'\n') {
         // Pending holds ≥1 COMPLETE line (pipelined requests that followed the
         // oversized one): return the first now and keep the rest queued.
@@ -2221,11 +3384,15 @@ fn read_request_line(
         raw_line.extend_from_slice(pending);
         pending.clear();
         let seeded = raw_line.len();
-        let mut capped = reader.take(MAX_JSONRPC_LINE_LEN as u64 + 1);
-        match capped.read_until(b'\n', raw_line) {
-            Ok(n) => Ok(seeded + n),
-            Err(e) => Err(e),
-        }
+        // Same bound as the former `Take`: at most MAX+1 fresh bytes.
+        read_line_capped(reader, raw_line, seeded + MAX_JSONRPC_LINE_LEN + 1)
+            .map(|read| read.map(|n| n + seeded))
+    };
+    let read = match read {
+        // A03-F15: the shutdown signal interrupted the read.
+        Ok(None) => return LineRead::Interrupted,
+        Ok(Some(read)) => Ok(read),
+        Err(e) => Err(e),
     };
     match read {
         Ok(0) => LineRead::Eof, // EOF — stdin closed
@@ -2548,4 +3715,423 @@ mod tests {
         assert!(!all_finite(&[f32::NAN]));
         assert!(!all_finite(&[0.0, 1.0, f32::NAN, 2.0]));
     }
+
+    /// A03-F10: the opt-in parser accepts only explicit affirmations.
+    #[test]
+    fn f10_simcos_opt_in_truth_table() {
+        for v in ["1", "true", "yes", "on", "TRUE", " yes ", "On"] {
+            assert!(simcos_opt_in(v), "{v:?} must parse as opt-in");
+        }
+        for v in ["", "0", "false", "no", "off", "2", "anything-else"] {
+            assert!(!simcos_opt_in(v), "{v:?} must NOT parse as opt-in");
+        }
+    }
+
+    /// A03-F10: without the service, the resolver errors unless SimCos was
+    /// explicitly authorized — and then labels it. No silent path exists.
+    #[test]
+    fn f10_resolver_never_falls_back_silently() {
+        let (svc, opt) = (
+            EMBED_SERVICE_AVAILABLE.load(Ordering::Relaxed),
+            SIMCOS_ALLOWED.load(Ordering::Relaxed),
+        );
+        EMBED_SERVICE_AVAILABLE.store(false, Ordering::Relaxed);
+        SIMCOS_ALLOWED.store(false, Ordering::Relaxed);
+
+        let err = get_embedding_labeled("hello world", 16)
+            .expect_err("no service + no opt-in must fail closed");
+        assert!(err.contains("embedding unavailable"), "{err}");
+        assert!(err.contains("SPLATSDB_ALLOW_SIMCOS"), "{err}");
+
+        SIMCOS_ALLOWED.store(true, Ordering::Relaxed);
+        let (vec, src) =
+            get_embedding_labeled("hello world", 16).expect("opt-in authorizes SimCos");
+        assert_eq!(src, EmbeddingSource::SimCos);
+        assert_eq!(src.label(), "simcos");
+        assert_eq!(vec.len(), 16);
+        assert_eq!(vec, simcos_embedding("hello world", 16));
+        assert!(all_finite(&vec));
+
+        EMBED_SERVICE_AVAILABLE.store(svc, Ordering::Relaxed);
+        SIMCOS_ALLOWED.store(opt, Ordering::Relaxed);
+        assert_eq!(EmbeddingSource::Real.label(), "real");
+        assert_eq!(EmbeddingSource::Provided.label(), "provided");
+    }
+
+    /// Small, fast `McpState` for handler-level tests (8-dim store,
+    /// in-memory docs, non-persistent).
+    fn f05a_state() -> Mutex<McpState> {
+        let mut config = SplatsDBConfig::mcp(None);
+        config.max_splats = 256;
+        config.latent_dim = 8;
+        let store = SplatStore::new(config);
+        let docs = SqliteMetadataStore::new(std::path::PathBuf::from(":memory:"))
+            .expect("in-memory doc store");
+        Mutex::new(McpState::new(store, docs, false))
+    }
+
+    fn f05a_emb(i: f64) -> Value {
+        json!([1.0, 0.3 * i, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    }
+
+    fn f05a_ids(res: &Value) -> Vec<String> {
+        res["results"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no results array: {res}"))
+            .iter()
+            .map(|r| r["id"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    /// F05b (A03-F10, persistence half): the warm start indexes stored
+    /// vectors directly — each with the label it was stored with — instead
+    /// of embedding again; a blob of another dimension is quarantined.
+    #[test]
+    fn p05_warm_start_loads_stored_vectors_with_their_labels() {
+        let dir = std::env::temp_dir().join(format!(
+            "splatsdb-mcp-p05-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let doc_store = SqliteMetadataStore::new(dir.join("docs.db")).expect("doc store");
+        let record = |id: &str, text: &str| DocumentRecord {
+            id: id.into(),
+            shard_idx: 0,
+            vector_idx: 0,
+            metadata: Some(json!({ "text": text, "wing": format!("{id}_wing") })),
+            document: Some(text.into()),
+            deleted: false,
+            created_at: 1.0,
+            updated_at: 1.0,
+        };
+        doc_store
+            .upsert_with_embedding(
+                &record("r", "real text"),
+                &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                EmbeddingProvenance::Real,
+            )
+            .unwrap();
+        doc_store
+            .upsert_with_embedding(
+                &record("s", "simcos text"),
+                &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                EmbeddingProvenance::SimCos,
+            )
+            .unwrap();
+        doc_store
+            .upsert_with_embedding(
+                &record("p", "provided text"),
+                &[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                EmbeddingProvenance::Provided,
+            )
+            .unwrap();
+        // Another dimension than the store → quarantined.
+        doc_store
+            .upsert_with_embedding(
+                &record("bad", "bad dim text"),
+                &[0.0; 4],
+                EmbeddingProvenance::Real,
+            )
+            .unwrap();
+        // A legacy row without any vector (pre-F05b writer).
+        let mut legacy = record("legacy", "legacy text");
+        legacy.metadata = Some(json!({ "text": "legacy text" }));
+        doc_store.upsert(&legacy).unwrap();
+
+        let mut config = SplatsDBConfig::mcp(None);
+        config.max_splats = 256;
+        config.latent_dim = 8;
+        let mut store = SplatStore::new(config);
+        let mut outcome =
+            warm_start_reload(&doc_store, &mut store, true, std::time::Instant::now());
+
+        let stats = outcome.stats;
+        assert_eq!(stats.vectors_loaded, 3);
+        assert_eq!(
+            (
+                stats.stored_real,
+                stats.stored_simcos,
+                stats.stored_provided
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            stats.quarantined, 1,
+            "a 4-dim blob in an 8-dim store is quarantined"
+        );
+        // The legacy row is either embedded or reported unindexed — whatever
+        // the process-global service/SimCos flags say while the other lib
+        // tests run — but it is never loaded from a vector it does not have.
+        assert_eq!(stats.reembedded + stats.unindexed, 1);
+
+        let state = Mutex::new(McpState::from_warm_start(
+            store,
+            doc_store,
+            true,
+            &mut outcome,
+        ));
+        let res = handle_search(
+            &state,
+            &json!({ "query": "q", "embedding": f05a_emb(1.0), "top_k": 10 }),
+        )
+        .unwrap();
+        let mut labels: Vec<(String, String)> = res["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["id"].as_str().unwrap().to_string(),
+                    r["embedding_source"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        labels.sort();
+        for (id, label) in [
+            ("p", "stored_provided"),
+            ("r", "stored_real"),
+            ("s", "stored_simcos"),
+        ] {
+            let wanted = (id.to_string(), label.to_string());
+            assert!(labels.contains(&wanted), "{labels:?}");
+        }
+        assert!(labels
+            .iter()
+            .all(|(_, l)| l.starts_with("stored_") || l == "simcos" || l == "real"));
+        assert_eq!(res["embedding"], json!("provided"));
+        let status = handle_status(&state).unwrap();
+        assert_eq!(
+            status["vector_persistence"]["warm_start"]["vectors_loaded"],
+            json!(3)
+        );
+        assert_eq!(
+            status["vector_persistence"]["warm_start"]["quarantined"],
+            json!(1)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A03-F11 (handlers): doc_del tombstones the vector and top-k is
+    /// refilled; re-store retires the old mapping (exactly one hit, new text).
+    #[test]
+    fn f11_handlers_tombstone_delete_and_restore() {
+        let state = f05a_state();
+        for i in 1..=5u32 {
+            let id = format!("t{i}");
+            let stored = handle_store(
+                &state,
+                &json!({ "text": format!("text {id} v1"), "id": id, "embedding": f05a_emb(i as f64) }),
+            )
+            .expect("store");
+            assert_eq!(stored["id"], json!(id));
+        }
+        let search = |top_k: u64, q: Value| {
+            handle_search(
+                &state,
+                &json!({ "query": "q", "embedding": q, "top_k": top_k }),
+            )
+            .expect("search")
+        };
+        assert_eq!(f05a_ids(&search(3, f05a_emb(3.0))), vec!["t3", "t2", "t4"]);
+
+        handle_doc_del(&state, &json!({ "id": "t3" })).expect("del");
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.store.n_active(), 5, "the splat physically stays");
+            assert_eq!(s.tombstones, std::collections::HashSet::from([2]));
+            assert!(!s.doc_to_vec.contains_key("t3"));
+            assert!(!s.vector_to_doc.contains_key(&2));
+            assert_eq!(s.live_vectors(), 4);
+            assert!(s.doc_texts.get("t3").is_none());
+        }
+        // Top-k is refilled past the tombstone: 4 live docs, never a `vec_N`.
+        let res = search(5, f05a_emb(3.0));
+        let got = f05a_ids(&res);
+        assert_eq!(got.len(), 4, "{res}");
+        assert!(!got.contains(&"t3".to_string()), "{res}");
+        assert!(res["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| !r["text"].as_str().unwrap_or("").is_empty()));
+        // status exposes the difference between physical and live vectors
+        let status = handle_status(&state).unwrap();
+        assert_eq!(status["n_active"], json!(5));
+        assert_eq!(status["live_vectors"], json!(4));
+        assert_eq!(status["tombstoned_vectors"], json!(1));
+
+        // Re-store t1 with a NEW vector and text → exactly one hit, the new text.
+        handle_store(
+            &state,
+            &json!({ "text": "text t1 v2", "id": "t1", "embedding": json!([0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]) }),
+        )
+        .expect("re-store");
+        for q in [
+            json!([0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            f05a_emb(1.0),
+        ] {
+            let res = search(10, q);
+            let got = f05a_ids(&res);
+            assert_eq!(
+                got.iter().filter(|i| *i == "t1").count(),
+                1,
+                "duplicate mapping: {res}"
+            );
+            assert_eq!(got.len(), 4, "{res}");
+            let t1 = res["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == "t1")
+                .unwrap();
+            assert_eq!(t1["text"], json!("text t1 v2"), "stale text: {res}");
+        }
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.live_vectors(), 4);
+            assert_eq!(s.tombstones.len(), 2);
+            assert_eq!(s.doc_to_vec["t1"], 5);
+        }
+
+        // Deleting an unknown doc is still a clean "not found".
+        let err = handle_doc_del(&state, &json!({ "id": "nope" })).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    /// A03-F14: with the text cache capped at ONE entry, the doc evicted by
+    /// the next store still returns its text from `record.document` in every
+    /// search handler (it used to come back as `"text": ""`).
+    #[test]
+    fn f14_search_text_falls_back_to_record_when_cache_evicted() {
+        let state = f05a_state();
+        state.lock().unwrap().doc_texts.cap = 1;
+        for i in 1..=2u32 {
+            let id = format!("e{i}");
+            handle_store(
+                &state,
+                &json!({ "text": format!("persisted text of {id}"), "id": id, "embedding": f05a_emb(i as f64) }),
+            )
+            .expect("store");
+        }
+        {
+            let s = state.lock().unwrap();
+            assert!(
+                s.doc_texts.get("e1").is_none(),
+                "precondition: e1 evicted from the cache"
+            );
+            assert_eq!(
+                s.doc_store.get("e1").unwrap().unwrap().document.as_deref(),
+                Some("persisted text of e1")
+            );
+            assert_eq!(s.doc_text("e1"), "persisted text of e1");
+        }
+        // Same signature for the three search handlers (coerced to one fn type).
+        for h in [
+            handle_search as fn(&Mutex<McpState>, &Value) -> Result<Value, String>,
+            handle_spatial_search,
+            handle_verbatim_search,
+        ] {
+            let res = h(
+                &state,
+                &json!({ "query": "q", "embedding": f05a_emb(1.0), "top_k": 2 }),
+            )
+            .expect("search");
+            let texts: Vec<String> = res["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["text"].as_str().unwrap_or("").to_string())
+                .collect();
+            assert_eq!(
+                texts,
+                vec![
+                    "persisted text of e1".to_string(),
+                    "persisted text of e2".to_string()
+                ],
+                "{res}"
+            );
+        }
+        // A doc with no row at all (cannot happen through the handlers) still degrades to "".
+        assert_eq!(state.lock().unwrap().doc_text("ghost"), "");
+    }
+
+    /// A05-F12: a poisoned state mutex never panics the stdio server. Every
+    /// tool that takes the lock answers a controlled error, and the
+    /// cold-start helper returns instead of unwrapping.
+    #[test]
+    fn f12_poisoned_state_mutex_yields_controlled_errors() {
+        let state = f05a_state();
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state.lock().unwrap();
+            panic!("poison probe");
+        }));
+        std::panic::set_hook(prev_hook);
+        assert!(
+            poisoned.is_err(),
+            "probe must have panicked while holding the lock"
+        );
+        assert!(state.is_poisoned());
+
+        // Cold-start path: no panic on the poisoned lock.
+        register_warm_start_spatial(
+            &state,
+            &vec![("d".to_string(), None, None, None)],
+            true,
+            std::time::Instant::now(),
+        );
+
+        let calls: [(&str, Value); 14] = [
+            ("splatsdb_store", json!({ "text": "t", "id": "p" })),
+            ("splatsdb_search", json!({ "query": "q" })),
+            ("splatsdb_status", json!({})),
+            ("splatsdb_doc_add", json!({ "id": "p", "text": "t" })),
+            ("splatsdb_doc_get", json!({ "id": "p" })),
+            ("splatsdb_doc_del", json!({ "id": "p" })),
+            ("splatsdb_graph_add_doc", json!({ "text": "t" })),
+            (
+                "splatsdb_graph_add_entity",
+                json!({ "name": "n", "entity_type": "x" }),
+            ),
+            (
+                "splatsdb_graph_add_relation",
+                json!({ "source_id": 1, "target_id": 2, "relation_type": "r" }),
+            ),
+            ("splatsdb_graph_traverse", json!({ "start_id": 1 })),
+            ("splatsdb_graph_search", json!({ "query": "q" })),
+            ("splatsdb_graph_search_entities", json!({ "query": "q" })),
+            ("splatsdb_spatial_search", json!({ "query": "q" })),
+            ("splatsdb_spatial_info", json!({})),
+        ];
+        for (i, (tool, args)) in calls.iter().enumerate() {
+            let req: JsonRpcRequest = serde_json::from_value(json!({
+                "jsonrpc": "2.0", "id": i, "method": "tools/call",
+                "params": { "name": tool, "arguments": args }
+            }))
+            .unwrap();
+            let resp = dispatch_request(&state, &req);
+            assert!(
+                resp.error.is_none(),
+                "{tool}: protocol error instead of a controlled tool error"
+            );
+            let result = resp.result.expect("tool result");
+            assert_eq!(result["isError"], json!(true), "{tool}: {result}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("internal server error"), "{tool}: {text}");
+        }
+        // The verbatim search reaches the lock after its parameter validation.
+        let req: JsonRpcRequest = serde_json::from_value(json!({
+            "jsonrpc": "2.0", "id": 99, "method": "tools/call",
+            "params": { "name": "splatsdb_verbatim_search", "arguments": { "query": "q" } }
+        }))
+        .unwrap();
+        let resp = dispatch_request(&state, &req);
+        assert_eq!(resp.result.unwrap()["isError"], json!(true));
+    }
+
+    // -- end of F05a inline tests --
 }

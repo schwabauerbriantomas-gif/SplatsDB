@@ -603,7 +603,7 @@ fn qa_graph_search_entities_returns_correct_order() {
     g.add_entity("Dog", &[0.9, 0.1], "animal").unwrap();
     g.add_entity("Car", &[0.0, 1.0], "vehicle").unwrap();
 
-    let results = g.search_entities(&[1.0, 0.0], 2);
+    let results = g.search_entities(&[1.0, 0.0], 2).unwrap();
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].content, "Cat"); // Most similar
 }
