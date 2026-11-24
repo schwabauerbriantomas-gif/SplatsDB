@@ -392,7 +392,7 @@ struct LoggedStore {
 struct StoreWorkerError {
     status: StatusCode,
     message: String,
-    response: Option<StoreResponse>,
+    response: Option<Box<StoreResponse>>,
 }
 
 pub struct Durability {
@@ -601,7 +601,7 @@ impl Durability {
             return Err(StoreWorkerError {
                 status: StatusCode::CONFLICT,
                 message: "id already belongs to a different WAL entry".into(),
-                response: Some(StoreResponse {
+                response: Some(Box::new(StoreResponse {
                     id: id.into(),
                     status: "conflict".into(),
                     outcome: "not_stored".into(),
@@ -612,7 +612,7 @@ impl Durability {
                     wal_pending: self.wal_pending(),
                     durability_mode: self.mode.as_str().into(),
                     persistence: "wal".into(),
-                }),
+                })),
             });
         }
         if self.mode == WalDurability::PowerLoss {
@@ -675,7 +675,7 @@ impl Durability {
         StoreWorkerError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: message.into(),
-            response: Some(StoreResponse {
+            response: Some(Box::new(StoreResponse {
                 id: id.into(),
                 status: if may_be_persisted {
                     "unknown"
@@ -696,7 +696,7 @@ impl Durability {
                 wal_pending: self.wal_pending(),
                 durability_mode: self.mode.as_str().into(),
                 persistence: "wal".into(),
-            }),
+            })),
         }
     }
 

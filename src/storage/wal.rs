@@ -324,10 +324,7 @@ impl WriteAheadLog {
             #[cfg(not(test))]
             let injected = false;
             let synced = if injected {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "injected WAL fsync failure",
-                ))
+                Err(std::io::Error::other("injected WAL fsync failure"))
             } else {
                 inner.file.sync_all()
             };
