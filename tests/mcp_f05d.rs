@@ -1300,8 +1300,14 @@ fn f05e_g03_repeated_relation_is_a_no_op_no_rewrite_no_spurious_outofsync() {
     let (mut srv, a, b) = graph_with_a_popular_b(&db);
     let first = srv.add_relation(40, a, b, "CITES");
     assert_eq!(first["created"], json!(true), "{first}");
+    // The log line of THIS relation. A bare `created=true` is not enough: the
+    // five MENTIONS relations of the fixture say the same, so the wait used to
+    // return at the third mutation of the start-up and the count below then
+    // included the nine `graph persisted` lines still queued behind it
+    // (13 vs 4 — the fixture's own writes, not a rewrite by the no-op).
+    let cites = format!("--CITES--> {b} (w=0.9, created=");
     assert!(
-        srv.wait_stderr_containing("created=true", Duration::from_secs(5)),
+        srv.wait_stderr_containing(&format!("{cites}true"), Duration::from_secs(5)),
         "{}",
         srv.err_log.join("\n")
     );
@@ -1311,12 +1317,20 @@ fn f05e_g03_repeated_relation_is_a_no_op_no_rewrite_no_spurious_outofsync() {
         .filter(|l| l.contains("graph persisted"))
         .count();
     let on_disk = std::fs::read(state_path(&dir)).expect("state file");
+    // A save writes a transient file and renames it over the state file: a
+    // rewrite is a NEW inode even when the bytes come out identical.
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    #[cfg(unix)]
+    let inode_before = std::fs::metadata(state_path(&dir))
+        .expect("state file metadata")
+        .ino();
 
     // The repeat answers created=false from the live graph: no file write.
     let again = srv.add_relation(41, a, b, "CITES");
     assert_eq!(again["created"], json!(false), "{again}");
     assert!(
-        srv.wait_stderr_containing("created=false", Duration::from_secs(5)),
+        srv.wait_stderr_containing(&format!("{cites}false"), Duration::from_secs(5)),
         "{}",
         srv.err_log.join("\n")
     );
@@ -1333,6 +1347,14 @@ fn f05e_g03_repeated_relation_is_a_no_op_no_rewrite_no_spurious_outofsync() {
         std::fs::read(state_path(&dir)).unwrap(),
         on_disk,
         "the no-op changed the state file"
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::metadata(state_path(&dir))
+            .expect("state file metadata")
+            .ino(),
+        inode_before,
+        "the no-op replaced the state file (same bytes, new inode)"
     );
 
     // Another writer replaced the state file meanwhile: the no-op still
