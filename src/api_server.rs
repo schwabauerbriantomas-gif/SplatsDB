@@ -375,13 +375,15 @@ pub struct AppState {
 /// COMPACT_EVERY stores — y en el shutdown — se persiste el shard
 /// "default" completo y se trunca el WAL.
 ///
-/// Contrato explícito de durabilidad (dos niveles, nunca mezclados):
-/// - **aceptado**: la entrada llegó al archivo del WAL (`log_store` → Ok).
-///   Sobrevive a un crash del proceso; `/store` responde 200 con
-///   `durable:false`.
-/// - **duradero**: además `sync_all` del WAL terminó después de esa entrada
-///   (cada CHECKPOINT_EVERY, al compactar o al apagar). Recién entonces
-///   `/store` y `/status` reportan `durable:true`.
+/// Durability is interpreted through the session's fixed `WalDurability` mode:
+/// - **process-crash** (default): a complete WAL write acknowledges `stored`,
+///   `durable:true`, `crash_durable:true`, `power_loss_durable:false`. Group
+///   `sync_all` only clears `wal_pending`; it does not change the declared mode.
+/// - **power-loss**: `sync_all` must succeed before `stored`; a failed/ambiguous
+///   sync returns `outcome:unknown` and never acknowledges `power_loss_durable`.
+///
+/// Pending entries are therefore "not yet power-loss safe", never "not crash
+/// durable" in the default mode.
 #[derive(Debug)]
 struct LoggedStore {
     _lsn: u64,
@@ -424,9 +426,8 @@ pub struct Durability {
 impl Durability {
     /// Stores entre compactaciones (persistir shard + truncar WAL).
     const COMPACT_EVERY: usize = 1000;
-    /// Stores entre `sync_all` del WAL (group commit). No hay fsync por
-    /// operación: hasta CHECKPOINT_EVERY-1 stores aceptados pueden ser
-    /// todavía `durable:false`.
+    /// Stores between group `sync_all` calls. Default-mode entries are already
+    /// process-crash durable while pending; they are not yet power-loss safe.
     const CHECKPOINT_EVERY: u32 = 32;
 
     /// Abre el WAL de `data_dir`. Devuelve `Err` si el WAL no se puede abrir
