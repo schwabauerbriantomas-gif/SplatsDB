@@ -1428,6 +1428,20 @@ fn f05e_x05_sigterm_during_a_large_warm_start_exits_cleanly_and_the_store_is_int
         !err.iter().any(|l| l.contains("MCP server ready")),
         "a shutting-down server announced itself ready: {err:#?}"
     );
+    // Not ready means not serving: a request is never answered — not even one
+    // already waiting in the pipe when the start-up was interrupted.
+    let _ = srv.send_request(99, "splatsdb_status", json!({}));
+    assert!(
+        srv.stdout_until_closed(Duration::from_secs(5))
+            .iter()
+            .all(|l| l.trim().is_empty()),
+        "a request was answered by a server that never became ready"
+    );
+    assert!(
+        err.iter()
+            .any(|l| l.contains("MCP server shutting down (exit signal)")),
+        "the interrupted start-up did not leave through the shutdown route: {err:#?}"
+    );
     eprintln!("[F05e] SIGTERM during warm start (5000 docs): exit after {took:?}");
     let mut again = spawn(&db, &[]);
     assert!(again.wait_ready(), "{}", again.err_log.join("\n"));

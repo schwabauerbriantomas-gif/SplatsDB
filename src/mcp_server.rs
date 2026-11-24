@@ -2649,7 +2649,18 @@ pub fn run_mcp_server() {
     let mut reader = io::stdin().lock();
     let mut stdout = io::stdout();
 
-    eprintln!("[splatsdb] MCP server ready. Waiting for JSON-RPC on stdin...");
+    // F05e: an exit requested while the server was still starting (warm start,
+    // graph load, spatial registration) is a SHUTDOWN, not a start. Nothing is
+    // announced ready; the request loop below is never entered (its head looks
+    // at the flag), so nothing is read and nothing is answered; and the process
+    // leaves through the one shutdown route every other exit takes.
+    if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+        eprintln!(
+            "[splatsdb] Shutdown requested during start-up: the server does NOT become ready and accepts no request."
+        );
+    } else {
+        eprintln!("[splatsdb] MCP server ready. Waiting for JSON-RPC on stdin...");
+    }
     eprintln!(
         "[splatsdb] Env vars: SPLATSDB_EMBED_URL={}, SPLATSDB_DOC_PATH={}, SPLATSDB_ALLOW_SIMCOS={}",
         std::env::var("SPLATSDB_EMBED_URL").unwrap_or_else(|_| "(default)".into()),
