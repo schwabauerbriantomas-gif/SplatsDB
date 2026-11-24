@@ -50,7 +50,7 @@ use axum::{
 };
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -116,6 +116,11 @@ impl GpuIndexKey {
 /// worker, as before. Before F06a the startup key went stale on the first
 /// mutation and every later `/search` took the batch worker (`backend:
 /// null`, 2 ms coalescing window: after-mutation p50 was 2.0-2.3× the base).
+// The exact-index latch below is the only AtomicBool user in this module and
+// it only exists with the cuda feature; without it the import would be dead.
+#[cfg(feature = "cuda")]
+use std::sync::atomic::AtomicBool;
+
 #[cfg(feature = "cuda")]
 pub struct GpuExactIndex {
     current: parking_lot::RwLock<Option<Arc<GpuFastPath>>>,
