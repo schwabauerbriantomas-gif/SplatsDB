@@ -1430,7 +1430,14 @@ fn run_signal_cell(
     let mut notes = Vec::new();
     let mut max_ms = 0;
     for rep in 0..reps {
-        let mut srv = spawn(db, &[]);
+        // One directory per run: the graph state is `graph_state.json` beside
+        // the SQLite file and one directory holds ONE graph (A04-F10), so runs
+        // sharing a directory keep each other's nodes and `total_nodes == 1`
+        // below could only hold for the first one.
+        let run_dir = db.with_extension(format!("run{rep}"));
+        std::fs::create_dir_all(&run_dir).expect("create per-run dir");
+        let db = run_dir.join("docs.db");
+        let mut srv = spawn(&db, &[]);
         if !srv.wait_ready() {
             failures += 1;
             notes.push(format!("rep {rep}: never ready"));
@@ -1495,7 +1502,7 @@ fn run_signal_cell(
             failures += 1;
         }
         // On disk: everything acknowledged before the signal is still there.
-        let mut again = spawn(db, &[]);
+        let mut again = spawn(&db, &[]);
         let ready = again.wait_ready();
         let doc = again.ok(1, "splatsdb_doc_get", json!({ "id": "mem_kept" }));
         let nodes = again.stats(2)["total_nodes"].clone();
