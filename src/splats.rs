@@ -197,6 +197,10 @@ pub struct SplatStore {
     /// n_active)` were appended afterwards and belong to no cluster/table
     /// yet. Reset to 0 by `invalidate_positional_indexes` (F06a).
     approx_indexed_count: usize,
+    /// F06c (tests only): fused / fast queries answered by the exact linear
+    /// scan because their window could not settle a tie (or under-delivered).
+    #[cfg(test)]
+    tie_fallbacks: std::sync::atomic::AtomicU64,
     lsh: Option<crate::lsh_index::CrossPolytopeLSH>,
 }
 
@@ -309,6 +313,8 @@ impl SplatStore {
             hnsw_indexed_count: 0,
             approx_indexed_count: 0,
             lsh,
+            #[cfg(test)]
+            tie_fallbacks: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -855,6 +861,7 @@ impl SplatStore {
                 // may be hiding a lower id at that distance: the exact stable
                 // linear order decides (rare — exact duplicates at the edge).
                 if Self::boundary_tie(&ranked, k) || ranked.len() < k {
+                    self.count_tie_fallback();
                     return self.find_neighbors(query, k);
                 }
                 // The backend may return fewer than `fetch_k` candidates
@@ -890,6 +897,7 @@ impl SplatStore {
             ranked.extend((approx_indexed..n).map(|idx| (idx, exact_dist(idx))));
             ranked.sort_by(Self::cmp_dist_then_id);
             if Self::boundary_tie(&ranked, k) || ranked.len() < k {
+                self.count_tie_fallback();
                 return self.find_neighbors(query, k);
             }
             if ranked.len() > k {
@@ -1193,12 +1201,25 @@ impl SplatStore {
                 // Fewer than k distinct rows, or a tie at the boundary: the
                 // exact stable linear order completes the answer without
                 // duplicating ids.
+                self.count_tie_fallback();
             }
         }
         // HRM2 not indexed, query failed, under-delivery or boundary tie —
         // fall back to linear scan
         self.find_neighbors(query, k)
     }
+
+    /// F06c (tests only): fused / fast queries whose window could not settle
+    /// a tie (or under-delivered), so the exact linear scan answered.
+    #[cfg(test)]
+    fn count_tie_fallback(&self) {
+        self.tie_fallbacks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn count_tie_fallback(&self) {}
 
     /// F06a: true when only the exact linear scan can certify the answer:
     /// the k-th and (k+1)-th values of a value-sorted row are exactly equal
@@ -2828,5 +2849,381 @@ mod f02e1_contract_tests {
             .is_ok());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod f06c_contract_tests {
+    use super::*;
+
+    /// Rows, dimension and capacity of [`corpus`].
+    const DIM: usize = 16;
+    const N: usize = 1800;
+
+    /// Duplicate groups of [`corpus`]: (source row, size). The copies sit
+    /// under HIGH ids (>= 1000), so the graph's window of a query on a group
+    /// holds arbitrary members of it — not necessarily the lowest ids.
+    const GROUPS: [(usize, usize); 4] = [(10, 4), (200, 3), (350, 2), (500, 62)];
+
+    /// Deterministic pseudo-random rows in [0, 1) — an LCG, no `rand` dep.
+    fn random_rows(n: usize, dim: usize, seed: u64) -> Array2<f32> {
+        let mut s = seed | 1;
+        Array2::from_shape_fn((n, dim), |_| {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((s >> 40) as f32) / 16_777_216.0
+        })
+    }
+
+    fn copy_row(mu: &mut Array2<f32>, src: usize, dst: usize) {
+        for j in 0..DIM {
+            mu[[dst, j]] = mu[[src, j]];
+        }
+    }
+
+    /// `N` rows of dim `DIM`: random ones plus exact copies of [`GROUPS`]
+    /// (row 10 -> 1200, 1500, 1700; row 200 -> 1201, 1600; row 350 -> 1250;
+    /// row 500 -> 1000..1061). Row 77 carries a +0.0 on axis 3, see
+    /// `f06c_the_index_follows_appends`.
+    fn corpus() -> Array2<f32> {
+        let mut mu = random_rows(N, DIM, 0xF06C);
+        copy_row(&mut mu, 10, 1200);
+        copy_row(&mut mu, 10, 1500);
+        copy_row(&mut mu, 10, 1700);
+        copy_row(&mut mu, 200, 1201);
+        copy_row(&mut mu, 200, 1600);
+        copy_row(&mut mu, 350, 1250);
+        for dst in 1000..1061 {
+            copy_row(&mut mu, 500, dst);
+        }
+        mu[[77, 3]] = 0.0;
+        mu
+    }
+
+    fn store_over(mu: &Array2<f32>) -> SplatStore {
+        let mut store = SplatStore::new(SplatsDBConfig {
+            max_splats: 2000,
+            latent_dim: DIM,
+            enable_hnsw: true,
+            hnsw_m: 16,
+            hnsw_ef_construction: 100,
+            hnsw_ef_search: 50,
+            ..Default::default()
+        });
+        assert!(store.add_splat(mu));
+        store.build_index();
+        store
+    }
+
+    fn ids(results: &[NeighborResult]) -> Vec<usize> {
+        results.iter().map(|r| r.index).collect()
+    }
+
+    fn fallbacks(store: &SplatStore) -> u64 {
+        store
+            .tie_fallbacks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// (label, query, group size) for every group. `exact-*` IS the group's
+    /// row: the answer starts with distance 0.0 (F06a's exact-match rule).
+    /// `near-*` is that row moved by 1e-3 on axis 0: the whole group sits at
+    /// one distance d > 0 and nothing else does, so the group crosses the
+    /// k-th distance for every k below its size.
+    fn tie_queries(mu: &Array2<f32>) -> Vec<(String, Array1<f32>, usize)> {
+        let mut out = Vec::new();
+        for &(src, size) in GROUPS.iter() {
+            out.push((format!("exact-{src}"), mu.row(src).to_owned(), size));
+            let mut near = mu.row(src).to_owned();
+            near[0] += 1e-3;
+            out.push((format!("near-{src}"), near, size));
+        }
+        out
+    }
+
+    /// The `k` values of a query that tie: an exact match for every k, a
+    /// `near-*` query while the group crosses the k-th distance.
+    fn tied_ks(label: &str, size: usize) -> Vec<usize> {
+        let ks = [1usize, 2, 3, 5, 10];
+        if label.starts_with("near") {
+            ks.into_iter().filter(|&k| k < size).collect()
+        } else {
+            ks.to_vec()
+        }
+    }
+
+    /// Precondition of every tie case: the EXACT answer ties at its boundary
+    /// (k-th and (k+1)-th distance equal) or holds an exact match — a pass
+    /// on an untied case would prove nothing about ties.
+    fn assert_exact_ties(label: &str, k: usize, exact: &[NeighborResult]) {
+        let head = &exact[..k];
+        let zero = head.iter().any(|r| r.distance == 0.0);
+        let tied = exact[k].distance == head[k - 1].distance;
+        assert!(
+            zero || tied,
+            "{label} k={k}: the fixture must tie at the boundary of the exact answer"
+        );
+    }
+
+    /// A candidate backend that always hands back the same rows. The window
+    /// is then a fact, so a lower id hidden OUTSIDE it is too — with the real
+    /// graph one can only hope which members of a duplicate group come back.
+    struct FixedWindow {
+        rows: Vec<usize>,
+        n: usize,
+    }
+
+    impl CandidateBackend for FixedWindow {
+        fn search(&self, _q: &[f32], k_fetch: usize) -> Vec<(usize, f32)> {
+            self.rows
+                .iter()
+                .take(k_fetch)
+                .map(|&idx| (idx, 0.0))
+                .collect()
+        }
+
+        fn add_batch(&mut self, _vectors: &[Vec<f32>]) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn len(&self) -> usize {
+            self.n
+        }
+
+        fn capabilities(&self) -> BackendCaps {
+            BackendCaps {
+                supports_delete: false,
+                incremental: false,
+            }
+        }
+
+        fn name(&self) -> &'static str {
+            "fixed-window"
+        }
+
+        fn build(&mut self, _vectors: &Array2<f32>) {}
+
+        fn is_built(&self) -> bool {
+            true
+        }
+
+        fn save(&self, _path: &std::path::Path) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// F06c: a tie made of EXACT duplicates — an exact match in the answer,
+    /// or a k-th distance reached by several rows — is settled from the
+    /// window plus the duplicate index. The answer is the exact one (lowest
+    /// ids first) and NO query falls back to the linear scan over the whole
+    /// store, which F06a paid for every such query: ~20% of the benchmark
+    /// queries at ~10x their latency, i.e. the whole bench-hnsw p95.
+    #[test]
+    fn f06c_fused_settles_duplicate_ties_without_the_linear_scan() {
+        let mu = corpus();
+        let store = store_over(&mu);
+        for (label, q, size) in tie_queries(&mu) {
+            let exact = store.find_neighbors(&q.view(), 12);
+            for k in tied_ks(&label, size) {
+                assert_exact_ties(&label, k, &exact);
+                let fused = store.find_neighbors_fused(&q.view(), k);
+                assert_eq!(
+                    ids(&fused),
+                    ids(&exact[..k]),
+                    "{label} k={k}: fused differs from the exact answer"
+                );
+            }
+        }
+        assert_eq!(
+            fallbacks(&store),
+            0,
+            "duplicate ties must not pay the exact linear scan"
+        );
+    }
+
+    /// The same contract on the fast (cluster) path, whose window is k + 1
+    /// rows. Up to the size of the group the answer is the exact one — the
+    /// window holds arbitrary members of the group and the lowest ids are
+    /// completed into it — and nothing is scanned. Beyond the group the
+    /// cluster window is what it is for any untied query (approximate): F06a
+    /// made that tail exact only as a side effect of its scan, F06c does
+    /// not, so only the group is asserted there.
+    #[test]
+    fn f06c_fast_settles_duplicate_ties_without_the_linear_scan() {
+        let mu = corpus();
+        let mut store = store_over(&mu);
+        for &(src, size) in GROUPS.iter() {
+            let label = format!("exact-{src}");
+            let q = mu.row(src).to_owned();
+            let exact = store.find_neighbors(&q.view(), size + 1);
+            assert!(exact[..size].iter().all(|r| r.distance == 0.0));
+            assert!(exact[size].distance > 0.0);
+            for k in [1usize, 2, 3, 5, 10].into_iter().filter(|&k| k <= size) {
+                assert_exact_ties(&label, k, &exact);
+                let before = fallbacks(&store);
+                let fast = store.find_neighbors_fast(&q.view(), k);
+                assert_eq!(
+                    ids(&fast),
+                    ids(&exact[..k]),
+                    "{label} k={k}: fast differs from the exact answer"
+                );
+                assert_eq!(
+                    fallbacks(&store),
+                    before,
+                    "{label} k={k}: a duplicate tie must not pay the exact linear scan"
+                );
+            }
+            for k in [5usize, 10].into_iter().filter(|&k| k > size) {
+                let fast = store.find_neighbors_fast(&q.view(), k);
+                assert_eq!(fast.len(), k, "{label} k={k}");
+                assert_eq!(
+                    ids(&fast[..size]),
+                    ids(&exact[..size]),
+                    "{label} k={k}: the lowest ids of the group must lead the answer"
+                );
+                assert!(fast[k - 1].distance > 0.0, "{label} k={k}");
+                assert!(
+                    fast.windows(2)
+                        .all(|w| (w[0].distance, w[0].index) <= (w[1].distance, w[1].index)),
+                    "{label} k={k}: not in (distance, id) order"
+                );
+            }
+        }
+    }
+
+    /// The graph returns arbitrary members of a duplicate group — k x
+    /// over_fetch at most — so the lowest ids of the group are usually NOT
+    /// all in the window. They are completed from the duplicate index: the
+    /// answer is the exact one and nothing is scanned.
+    #[test]
+    fn f06c_lower_duplicate_ids_hidden_from_the_window_are_completed() {
+        let mu = corpus();
+        let mut store = store_over(&mu);
+        // (source row, group size, what the graph hands back: high members of
+        // the group plus unrelated rows — at least k rows, never the lowest ids)
+        let cases: [(usize, usize, &[usize]); 3] = [
+            (10, 4, &[1500, 1700, 300]),
+            (200, 3, &[1600, 300]),
+            (500, 62, &[1060, 1030, 1015, 300, 400]),
+        ];
+        for &(src, size, window) in cases.iter() {
+            store.candidates = Some(Box::new(FixedWindow {
+                rows: window.to_vec(),
+                n: N,
+            }));
+            let q = mu.row(src).to_owned();
+            let exact = store.find_neighbors(&q.view(), size + 1);
+            assert!(exact[..size].iter().all(|r| r.distance == 0.0));
+            assert!(exact[size].distance > 0.0);
+            for k in [1usize, 2, 3, 5].into_iter().filter(|&k| k < size) {
+                let fused = store.find_neighbors_fused(&q.view(), k);
+                assert_eq!(
+                    ids(&fused),
+                    ids(&exact[..k]),
+                    "group of row {src}, k={k}: the lowest ids of the group must reach the answer"
+                );
+            }
+        }
+        assert_eq!(
+            fallbacks(&store),
+            0,
+            "a window completed with duplicates must not pay the exact linear scan"
+        );
+    }
+
+    /// The index follows the store. A row appended after the build makes a
+    /// NEW pair with a row that was unique when the index was made; it
+    /// differs from it only in the sign of a zero — the same distance to
+    /// every query, hence a duplicate.
+    #[test]
+    fn f06c_the_index_follows_appends() {
+        let mu = corpus();
+        let mut store = store_over(&mu);
+        let mut tail = mu.slice(ndarray::s![77..78, ..]).to_owned();
+        tail[[0, 3]] = -0.0;
+        assert!(store.add_splat(&tail)); // id N: the graph does not know it yet
+                                         // The graph hands back nothing of the pair — the appended row (the
+                                         // backlog) is the only one in the window, and it is not the lowest id.
+        store.candidates = Some(Box::new(FixedWindow {
+            rows: Vec::new(),
+            n: N,
+        }));
+        let q = mu.row(77);
+        assert_eq!(
+            ids(&store.find_neighbors_fused(&q, 1)),
+            vec![77],
+            "the hidden lower id of the pair must be completed"
+        );
+        assert_eq!(
+            fallbacks(&store),
+            0,
+            "an exact match must not pay the exact linear scan"
+        );
+    }
+
+    /// Compaction moves the rows: the index is rebuilt with them (the old
+    /// ids would point at other content).
+    #[test]
+    fn f06c_the_index_follows_compaction() {
+        let mu = corpus();
+        let mut store = store_over(&mu);
+        let mut alpha = vec![1.0f32; N];
+        alpha[0] = 0.0;
+        alpha[5] = 0.0; // two dead rows below the group of row 10
+        store
+            .load_splats(&mu, &alpha, &[1.0f32; N])
+            .expect("load_splats");
+        store.compact();
+        store.build_index();
+        // ids above 5 moved down by 2: {10, 1200, 1500, 1700} -> {8, 1198, 1498, 1698}
+        let q = mu.row(10);
+        assert_eq!(
+            ids(&store.find_neighbors_fused(&q, 4)),
+            vec![8, 1198, 1498, 1698]
+        );
+        assert_eq!(
+            fallbacks(&store),
+            0,
+            "a tie after compaction must not pay the exact linear scan"
+        );
+    }
+
+    /// A tie between DIFFERENT vectors is an f32 rounding coincidence, not a
+    /// duplicate: there is nothing to complete and the exact linear scan
+    /// keeps deciding (the F06a rule, unchanged).
+    #[test]
+    fn f06c_a_tie_between_different_vectors_keeps_the_exact_scan() {
+        let mut mu = Array2::ones((200, DIM));
+        for i in 2..200 {
+            mu[[i, i % DIM]] = 1.5; // strictly farther from the query: 0.5^2
+        }
+        // Rows 0 and 1 sit at the same exact distance of the all-ones query
+        // (0.25^2 + 0.25^2) and are different vectors.
+        mu[[0, 0]] = 1.25;
+        mu[[0, 1]] = 1.25;
+        mu[[1, 2]] = 1.25;
+        mu[[1, 3]] = 1.25;
+        let mut store = SplatStore::new(SplatsDBConfig {
+            max_splats: 200,
+            latent_dim: DIM,
+            enable_hnsw: true,
+            hnsw_m: 16,
+            hnsw_ef_construction: 100,
+            hnsw_ef_search: 50,
+            ..Default::default()
+        });
+        assert!(store.add_splat(&mu));
+        store.build_index();
+        let q = Array1::ones(DIM);
+        let exact = store.find_neighbors(&q.view(), 2);
+        assert_eq!(ids(&exact), vec![0, 1]);
+        assert_eq!(exact[0].distance, exact[1].distance);
+        assert_eq!(ids(&store.find_neighbors_fused(&q.view(), 1)), vec![0]);
+        assert_eq!(
+            fallbacks(&store),
+            1,
+            "a tie between different vectors must take the exact linear scan"
+        );
     }
 }
