@@ -197,6 +197,16 @@ pub struct SplatStore {
     /// n_active)` were appended afterwards and belong to no cluster/table
     /// yet. Reset to 0 by `invalidate_positional_indexes` (F06a).
     approx_indexed_count: usize,
+    /// F06c: exact-duplicate index over the active rows — content key
+    /// ([`SplatStore::row_key`]) -> the rows carrying that content
+    /// ([`DupGroup`]). Lets `find_neighbors_fused` / `_fast` settle a
+    /// tie made of duplicates from the answer window instead of scanning
+    /// every row. Made in one pass by `ensure_duplicate_index` wherever
+    /// a positional index is (re)built, extended by `add_splat`; `false`
+    /// = not usable (the rows moved, or nothing was built yet) and ties
+    /// take the exact linear scan as in F06a.
+    dups: std::collections::HashMap<u64, DupGroup>,
+    dups_valid: bool,
     /// F06c (tests only): fused / fast queries answered by the exact linear
     /// scan because their window could not settle a tie (or under-delivered).
     #[cfg(test)]
@@ -231,6 +241,36 @@ fn build_quant_store(
         },
     };
     crate::quantization::QuantizedStore::new(dim, qcfg).ok()
+}
+
+/// F06c: the rows that share one content key (`SplatStore::row_key`).
+///
+/// `One` is the only row seen with that key; `Many` lists all of them in
+/// ascending id order (rows are appended with growing ids and every
+/// rebuild walks the ids upwards). Most rows are unique, so the common
+/// case stays as compact as a plain `key -> id` entry.
+enum DupGroup {
+    One(u32),
+    Many(Vec<u32>),
+}
+
+impl DupGroup {
+    fn ids(&self) -> &[u32] {
+        match self {
+            DupGroup::One(id) => std::slice::from_ref(id),
+            DupGroup::Many(ids) => ids,
+        }
+    }
+
+    fn push(&mut self, id: u32) {
+        match self {
+            DupGroup::One(first) => {
+                let first = *first;
+                *self = DupGroup::Many(vec![first, id]);
+            }
+            DupGroup::Many(ids) => ids.push(id),
+        }
+    }
 }
 
 /// Build the optional LSH index from the preset config.
@@ -312,6 +352,8 @@ impl SplatStore {
             candidates,
             hnsw_indexed_count: 0,
             approx_indexed_count: 0,
+            dups: std::collections::HashMap::new(),
+            dups_valid: false,
             lsh,
             #[cfg(test)]
             tie_fallbacks: std::sync::atomic::AtomicU64::new(0),
@@ -345,8 +387,33 @@ impl SplatStore {
             self.kappa[self.n_active + i] = self.config.init_kappa as f32;
             self.frequency[self.n_active + i] = 1.0;
         }
+        let start = self.n_active;
         self.n_active += n_new;
         self.next_id += n_new as u64;
+        // F06c: the new rows join the duplicate index (ids only grow, so
+        // every group keeps its ascending id order). Before the first
+        // build the index does not exist: `build_index` makes it in one
+        // pass over all the rows.
+        if self.dups_valid {
+            if self.n_active > u32::MAX as usize {
+                // The ids no longer fit the index: ties take the exact
+                // linear scan again.
+                self.dups.clear();
+                self.dups_valid = false;
+            } else {
+                for i in start..self.n_active {
+                    let key = Self::row_key(self.mu.row(i));
+                    match self.dups.entry(key) {
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(DupGroup::One(i as u32));
+                        }
+                        std::collections::hash_map::Entry::Occupied(e) => {
+                            e.into_mut().push(i as u32);
+                        }
+                    }
+                }
+            }
+        }
         // Dataset content changed → bump the VRAM-cache key.
         self.data_version += 1;
         true
@@ -416,6 +483,8 @@ impl SplatStore {
             return Ok(());
         }
         let embeddings = self.mu.slice(ndarray::s![..self.n_active, ..]).to_owned();
+        // F06c: the duplicate index covers the rows every search path indexes.
+        self.ensure_duplicate_index();
 
         // Primary HRM2 index
         self.engine.index(Some(embeddings.clone()));
@@ -456,6 +525,8 @@ impl SplatStore {
         if self.candidates.is_some() && self.try_load_hnsw(data_dir) {
             eprintln!("[splatsdb] Loaded persisted HNSW index from disk");
             self.hnsw_indexed_count = self.n_active;
+            // F06c: same rows, same coverage.
+            self.ensure_duplicate_index();
 
             // Still need to build other indexes (HRM2, quant, LSH) if not done
             let embeddings = self.mu.slice(ndarray::s![..self.n_active, ..]).to_owned();
@@ -562,6 +633,10 @@ impl SplatStore {
         }
         self.hnsw_indexed_count = 0;
         self.approx_indexed_count = 0;
+        // F06c: the rows are about to move or be replaced — the ids in
+        // the duplicate index would point at other content.
+        self.dups.clear();
+        self.dups_valid = false;
         self.engine.invalidate();
         self.quant_store = build_quant_store(&self.config, dim);
         self.lsh = build_lsh(&self.config, dim);
@@ -592,6 +667,10 @@ impl SplatStore {
         if start >= end || self.candidates.is_none() {
             return 0;
         }
+
+        // F06c: the graph is about to cover every active row, so the
+        // duplicate index must too (it was invalidated with the graph).
+        self.ensure_duplicate_index();
 
         let count = end - start;
         let mut inserted = 0usize;
@@ -857,10 +936,16 @@ impl SplatStore {
                 ranked.extend((indexed..n).map(|idx| (idx, exact_dist(idx))));
                 ranked.sort_by(Self::cmp_dist_then_id);
 
-                // A tie crossing the k-th distance means the candidate window
-                // may be hiding a lower id at that distance: the exact stable
-                // linear order decides (rare — exact duplicates at the edge).
-                if Self::boundary_tie(&ranked, k) || ranked.len() < k {
+                // A tie crossing the k-th distance, or an exact match in the
+                // answer, means the window may be hiding a lower id at that
+                // distance (F06a). F06c: the tied rows are completed with
+                // their exact duplicates; only a window that cannot be
+                // certified — shorter than k, or a tie between DIFFERENT
+                // vectors — still pays the exact linear scan.
+                if ranked.len() < k
+                    || (Self::boundary_tie(&ranked, k)
+                        && !self.resolve_duplicate_ties(&mut ranked, k, &exact_dist))
+                {
                     self.count_tie_fallback();
                     return self.find_neighbors(query, k);
                 }
@@ -896,7 +981,12 @@ impl SplatStore {
                 .collect();
             ranked.extend((approx_indexed..n).map(|idx| (idx, exact_dist(idx))));
             ranked.sort_by(Self::cmp_dist_then_id);
-            if Self::boundary_tie(&ranked, k) || ranked.len() < k {
+            // F06c: same rule as strategy 1 — complete the tied rows with
+            // their exact duplicates, scan only what cannot be certified.
+            if ranked.len() < k
+                || (Self::boundary_tie(&ranked, k)
+                    && !self.resolve_duplicate_ties(&mut ranked, k, &exact_dist))
+            {
                 self.count_tie_fallback();
                 return self.find_neighbors(query, k);
             }
@@ -1184,7 +1274,13 @@ impl SplatStore {
                 // Total order (F06a/F02e1): distance, then ascending id.
                 ranked.sort_by(Self::cmp_dist_then_id);
                 ranked.dedup_by(|a, b| a.0 == b.0);
-                if ranked.len() >= k && !Self::boundary_tie(&ranked, k) {
+                // F06c: a tie is settled from the window plus the exact
+                // duplicates of the tied rows (same rule as the fused
+                // path).
+                let settled = ranked.len() >= k
+                    && (!Self::boundary_tie(&ranked, k)
+                        || self.resolve_duplicate_ties(&mut ranked, k, &dist_sq));
+                if settled {
                     ranked.truncate(k);
                     return ranked
                         .into_iter()
@@ -1198,9 +1294,9 @@ impl SplatStore {
                         })
                         .collect();
                 }
-                // Fewer than k distinct rows, or a tie at the boundary: the
-                // exact stable linear order completes the answer without
-                // duplicating ids.
+                // Fewer than k distinct rows, or a tie the window cannot
+                // settle: the exact stable linear order completes the
+                // answer without duplicating ids.
                 self.count_tie_fallback();
             }
         }
@@ -1221,12 +1317,183 @@ impl SplatStore {
     #[inline]
     fn count_tie_fallback(&self) {}
 
+    /// F06c: content key of a row — FNV-1a over its f32 words (the sign
+    /// of a zero is dropped: `-0.0` and `0.0` sit at the same distance
+    /// of every query) with a final avalanche. Equal content implies
+    /// equal key; the converse is NOT assumed — a key only selects the
+    /// bucket, membership is confirmed by comparing the rows, so a hash
+    /// collision cannot invent a duplicate.
+    #[inline]
+    fn row_key(row: ArrayView1<'_, f32>) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &v in row.iter() {
+            let w = if v == 0.0 { 0 } else { v.to_bits() };
+            h = (h ^ u64::from(w)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h ^= h >> 30;
+        h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h ^= h >> 27;
+        h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+        h ^ (h >> 31)
+    }
+
+    /// F06c: make the duplicate index reflect the active rows — one pass
+    /// over `[0, n_active)`; a no-op while it is valid. Called wherever a
+    /// positional index is (re)built (`build_index`, a persisted HNSW
+    /// loaded, an incremental sync), so the search paths never pay for
+    /// it.
+    fn ensure_duplicate_index(&mut self) {
+        if self.dups_valid {
+            return;
+        }
+        let n = self.n_active;
+        // Ids are kept as u32; a store beyond that keeps settling ties
+        // with the exact linear scan (the index stays invalid).
+        if n > u32::MAX as usize {
+            self.dups.clear();
+            return;
+        }
+        let mut dups: std::collections::HashMap<u64, DupGroup> =
+            std::collections::HashMap::with_capacity(n);
+        for i in 0..n {
+            let key = Self::row_key(self.mu.row(i));
+            match dups.entry(key) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(DupGroup::One(i as u32));
+                }
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    e.into_mut().push(i as u32);
+                }
+            }
+        }
+        self.dups = dups;
+        self.dups_valid = true;
+    }
+
+    /// F06c: settle a tie of `ranked` — the answer window in `(distance,
+    /// id)` order — from its own rows plus their exact duplicates, in
+    /// place of the exact linear scan F06a took for every such query.
+    ///
+    /// * anchors: every row of the first k at distance 0, and every row
+    ///   of the window (also beyond k) at the k-th distance;
+    /// * each anchor's duplicates join the window with their exact
+    ///   distance (the anchor's: same content, same reduction), lowest
+    ///   ids first and at most k per content — no more can reach the
+    ///   answer — until no anchor adds a row;
+    /// * certified when all rows at 0.0 in the head and all rows at the
+    ///   k-th distance share one content: the tie is made of exact
+    ///   duplicates only, and the lowest ids among them are in the
+    ///   window.
+    ///
+    /// `false` keeps the F06a rule — the exact linear scan decides: a
+    /// window shorter than k, no usable duplicate index, a non-finite
+    /// distance, or a tie between DIFFERENT vectors (an f32 rounding
+    /// coincidence, not a duplicate). Not visible from here: a
+    /// different vector that rounds to exactly the k-th f32 distance
+    /// AND sits outside the window of a duplicate tie.
+    fn resolve_duplicate_ties(
+        &self,
+        ranked: &mut Vec<(usize, f32)>,
+        k: usize,
+        exact_dist: &dyn Fn(usize) -> f32,
+    ) -> bool {
+        if k == 0 || ranked.len() < k || !self.dups_valid {
+            return false;
+        }
+        let mu = self.mu.slice(ndarray::s![..self.n_active, ..]);
+        let same_content =
+            |a: usize, b: usize| mu.row(a).iter().zip(mu.row(b).iter()).all(|(x, y)| x == y);
+        let mut present: std::collections::HashSet<usize> =
+            ranked.iter().map(|&(idx, _)| idx).collect();
+        loop {
+            ranked.sort_by(Self::cmp_dist_then_id);
+            let head = &ranked[..k];
+            let d_k = head[k - 1].1;
+            if !d_k.is_finite() {
+                return false;
+            }
+            let zero_in_head = head.iter().any(|&(_, d)| d == 0.0);
+            let tied = ranked.len() > k && ranked[k].1.total_cmp(&d_k) == std::cmp::Ordering::Equal;
+            if !zero_in_head && !tied {
+                return true;
+            }
+            let mut anchors: Vec<(usize, f32)> = Vec::new();
+            if zero_in_head {
+                anchors.extend(head.iter().filter(|&&(_, d)| d == 0.0).copied());
+            }
+            if tied {
+                anchors.extend(
+                    ranked
+                        .iter()
+                        .filter(|&&(_, d)| d.total_cmp(&d_k) == std::cmp::Ordering::Equal)
+                        .copied(),
+                );
+            }
+            let mut keyed: Vec<u64> = Vec::with_capacity(anchors.len());
+            let mut added = 0usize;
+            for &(anchor, d_anchor) in &anchors {
+                let key = Self::row_key(mu.row(anchor));
+                if keyed.contains(&key) {
+                    continue;
+                }
+                keyed.push(key);
+                let Some(group) = self.dups.get(&key) else {
+                    continue;
+                };
+                let mut taken = 0usize;
+                for &id in group.ids() {
+                    let id = id as usize;
+                    if !same_content(id, anchor) {
+                        continue; // another content behind the same key
+                    }
+                    if !present.contains(&id) {
+                        let d = exact_dist(id);
+                        if d.total_cmp(&d_anchor) != std::cmp::Ordering::Equal {
+                            return false;
+                        }
+                        ranked.push((id, d));
+                        present.insert(id);
+                        added += 1;
+                    }
+                    taken += 1;
+                    if taken == k {
+                        break;
+                    }
+                }
+            }
+            if added == 0 {
+                break;
+            }
+        }
+        // The ties must be made of exact duplicates only: every row at
+        // 0.0 in the head, and every row at the k-th distance, has one
+        // content.
+        ranked.sort_by(Self::cmp_dist_then_id);
+        let head = &ranked[..k];
+        let (reference, d_k) = (head[k - 1].0, head[k - 1].1);
+        if let Some((zero, _)) = head.iter().find(|&&(_, d)| d == 0.0) {
+            if head
+                .iter()
+                .any(|&(idx, d)| d == 0.0 && !same_content(idx, *zero))
+            {
+                return false;
+            }
+        }
+        !ranked.iter().any(|&(idx, d)| {
+            d.total_cmp(&d_k) == std::cmp::Ordering::Equal && !same_content(idx, reference)
+        })
+    }
+
     /// F06a: true when only the exact linear scan can certify the answer:
     /// the k-th and (k+1)-th values of a value-sorted row are exactly equal
     /// (the candidate set may hide a lower id at that value), or one of the
     /// first k values is an exact match (0.0) — the graph / the probed
     /// clusters cannot prove they hold EVERY duplicate of the query, so the
     /// lowest ids among them are unknown.
+    ///
+    /// F06c: such a window is completed with the duplicates of the tied
+    /// rows ([`Self::resolve_duplicate_ties`]); the linear scan answers
+    /// only when that is not possible.
     #[inline]
     fn boundary_tie(ranked: &[(usize, f32)], k: usize) -> bool {
         let head = &ranked[..k.min(ranked.len())];
