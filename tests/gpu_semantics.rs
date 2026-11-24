@@ -659,15 +659,19 @@ fn gpu_search_with_a_field_corpus_agrees_with_cpu_before_and_after_a_store() {
         "GPU gaussian vs CPU gaussian, before /store",
     );
 
-    // Mutation: the fast path is invalidated, the batch worker answers.
+    // Mutation: the startup key goes stale — the GPU index is a snapshot of
+    // ONE dataset version (A03-F05). Before F06a nothing rebuilt it and every
+    // later /search took the batch worker for good; F06a rebuilds the exact
+    // index once per data_version, so the fast path answers again with the
+    // NEW snapshot. Either route may answer; a stale one may not: the rows
+    // must be the exact answer and the CPU route's.
     store(port_gpu, &v);
     store(port_cpu, &v);
     assert_stored_is_top_1(port_gpu);
     let after = search(port_gpu, false, &q, TOP_K);
-    assert_eq!(
-        after["backend"],
-        Value::Null,
-        "the fast path must stay invalid after a mutation (A03-F05): {after}"
+    assert!(
+        after["backend"] == Value::Null || after["backend"] == "gpu",
+        "after a mutation only the batch worker or a rebuilt GPU index may answer (A03-F05): {after}"
     );
     assert_rows_match(&rows(&after), &exact, &radii, "GPU batch after /store");
     assert_rows_eq(
@@ -953,14 +957,18 @@ fn exact_ties_resolve_by_id_on_the_gpu_fast_path_the_gpu_batch_and_the_cpu_route
         "CPU gaussian before /store",
     );
 
-    // Mutation: the fast path is invalidated, the GPU batch worker answers.
+    // Mutation: the startup key goes stale — the GPU index is a snapshot of
+    // ONE dataset version (A03-F05). Before F06a nothing rebuilt it and every
+    // later /search took the batch worker for good; F06a rebuilds the exact
+    // index once per data_version, so the fast path answers again with the
+    // NEW snapshot. Either route may answer; a stale one may not: the rows
+    // must be the exact answer and the CPU route's.
     store(port_gpu, &far);
     store(port_cpu, &far);
     let after = search(port_gpu, false, &q, TOP_K);
-    assert_eq!(
-        after["backend"],
-        Value::Null,
-        "the fast path must stay invalid after a mutation (A03-F05): {after}"
+    assert!(
+        after["backend"] == Value::Null || after["backend"] == "gpu",
+        "after a mutation only the batch worker or a rebuilt GPU index may answer (A03-F05): {after}"
     );
     assert_tie_rows(
         &after,
