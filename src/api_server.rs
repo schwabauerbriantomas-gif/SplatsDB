@@ -562,7 +562,7 @@ impl Durability {
                 }
                 Err(self.failure(
                     id,
-                    &e.to_string(),
+                    &format!("WAL write failed: {e}"),
                     e.entry_reached_kernel,
                     e.may_be_persisted,
                 ))
@@ -602,6 +602,7 @@ impl Durability {
                 status: StatusCode::CONFLICT,
                 message: "id already belongs to a different WAL entry".into(),
                 response: Some(Box::new(StoreResponse {
+                    error: Some("id already belongs to a different WAL entry".into()),
                     id: id.into(),
                     status: "conflict".into(),
                     outcome: "not_stored".into(),
@@ -652,6 +653,7 @@ impl Durability {
 
     fn success(&self, id: &str) -> StoreResponse {
         StoreResponse {
+            error: None,
             id: id.into(),
             status: "stored".into(),
             outcome: "stored".into(),
@@ -676,6 +678,7 @@ impl Durability {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: message.into(),
             response: Some(Box::new(StoreResponse {
+                error: Some(message.into()),
                 id: id.into(),
                 status: if may_be_persisted {
                     "unknown"
@@ -874,6 +877,9 @@ pub struct StoreResponse {
     pub power_loss_durable: bool,
     pub wal_pending: u64,
     pub durability_mode: String,
+    /// Diagnostic for a non-stored outcome; absent on success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// "wal" (persistente en --data-dir) o "ephemeral" (sólo memoria).
     pub persistence: String,
 }
@@ -1042,14 +1048,7 @@ async fn store_memory(
                 // WAL first: no unconfirmed mutation is ever applied in memory.
                 d.log_store(&id_for_wal, auto_id, idx, &emb_for_wal)?
             } else {
-                if !store.add_splat(&arr) {
-                    return Err(StoreWorkerError {
-                        status: StatusCode::INSUFFICIENT_STORAGE,
-                        message: "Store full".into(),
-                        response: None,
-                    });
-                }
-                store.hnsw_sync_incremental();
+                // The common apply path below owns the only in-memory mutation.
                 LoggedStore {
                     _lsn: 0,
                     already_logged: false,
@@ -1099,6 +1098,7 @@ async fn store_memory(
         Ok(_) => match state.durability.as_ref() {
             Some(d) => d.success(&id),
             None => StoreResponse {
+                error: None,
                 id: id.clone(),
                 status: "stored".into(),
                 outcome: "stored".into(),
@@ -5368,7 +5368,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn f02b_store_reports_durable_only_after_the_wal_was_fsynced() {
+    async fn f02b_store_reports_process_crash_mode_and_group_commit() {
         let dir = f02b_dir("durable-flag");
         let (app, _d) = app_with_wal(&dir);
         let (status, body) = f02b_call(&app, "POST", "/status", None).await;
@@ -5388,11 +5388,16 @@ mod tests {
             assert_eq!(status, StatusCode::OK, "{body}");
             let v: Value = serde_json::from_str(&body).unwrap();
             assert_eq!(v["status"], "stored", "{body}");
-            assert_eq!(v["durable"], false, "store #{i} was not fsynced: {body}");
+            assert_eq!(v["durable"], true, "store #{i} reached the WAL: {body}");
+            assert_eq!(v["crash_durable"], true, "{body}");
+            assert_eq!(v["power_loss_durable"], false, "{body}");
+            assert_eq!(v["durability_mode"], "process-crash", "{body}");
         }
         let (_, body) = f02b_call(&app, "POST", "/status", None).await;
         let v: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["durable"], false, "{body}");
+        assert_eq!(v["durable"], true, "{body}");
+        assert_eq!(v["crash_durable"], true, "{body}");
+        assert_eq!(v["power_loss_durable"], false, "{body}");
         assert_eq!(v["wal_pending"], 31, "{body}");
         // la 32ª dispara el checkpoint: sync_all terminó ANTES de este 200
         let (status, body) =
@@ -5438,7 +5443,9 @@ mod tests {
         let (_, body) = f02b_call(&app, "POST", "/status", None).await;
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["persistence"], "wal", "{body}");
-        assert_eq!(v["durable"], false, "{body}");
+        assert_eq!(v["durable"], true, "{body}");
+        assert_eq!(v["crash_durable"], true, "{body}");
+        assert_eq!(v["power_loss_durable"], false, "{body}");
         assert_eq!(v["wal_pending"], 2, "{body}");
         std::fs::remove_dir_all(&dir).ok();
     }
