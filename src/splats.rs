@@ -521,7 +521,7 @@ impl SplatStore {
         match self.try_build_index_if_needed(data_dir) {
             Ok(built) => built,
             Err(e) => {
-                eprintln!("[splatsdb] refused persisted HNSW load/rebuild: {e}");
+                eprintln!("[splatsdb] failed to save HNSW index; refused persisted HNSW load/rebuild: {e}");
                 false
             }
         }
