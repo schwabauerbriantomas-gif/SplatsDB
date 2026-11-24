@@ -399,17 +399,22 @@ fn b1_store_is_acknowledged_before_it_is_durable_and_says_so() {
     );
     assert_eq!(v["durable"], true, "nothing accepted yet: {v}");
 
-    // CHECKPOINT_EVERY = 32: las primeras 31 quedan aceptadas en el WAL pero
-    // sin fsync → la respuesta no puede afirmar durabilidad.
+    // Process-crash durability includes writes still waiting for group fsync;
+    // it never implies power-loss durability in this mode.
     for i in 1..32 {
         let (code, body) = store(port, &format!("doc {i}"));
         assert_eq!(code, 200, "{body}");
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["status"], "stored", "{body}");
-        assert_eq!(v["durable"], false, "store #{i} was not fsynced: {body}");
+        assert_eq!(v["durable"], true, "store #{i} reached the WAL: {body}");
+        assert_eq!(v["crash_durable"], true, "{body}");
+        assert_eq!(v["power_loss_durable"], false, "{body}");
+        assert_eq!(v["durability_mode"], "process-crash", "{body}");
     }
     let v = status_json(port);
-    assert_eq!(v["durable"], false, "{v}");
+    assert_eq!(v["durable"], true, "{v}");
+    assert_eq!(v["crash_durable"], true, "{v}");
+    assert_eq!(v["power_loss_durable"], false, "{v}");
     assert_eq!(v["wal_pending"], 31, "{v}");
 
     // la 32ª hace el group commit: sync_all terminó ANTES de este 200

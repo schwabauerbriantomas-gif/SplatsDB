@@ -6,14 +6,69 @@ use std::collections::{BinaryHeap, HashSet};
 use std::io::{Read, Write};
 use std::path::Path;
 
-use ndarray::{Array2, ArrayView1};
+use ndarray::{Array2, ArrayView1, ArrayView2};
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use sha1::{Digest, Sha1};
 
 use crate::interfaces::{IndexSearchResult, VectorIndex};
 
 const HNSW_MAGIC: u64 = 0x484E5357; // "HNSW"
+/// v2 appends `[u64 format_version=2][20-byte content SHA-1]` after the
+/// legacy body. Legacy files remain parseable, but expose no fingerprint and
+/// must never authorize a store load without a rebuild.
+const HNSW_FORMAT_VERSION: u64 = 2;
+const HNSW_TRAILER_BYTES: usize = 8 + 20;
+
+/// Identity of the source rows that determine a graph: positional id, order,
+/// raw f32 bits, shape and metric. It deliberately excludes mtime, inode,
+/// process data_version and graph pointers. SHA-1 is already a dependency;
+/// this is accidental-staleness/corruption identity, not a signature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContentFingerprint([u8; 20]);
+
+impl ContentFingerprint {
+    fn start(vectors: &usize, dim: usize, metric: &str) -> Sha1 {
+        let mut hash = Sha1::new();
+        hash.update(b"SplatDB-HNSW-source-v2\0");
+        hash.update((*vectors as u64).to_le_bytes());
+        hash.update((dim as u64).to_le_bytes());
+        hash.update((metric.len() as u64).to_le_bytes());
+        hash.update(metric.as_bytes());
+        hash
+    }
+
+    fn absorb_row(hash: &mut Sha1, id: usize, values: impl Iterator<Item = f32>) {
+        hash.update((id as u64).to_le_bytes());
+        for value in values {
+            hash.update(value.to_bits().to_le_bytes());
+        }
+    }
+
+    /// Hash active store rows without cloning the matrix or allocating a
+    /// dataset-sized serialization buffer.
+    pub fn from_array(vectors: ArrayView2<f32>, metric: &str) -> Self {
+        let mut hash = Self::start(&vectors.nrows(), vectors.ncols(), metric);
+        for (id, row) in vectors.outer_iter().enumerate() {
+            Self::absorb_row(&mut hash, id, row.iter().copied());
+        }
+        Self(hash.finalize().into())
+    }
+
+    fn from_index(vectors: &[Vec<f32>], metric: &str, removed: &HashSet<usize>) -> Self {
+        let dim = vectors.first().map_or(0, Vec::len);
+        let mut hash = Self::start(&vectors.len(), dim, metric);
+        for &id in &sorted_removed_ids(removed) {
+            hash.update(b"removed");
+            hash.update(id.to_le_bytes());
+        }
+        for (id, row) in vectors.iter().enumerate() {
+            Self::absorb_row(&mut hash, id, row.iter().copied());
+        }
+        Self(hash.finalize().into())
+    }
+}
 
 /// Upper bounds shared by `new()` and `load()` so an index built in memory
 /// obeys the same limits as one read from disk. m >= 2 keeps
@@ -96,6 +151,8 @@ pub struct HNSWIndex {
     entry_point: usize,
     max_level: usize,
     removed: HashSet<usize>,
+    /// `Some` only while the loaded/encoded bytes still describe these rows.
+    source_fingerprint: Option<ContentFingerprint>,
 }
 
 /// Serialize tombstones in canonical order: HashSet iteration order is not
@@ -153,12 +210,19 @@ impl HNSWIndex {
             entry_point: 0,
             max_level: 0,
             removed: HashSet::new(),
+            source_fingerprint: None,
         }
     }
 
     /// Check if the index has been built (has vectors loaded).
     pub fn is_built(&self) -> bool {
         !self.vectors.is_empty()
+    }
+
+    /// Fingerprint persisted with this graph; `None` for a legacy file or
+    /// an in-memory index changed since its last build/load.
+    pub fn source_fingerprint(&self) -> Option<&ContentFingerprint> {
+        self.source_fingerprint.as_ref()
     }
 
     /// Save the HNSW graph to a binary file.
@@ -170,6 +234,21 @@ impl HNSWIndex {
     /// a reported error the temp file is removed. The byte layout of a valid
     /// file is unchanged.
     pub fn save(&self, path: &Path) -> Result<(), String> {
+        let fingerprint = if let Some(fp) = self.source_fingerprint {
+            fp
+        } else {
+            ContentFingerprint::from_index(&self.vectors, &self.metric, &self.removed)
+        };
+        self.save_with_fingerprint(path, &fingerprint)
+    }
+
+    /// Persist an explicit current-source identity. `SplatStore` computes it
+    /// from the live shard rows, never trusts a backend's process-local epoch.
+    pub fn save_with_fingerprint(
+        &self,
+        path: &Path,
+        fingerprint: &ContentFingerprint,
+    ) -> Result<(), String> {
         let mut f = AtomicWriter::create(path)?;
 
         let n_vectors = self.vectors.len() as u64;
@@ -230,6 +309,10 @@ impl HNSWIndex {
                 .map_err(|e| format!("write vector data: {}", e))?;
         }
 
+        f.write_all(&HNSW_FORMAT_VERSION.to_le_bytes())
+            .map_err(|e| format!("write format version: {e}"))?;
+        f.write_all(&fingerprint.0)
+            .map_err(|e| format!("write source fingerprint: {e}"))?;
         f.finish()?;
         Ok(())
     }
@@ -444,6 +527,35 @@ impl HNSWIndex {
             }
         }
 
+        // v2 trailer: exactly version + fingerprint and nothing else. EOF at
+        // the legacy boundary is the only accepted legacy shape; every short,
+        // long or unknown-version trailer is malformed and fails closed.
+        let mut source_fingerprint = None;
+        let mut first = [0u8; 1];
+        match f.read(&mut first) {
+            Ok(0) => {}
+            Ok(_) => {
+                let mut trailer = [0u8; HNSW_TRAILER_BYTES];
+                trailer[0] = first[0];
+                f.read_exact(&mut trailer[1..])
+                    .map_err(|e| format!("read fingerprint trailer: {e}"))?;
+                let version = u64::from_le_bytes(trailer[..8].try_into().unwrap());
+                if version != HNSW_FORMAT_VERSION {
+                    return Err(format!(
+                        "unsupported HNSW format version {version} (expected {HNSW_FORMAT_VERSION})"
+                    ));
+                }
+                let mut extra = [0u8; 1];
+                match f.read(&mut extra) {
+                    Ok(0) => {}
+                    Ok(_) => return Err("trailing bytes after HNSW fingerprint trailer".into()),
+                    Err(e) => return Err(format!("read after HNSW trailer: {e}")),
+                }
+                source_fingerprint = Some(ContentFingerprint(trailer[8..].try_into().unwrap()));
+            }
+            Err(e) => return Err(format!("read HNSW format trailer: {e}")),
+        }
+
         // Reconstruct precomputed norms from loaded vectors
         let norms: Vec<f32> = vectors
             .iter()
@@ -467,6 +579,7 @@ impl HNSWIndex {
             entry_point,
             max_level,
             removed,
+            source_fingerprint,
         })
     }
 
@@ -631,6 +744,7 @@ impl HNSWIndex {
         if self.vectors.len() >= 10_000_000 {
             return;
         }
+        self.source_fingerprint = None;
         let idx = self.vectors.len();
         let level = self.random_level();
         let mut neighbors = Vec::with_capacity(level + 1);
@@ -715,6 +829,7 @@ impl VectorIndex for HNSWIndex {
         self.norms.clear();
         self.nodes.clear();
         self.removed.clear();
+        self.source_fingerprint = None;
         self.entry_point = 0;
         self.max_level = 0;
 
@@ -765,6 +880,7 @@ impl VectorIndex for HNSWIndex {
     }
 
     fn remove(&mut self, indices: &[usize]) {
+        self.source_fingerprint = None;
         for &idx in indices {
             self.removed.insert(idx);
         }
@@ -1215,6 +1331,9 @@ mod tests {
         for v in &idx.vectors {
             f.write_all(bytemuck::cast_slice(v.as_slice())).unwrap();
         }
+        f.write_all(&HNSW_FORMAT_VERSION.to_le_bytes()).unwrap();
+        f.write_all(&ContentFingerprint::from_index(&idx.vectors, &idx.metric, &idx.removed).0)
+            .unwrap();
         f.into_inner()
     }
 

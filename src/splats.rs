@@ -6,6 +6,7 @@ use crate::dataset_transformer;
 use ndarray::{Array1, Array2, ArrayView1};
 
 use crate::config::SplatsDBConfig;
+use crate::hnsw_index::ContentFingerprint;
 use crate::hrm2_engine::HRM2Engine;
 
 /// Result of a neighbor search.
@@ -517,18 +518,27 @@ impl SplatStore {
     ///
     /// Returns true if the index was built or loaded, false if nothing needed doing.
     pub fn build_index_if_needed(&mut self, data_dir: &str) -> bool {
-        if self.n_active == 0 {
-            return false;
+        match self.try_build_index_if_needed(data_dir) {
+            Ok(built) => built,
+            Err(e) => {
+                eprintln!("[splatsdb] refused persisted HNSW load/rebuild: {e}");
+                false
+            }
         }
+    }
 
-        // Try to load the persisted candidate backend (HNSW format) first
-        if self.candidates.is_some() && self.try_load_hnsw(data_dir) {
+    /// Result-returning load/rebuild path. A malformed snapshot is an error,
+    /// never permission to replace the last valid file. Missing, legacy and
+    /// stale-but-well-formed snapshots rebuild from the current shard.
+    pub fn try_build_index_if_needed(&mut self, data_dir: &str) -> Result<bool, String> {
+        if self.n_active == 0 {
+            return Ok(false);
+        }
+        if self.candidates.is_some() && self.try_load_hnsw_checked(data_dir)? {
             eprintln!("[splatsdb] Loaded persisted HNSW index from disk");
             self.hnsw_indexed_count = self.n_active;
-            // F06c: same rows, same coverage.
             self.ensure_duplicate_index();
 
-            // Still need to build other indexes (HRM2, quant, LSH) if not done
             let embeddings = self.mu.slice(ndarray::s![..self.n_active, ..]).to_owned();
             self.engine.index(Some(embeddings.clone()));
             self.approx_indexed_count = self.n_active;
@@ -538,57 +548,59 @@ impl SplatStore {
             if let Some(ref mut lsh) = self.lsh {
                 lsh.index(embeddings);
             }
-            return true;
+            return Ok(true);
         }
 
-        // No persisted index — build from scratch and save
-        self.build_index_with_save(Some(data_dir));
-        true
+        self.try_build_index_with_save(Some(data_dir))?;
+        Ok(true)
     }
 
-    /// Try to load a persisted candidate backend from `{data_dir}/hnsw_index.bin`.
-    ///
-    /// Dispatches on file content: today only the homegrown HNSW format
-    /// (magic `0x484E5357`) exists; CAGRA and other backends plug in here
-    /// by sniffing their own magic/suffix.
-    /// Returns true if loaded successfully.
+    /// Compatibility bool wrapper. Malformed files are false; callers that
+    /// must distinguish corruption from an ordinary rebuild use the checked
+    /// variant.
     pub fn try_load_hnsw(&mut self, data_dir: &str) -> bool {
+        self.try_load_hnsw_checked(data_dir).unwrap_or(false)
+    }
+
+    /// Load only a well-formed snapshot whose source content is exactly the
+    /// active store. Legacy (no fingerprint) and same-shape content changes
+    /// return `Ok(false)` so the caller performs a controlled rebuild.
+    pub fn try_load_hnsw_checked(&mut self, data_dir: &str) -> Result<bool, String> {
         let path = std::path::Path::new(data_dir).join("hnsw_index.bin");
         if !path.exists() {
-            return false;
+            return Ok(false);
         }
-
-        let m = self.config.hnsw_m;
-        let ef_construction = self.config.hnsw_ef_construction;
-        let ef_search = self.config.hnsw_ef_search;
-        let metric = &self.config.hnsw_metric;
-
-        match crate::hnsw_index::HNSWIndex::load(&path, m, ef_construction, ef_search, metric, 42) {
-            Ok(loaded) => {
-                let dim = self.config.latent_dim;
-                // A persisted index is only usable if it matches the store:
-                // stale (fewer vectors → hnsw_needs_sync() would lie forever
-                // and the missing ones never get indexed) or a different dim
-                // (distance_cached zips → silently wrong distances). Either
-                // way, fall through to a full rebuild.
-                if loaded.len() != self.n_active || loaded.dim() != dim {
-                    eprintln!(
-                        "[splatsdb] Persisted HNSW is stale/mismatched (index: {} vectors, dim {}; \
-                         store: n_active {}, dim {dim}) — rebuilding",
-                        loaded.len(),
-                        loaded.dim(),
-                        self.n_active
-                    );
-                    return false;
-                }
-                self.candidates = Some(Box::new(HnswBackend::from_index(loaded, dim)));
-                true
-            }
-            Err(e) => {
-                eprintln!("[splatsdb] Warning: failed to load HNSW index: {}", e);
-                false
-            }
+        let loaded = crate::hnsw_index::HNSWIndex::load(
+            &path,
+            self.config.hnsw_m,
+            self.config.hnsw_ef_construction,
+            self.config.hnsw_ef_search,
+            &self.config.hnsw_metric,
+            42,
+        )?;
+        let dim = self.config.latent_dim;
+        if loaded.len() != self.n_active || loaded.dim() != dim {
+            eprintln!(
+                "[splatsdb] Persisted HNSW is stale/mismatched (index: {} vectors, dim {}; \
+                 store: n_active {dim}) — rebuilding",
+                loaded.len(),
+                loaded.dim(),
+            );
+            return Ok(false);
         }
+        let expected = ContentFingerprint::from_array(
+            self.mu.slice(ndarray::s![..self.n_active, ..]),
+            &self.config.hnsw_metric,
+        );
+        if loaded.source_fingerprint() != Some(&expected) {
+            eprintln!(
+                "[splatsdb] Persisted HNSW has no trusted fingerprint for the current \
+                 content (legacy or same-shape mutation) — rebuilding"
+            );
+            return Ok(false);
+        }
+        self.candidates = Some(Box::new(HnswBackend::from_index(loaded, dim)));
+        Ok(true)
     }
 
     /// Save the candidate backend to `{data_dir}/hnsw_index.bin`.
@@ -600,8 +612,12 @@ impl SplatStore {
             let dir = std::path::Path::new(data_dir);
             std::fs::create_dir_all(dir).map_err(|e| format!("create dir {}: {}", data_dir, e))?;
             let path = dir.join("hnsw_index.bin");
+            let fingerprint = ContentFingerprint::from_array(
+                self.mu.slice(ndarray::s![..self.n_active, ..]),
+                &self.config.hnsw_metric,
+            );
             backend
-                .save(&path)
+                .save_with_fingerprint(&path, &fingerprint)
                 .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
             eprintln!(
                 "[splatsdb] Saved HNSW index ({} vectors) to {}",

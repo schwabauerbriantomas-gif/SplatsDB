@@ -267,6 +267,9 @@ pub enum Commands {
         /// Búsqueda exacta en GPU (kernel PTX l2_topk) para /search
         #[arg(long)]
         gpu: bool,
+        /// WAL acknowledgement mode: process-crash (write) or power-loss (fsync before ACK)
+        #[arg(long, default_value = "process-crash")]
+        wal_mode: splatsdb::storage::wal::WalDurability,
     },
     /// Start MCP server (stdio transport for AI agent integration)
     Mcp,
@@ -622,9 +625,12 @@ pub fn dispatch(cli: Cli) {
             hnsw_ef_search,
             candidate_mult,
         ),
-        Commands::Serve { port, host, gpu } => {
-            data_cmds::cmd_serve(cli.data_dir, port, &host, config, gpu)
-        }
+        Commands::Serve {
+            port,
+            host,
+            gpu,
+            wal_mode,
+        } => data_cmds::cmd_serve(cli.data_dir, port, &host, config, gpu, wal_mode),
         Commands::Mcp => splatsdb::mcp_server::run_mcp_server(),
         // ── Graph Splat ──
         Commands::GraphAddDoc { text, embedding } => graph_cmds::cmd_graph_add_doc(text, embedding),

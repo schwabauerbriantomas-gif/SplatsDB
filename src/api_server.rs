@@ -62,7 +62,7 @@ use crate::storage::persistence::{SplatsDBPersistence, StorageBackend};
 use crate::storage::shard_guard::{
     fingerprint, read_wal_base, write_wal_base, DataDirLock, WalBase, WAL_BASE_FILE,
 };
-use crate::storage::wal::WriteAheadLog;
+use crate::storage::wal::{WalDurability, WriteAheadLog};
 
 // ─── Security constants ──────────────────────────────────
 const MAX_TEXT_LEN: usize = 100_000; // 100KB max text input
@@ -382,6 +382,19 @@ pub struct AppState {
 /// - **duradero**: además `sync_all` del WAL terminó después de esa entrada
 ///   (cada CHECKPOINT_EVERY, al compactar o al apagar). Recién entonces
 ///   `/store` y `/status` reportan `durable:true`.
+#[derive(Debug)]
+struct LoggedStore {
+    _lsn: u64,
+    already_logged: bool,
+}
+
+#[derive(Debug)]
+struct StoreWorkerError {
+    status: StatusCode,
+    message: String,
+    response: Option<StoreResponse>,
+}
+
 pub struct Durability {
     wal: WriteAheadLog,
     persist: SplatsDBPersistence,
@@ -401,6 +414,11 @@ pub struct Durability {
     pending: AtomicU64,
     /// Stores loggeados desde el arranque.
     since_compact: AtomicUsize,
+    /// Fixed for the whole session; ACK flags are interpreted through it.
+    mode: WalDurability,
+    /// Idempotency keys of records that may exist in the WAL. A retry after
+    /// an ambiguous result reconciles against these instead of appending twice.
+    known_ids: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Durability {
@@ -413,38 +431,38 @@ impl Durability {
 
     /// Abre el WAL de `data_dir`. Devuelve `Err` si el WAL no se puede abrir
     /// ni leer, o si el shard cambió debajo de un WAL con stores sin compactar.
+    #[cfg(test)]
     fn open(data_dir: &str) -> anyhow::Result<Self> {
-        let persist = SplatsDBPersistence::with_backend(
-            data_dir,
-            StorageBackend::Sqlite,
-            false, // WAL propio: {data_dir}/wal/store.wal, no el interno del persistence
-        )
-        .map_err(|e| anyhow::anyhow!("persistence init falló: {e}"))?;
+        Self::open_with_mode(data_dir, WalDurability::ProcessCrash)
+    }
+
+    fn open_with_mode(data_dir: &str, mode: WalDurability) -> anyhow::Result<Self> {
+        let persist = SplatsDBPersistence::with_backend(data_dir, StorageBackend::Sqlite, false)
+            .map_err(|e| anyhow::anyhow!("persistence init falló: {e}"))?;
         let shard_path = Self::shard_path(&persist)?;
         let current = fingerprint(&shard_path)?;
         let base_path = std::path::Path::new(data_dir)
             .join("wal")
             .join(WAL_BASE_FILE);
-        // sync_interval=1: flush del WAL en CADA store (page cache: un kill
-        // -9 no lo pierde; el fsync real viene con CHECKPOINT_EVERY).
-        let wal = WriteAheadLog::new(&format!("{data_dir}/wal/store.wal"), 1)?;
-        let pending = Self::count_stores(&wal)?;
-        // El replay deduplica por `idx` suponiendo que el shard en disco es
-        // el mismo contra el que se escribió el WAL. Si cambió (la CLI u
-        // otro proceso lo reescribió con entradas sin compactar) no se
-        // adivina cuáles ya están: fail-closed.
+        let wal = WriteAheadLog::new_with_mode(&format!("{data_dir}/wal/store.wal"), 1, mode)?;
+        let entries = wal.recover()?;
+        let pending = entries.iter().filter(|e| e.operation == "store").count();
+        let known_ids = entries
+            .iter()
+            .filter(|e| e.operation == "store")
+            .filter_map(|e| e.data.get("id").and_then(|v| v.as_str()))
+            .map(str::to_owned)
+            .collect();
         if let Some(recorded) = read_wal_base(&base_path)? {
             if recorded.shard != current && pending > 0 {
                 anyhow::bail!(
                     "shard 'default' de {data_dir} cambió en disco mientras el WAL tenía {pending} \
                      store(s) sin compactar: replay por idx no es seguro. Restaurá el shard contra \
-                     el que se escribió el WAL, o respaldá y reconciliá wal/store.wal a mano \
-                     (borrar wal/store.wal.base acepta el replay por idx bajo tu propio riesgo)"
+                     el que se escribió el WAL, o respaldá y reconciliá wal/store.wal a mano"
                 );
             }
         }
         write_wal_base(&base_path, &WalBase { shard: current })?;
-        // Lo que haya en el WAL queda fsyncado antes de aceptar tráfico.
         wal.checkpoint()?;
         Ok(Self {
             wal,
@@ -453,9 +471,11 @@ impl Durability {
             base: std::sync::Mutex::new(WalBase { shard: current }),
             unapplied: std::sync::Mutex::new(Vec::new()),
             last_compact_error: std::sync::Mutex::new(None),
-            last_lsn: AtomicU64::new(0),
+            last_lsn: AtomicU64::new(entries.last().map_or(0, |e| e.lsn)),
             pending: AtomicU64::new(0),
             since_compact: AtomicUsize::new(0),
+            mode,
+            known_ids: std::sync::Mutex::new(known_ids),
         })
     }
 
@@ -485,30 +505,124 @@ impl Durability {
             .map_err(|_| std::io::Error::other(format!("lock de {what} envenenado")))
     }
 
-    /// Loggea un store YA insertado en el store en memoria. DEBE llamarse
-    /// con el lock del store tomado (ver orden WAL == orden de índices).
-    /// `Ok` = aceptado: la entrada llegó al archivo del WAL.
+    /// Log before the in-memory mutation. A failed write therefore never
+    /// leaves an unacknowledged vector in memory. An ambiguous sync/write is
+    /// reported as such and its id is retained for idempotent reconciliation.
     fn log_store(
         &self,
         id: &str,
         auto_id: Option<usize>,
         idx: usize,
         vector: &[f32],
-    ) -> std::io::Result<()> {
-        let data = serde_json::json!({
-            "id": id,
-            "auto_id": auto_id,
-            "idx": idx,
-            "vector": vector,
-        });
-        let lsn = self.wal.log_operation("store", data)?;
-        self.last_lsn.fetch_max(lsn, Ordering::SeqCst);
-        self.pending.fetch_add(1, Ordering::SeqCst);
-        let n = self.since_compact.fetch_add(1, Ordering::SeqCst) + 1;
-        if (n as u32).is_multiple_of(Self::CHECKPOINT_EVERY) {
-            self.checkpoint_now()?;
+    ) -> Result<LoggedStore, StoreWorkerError> {
+        {
+            let known = self
+                .known_ids
+                .lock()
+                .map_err(|_| self.poisoned_failure(id))?;
+            if known.contains(id) {
+                drop(known);
+                return self.reconcile_retry(id, auto_id, idx, vector);
+            }
         }
-        Ok(())
+        let data =
+            serde_json::json!({ "id": id, "auto_id": auto_id, "idx": idx, "vector": vector });
+        match self.wal.log_operation("store", data) {
+            Ok(lsn) => {
+                self.known_ids
+                    .lock()
+                    .map_err(|_| self.poisoned_failure(id))?
+                    .insert(id.to_owned());
+                self.last_lsn.fetch_max(lsn, Ordering::SeqCst);
+                if self.mode == WalDurability::ProcessCrash {
+                    self.pending.fetch_add(1, Ordering::SeqCst);
+                }
+                let n = self.since_compact.fetch_add(1, Ordering::SeqCst) + 1;
+                if self.mode == WalDurability::ProcessCrash
+                    && (n as u32).is_multiple_of(Self::CHECKPOINT_EVERY)
+                {
+                    if let Err(e) = self.checkpoint_now() {
+                        return Err(self.failure(id, &e.to_string(), true, true));
+                    }
+                }
+                Ok(LoggedStore {
+                    _lsn: lsn,
+                    already_logged: false,
+                })
+            }
+            Err(e) => {
+                if e.entry_reached_kernel || e.may_be_persisted {
+                    self.known_ids
+                        .lock()
+                        .map_err(|_| self.poisoned_failure(id))?
+                        .insert(id.to_owned());
+                    if self.mode == WalDurability::PowerLoss {
+                        self.pending.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                Err(self.failure(
+                    id,
+                    &e.to_string(),
+                    e.entry_reached_kernel,
+                    e.may_be_persisted,
+                ))
+            }
+        }
+    }
+
+    /// Reconcile an id returned after an ambiguous failure. Never append a
+    /// second record for it; conflicting reuse of an id is rejected.
+    fn reconcile_retry(
+        &self,
+        id: &str,
+        auto_id: Option<usize>,
+        idx: usize,
+        vector: &[f32],
+    ) -> Result<LoggedStore, StoreWorkerError> {
+        let entries = self
+            .wal
+            .recover()
+            .map_err(|e| self.failure(id, &e.to_string(), false, true))?;
+        let entry = entries.iter().rev().find(|e| {
+            e.operation == "store" && e.data.get("id").and_then(|v| v.as_str()) == Some(id)
+        });
+        let Some(entry) = entry else {
+            return Err(self.failure(
+                id,
+                "WAL id disappeared before retry reconciliation",
+                false,
+                true,
+            ));
+        };
+        let same = entry.data.get("idx").and_then(|v| v.as_u64()) == Some(idx as u64)
+            && entry.data.get("auto_id").and_then(|v| v.as_u64()) == auto_id.map(|v| v as u64)
+            && entry.data.get("vector") == Some(&serde_json::json!(vector));
+        if !same {
+            return Err(StoreWorkerError {
+                status: StatusCode::CONFLICT,
+                message: "id already belongs to a different WAL entry".into(),
+                response: Some(StoreResponse {
+                    id: id.into(),
+                    status: "conflict".into(),
+                    outcome: "not_stored".into(),
+                    may_be_persisted: false,
+                    durable: false,
+                    crash_durable: false,
+                    power_loss_durable: false,
+                    wal_pending: self.wal_pending(),
+                    durability_mode: self.mode.as_str().into(),
+                    persistence: "wal".into(),
+                }),
+            });
+        }
+        if self.mode == WalDurability::PowerLoss {
+            self.checkpoint_now()
+                .map_err(|e| self.failure(id, &e.to_string(), true, true))?;
+        }
+        Ok(LoggedStore {
+            _lsn: entry.lsn,
+            already_logged: true,
+        })
     }
 
     /// `sync_all` del WAL: todo lo aceptado hasta acá pasa a ser duradero.
@@ -518,14 +632,76 @@ impl Durability {
         Ok(())
     }
 
-    /// `true` sii todo lo aceptado ya pasó por `sync_all`.
+    /// Mode-level durability. In process-crash mode pending means "not yet
+    /// power-loss safe", not "not crash durable".
     fn is_durable(&self) -> bool {
-        self.wal_pending() == 0
+        self.mode == WalDurability::ProcessCrash || self.wal_pending() == 0
     }
 
-    /// Entradas aceptadas que todavía no pasaron por `sync_all`.
+    fn crash_durable(&self) -> bool {
+        true
+    }
+
+    fn power_loss_durable(&self) -> bool {
+        self.mode == WalDurability::PowerLoss && self.wal_pending() == 0
+    }
+
     fn wal_pending(&self) -> u64 {
         self.pending.load(Ordering::SeqCst)
+    }
+
+    fn success(&self, id: &str) -> StoreResponse {
+        StoreResponse {
+            id: id.into(),
+            status: "stored".into(),
+            outcome: "stored".into(),
+            may_be_persisted: true,
+            durable: self.is_durable(),
+            crash_durable: self.crash_durable(),
+            power_loss_durable: self.power_loss_durable(),
+            wal_pending: self.wal_pending(),
+            durability_mode: self.mode.as_str().into(),
+            persistence: "wal".into(),
+        }
+    }
+
+    fn failure(
+        &self,
+        id: &str,
+        message: &str,
+        reached_kernel: bool,
+        may_be_persisted: bool,
+    ) -> StoreWorkerError {
+        StoreWorkerError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+            response: Some(StoreResponse {
+                id: id.into(),
+                status: if may_be_persisted {
+                    "unknown"
+                } else {
+                    "not_stored"
+                }
+                .into(),
+                outcome: if may_be_persisted {
+                    "unknown"
+                } else {
+                    "not_stored"
+                }
+                .into(),
+                may_be_persisted,
+                durable: false,
+                crash_durable: reached_kernel,
+                power_loss_durable: false,
+                wal_pending: self.wal_pending(),
+                durability_mode: self.mode.as_str().into(),
+                persistence: "wal".into(),
+            }),
+        }
+    }
+
+    fn poisoned_failure(&self, id: &str) -> StoreWorkerError {
+        self.failure(id, "WAL idempotency state is poisoned", false, true)
     }
 
     fn stores_since_compact(&self) -> usize {
@@ -622,6 +798,10 @@ impl Durability {
         *Self::lock(&self.base, "base de WAL")? = fresh;
         self.last_lsn.store(0, Ordering::SeqCst);
         self.pending.store(0, Ordering::SeqCst);
+        self.known_ids.lock().map(|mut ids| ids.clear()).ok();
+        if let Ok(mut slot) = self.unapplied.lock() {
+            slot.clear();
+        }
         if let Err(e) = write_wal_base(&self.base_path, &fresh) {
             eprintln!(
                 "[splatsdb] WAL: no se pudo actualizar {}: {e}",
@@ -679,15 +859,21 @@ pub struct SearchQuery {
     pub rescore: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct StoreResponse {
     pub id: String,
     pub status: String,
+    pub outcome: String,
+    pub may_be_persisted: bool,
     /// `true` sii, además de estar en el WAL, `sync_all` del WAL ya terminó
     /// después de esta entrada. `false` = aceptado (sobrevive a un crash del
     /// proceso) pero todavía no duradero ante corte de energía, o bien el
     /// server corre efímero sin data-dir.
     pub durable: bool,
+    pub crash_durable: bool,
+    pub power_loss_durable: bool,
+    pub wal_pending: u64,
+    pub durability_mode: String,
     /// "wal" (persistente en --data-dir) o "ephemeral" (sólo memoria).
     pub persistence: String,
 }
@@ -729,8 +915,11 @@ pub struct StatusResponse {
     pub persistence: String,
     /// `true` sii todo lo aceptado hasta ahora pasó por `sync_all`.
     pub durable: bool,
+    pub crash_durable: bool,
+    pub power_loss_durable: bool,
     /// Entradas aceptadas que todavía no pasaron por `sync_all` (group commit).
     pub wal_pending: u64,
+    pub durability_mode: String,
     /// Último error de compact: el shard o el WAL no se pudieron persistir.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_compact_error: Option<String>,
@@ -752,15 +941,25 @@ async fn health() -> Json<HealthResponse> {
 async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
     let store = state.store.lock().await;
     let stats = store.get_statistics();
-    // Sin data-dir el modo efímero es explícito y visible: nunca `durable`.
-    let (persistence, durable, wal_pending, last_compact_error) = match state.durability.as_ref() {
+    let (
+        persistence,
+        durability_mode,
+        durable,
+        crash_durable,
+        power_loss_durable,
+        wal_pending,
+        last_compact_error,
+    ) = match state.durability.as_ref() {
         Some(d) => (
             "wal",
+            d.mode.as_str(),
             d.is_durable(),
+            d.crash_durable(),
+            d.power_loss_durable(),
             d.wal_pending(),
             d.last_compact_error(),
         ),
-        None => ("ephemeral", false, 0, None),
+        None => ("ephemeral", "ephemeral", false, false, false, 0, None),
     };
     Json(StatusResponse {
         n_active: store.n_active(),
@@ -771,7 +970,10 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
         has_quantization: store.has_quantization(),
         persistence: persistence.into(),
         durable,
+        crash_durable,
+        power_loss_durable,
         wal_pending,
+        durability_mode: durability_mode.into(),
         last_compact_error,
     })
 }
@@ -779,24 +981,19 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
 async fn store_memory(
     State(state): State<AppState>,
     Json(req): Json<StoreRequest>,
-) -> Result<(StatusCode, Json<StoreResponse>), (StatusCode, String)> {
-    // Input validation
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    let error =
+        |code: StatusCode, message: String| (code, Json(serde_json::json!({ "error": message })));
     if req.text.len() > MAX_TEXT_LEN {
-        return Err((
+        return Err(error(
             StatusCode::PAYLOAD_TOO_LARGE,
             format!("Text exceeds max length ({MAX_TEXT_LEN})"),
         ));
     }
-
-    let dim = {
-        let store = state.store.lock().await;
-        store.get_statistics().embedding_dim
-    }; // lock dropped here — embedding computation doesn't need the mutex
-
-    // Validate user-supplied embedding dimension
+    let dim = state.store.lock().await.get_statistics().embedding_dim;
     if let Some(ref emb) = req.embedding {
         if emb.len() != dim {
-            return Err((
+            return Err(error(
                 StatusCode::BAD_REQUEST,
                 format!(
                     "Embedding dimension mismatch: expected {dim}, got {}",
@@ -805,56 +1002,81 @@ async fn store_memory(
             ));
         }
         if emb.len() > MAX_EMBEDDING_DIM {
-            return Err((
+            return Err(error(
                 StatusCode::BAD_REQUEST,
                 format!("Embedding dimension exceeds max ({MAX_EMBEDDING_DIM})"),
             ));
         }
-        // NaN/inf (e.g. `1e400` parsed as inf) would poison the index.
         if !all_finite(emb) {
-            return Err((
+            return Err(error(
                 StatusCode::BAD_REQUEST,
                 "Embedding contains non-finite values (NaN/inf)".into(),
             ));
         }
     }
-
     let embedding = req
         .embedding
         .unwrap_or_else(|| simple_hash_embedding(&req.text, dim));
-
     let arr = Array2::from_shape_vec((1, dim), embedding.clone())
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Bad embedding shape: {e}")))?;
-
+        .map_err(|e| error(StatusCode::BAD_REQUEST, format!("Bad embedding shape: {e}")))?;
     let id_num = state.next_id.fetch_add(1, Ordering::SeqCst);
     let user_supplied = req.id.is_some();
     let id = req.id.unwrap_or_else(|| format!("mem_{id_num}"));
-
-    // Wrap CPU-intensive work in spawn_blocking to avoid blocking the tokio runtime
     let store = state.store.clone();
     let durability = state.durability.clone();
     let emb_for_wal = embedding.clone();
     let id_for_wal = id.clone();
     let auto_id = (!user_supplied).then_some(id_num);
-    let wal_outcome = tokio::task::spawn_blocking(move || -> Result<bool, String> {
-        let mut store = store.blocking_lock();
-        let added = store.add_splat(&arr);
-        if added {
-            // Incrementally insert the new vector into HNSW (no full rebuild)
-            store.hnsw_sync_incremental();
-            if let Some(d) = durability.as_ref() {
-                // Mismo lock que add_splat: el orden del WAL replica el orden
-                // de índices del store, así el replay es determinista.
-                let idx = store.n_active().saturating_sub(1);
-                // Contrato: `stored` (200) exige que la entrada llegó al WAL.
-                // Si el WAL falla NO hay ACK: 503, nunca un 200 falso.
-                if let Err(e) = d.log_store(&id_for_wal, auto_id, idx, &emb_for_wal) {
-                    return Err(format!(
-                        "store not accepted: the WAL write failed, the vector is NOT recoverable \
-                         after a restart: {e}"
-                    ));
+    let wal_outcome =
+        tokio::task::spawn_blocking(move || -> Result<LoggedStore, StoreWorkerError> {
+            let mut store = store.blocking_lock();
+            if store.n_active() >= store.max_splats() {
+                return Err(StoreWorkerError {
+                    status: StatusCode::INSUFFICIENT_STORAGE,
+                    message: "Store full".into(),
+                    response: None,
+                });
+            }
+            let idx = store.n_active();
+            let logged = if let Some(d) = durability.as_ref() {
+                // WAL first: no unconfirmed mutation is ever applied in memory.
+                d.log_store(&id_for_wal, auto_id, idx, &emb_for_wal)?
+            } else {
+                if !store.add_splat(&arr) {
+                    return Err(StoreWorkerError {
+                        status: StatusCode::INSUFFICIENT_STORAGE,
+                        message: "Store full".into(),
+                        response: None,
+                    });
                 }
-                if d.stores_since_compact() % Durability::COMPACT_EVERY == 0 {
+                store.hnsw_sync_incremental();
+                LoggedStore {
+                    _lsn: 0,
+                    already_logged: false,
+                }
+            };
+            if !logged.already_logged || store.n_active() == idx {
+                if !store.add_splat(&arr) {
+                    if let Some(d) = durability.as_ref() {
+                        return Err(d.failure(
+                            &id_for_wal,
+                            "memory apply failed after WAL acceptance",
+                            true,
+                            true,
+                        ));
+                    }
+                    return Err(StoreWorkerError {
+                        status: StatusCode::INSUFFICIENT_STORAGE,
+                        message: "Store full".into(),
+                        response: None,
+                    });
+                }
+                store.hnsw_sync_incremental();
+            }
+            if let Some(d) = durability.as_ref() {
+                if d.stores_since_compact() > 0
+                    && d.stores_since_compact() % Durability::COMPACT_EVERY == 0
+                {
                     match d.compact(&store) {
                         Ok(n) => {
                             eprintln!("[splatsdb] compact: shard 'default' persistido ({n} splats)")
@@ -863,40 +1085,44 @@ async fn store_memory(
                     }
                 }
             }
+            Ok(logged)
+        })
+        .await
+        .map_err(|e| {
+            eprintln!("[splatsdb] /store: background task failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "internal error" })),
+            )
+        })?;
+    let response = match wal_outcome {
+        Ok(_) => match state.durability.as_ref() {
+            Some(d) => d.success(&id),
+            None => StoreResponse {
+                id: id.clone(),
+                status: "stored".into(),
+                outcome: "stored".into(),
+                may_be_persisted: false,
+                durable: false,
+                crash_durable: false,
+                power_loss_durable: false,
+                wal_pending: 0,
+                durability_mode: "ephemeral".into(),
+                persistence: "ephemeral".into(),
+            },
+        },
+        Err(e) => {
+            eprintln!("[splatsdb] /store: {}", e.message);
+            let body = e
+                .response
+                .map(|r| serde_json::to_value(r).expect("serializable store response"))
+                .unwrap_or_else(|| serde_json::json!({ "error": e.message }));
+            return Err((e.status, Json(body)));
         }
-        Ok(added)
-    })
-    .await
-    .map_err(|e| {
-        // Log the real cause server-side; the client gets a generic 500
-        // (JoinError strings can carry panic payloads).
-        eprintln!("[splatsdb] /store: background task failed: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
-    })?;
-
-    // The vector may sit in the in-memory store, but without its WAL entry
-    // it is volatile: it is not acknowledged as stored.
-    let added = wal_outcome.map_err(|e| {
-        eprintln!("[splatsdb] /store: {e}");
-        (StatusCode::SERVICE_UNAVAILABLE, e)
-    })?;
-
-    if !added {
-        return Err((StatusCode::INSUFFICIENT_STORAGE, "Store full".into()));
-    }
-
-    let (durable, persistence) = match state.durability.as_ref() {
-        Some(d) => (d.is_durable(), "wal"),
-        None => (false, "ephemeral"),
     };
     Ok((
         StatusCode::OK,
-        Json(StoreResponse {
-            id,
-            status: "stored".into(),
-            durable,
-            persistence: persistence.into(),
-        }),
+        Json(serde_json::to_value(response).expect("serializable store response")),
     ))
 }
 
@@ -2953,6 +3179,25 @@ pub async fn run_server(
     data_dir: &str,
     gpu_enabled: bool,
 ) -> anyhow::Result<()> {
+    run_server_with_mode(
+        addr,
+        port,
+        config,
+        data_dir,
+        gpu_enabled,
+        WalDurability::ProcessCrash,
+    )
+    .await
+}
+
+pub async fn run_server_with_mode(
+    addr: &str,
+    port: u16,
+    config: SplatsDBConfig,
+    data_dir: &str,
+    gpu_enabled: bool,
+    wal_mode: WalDurability,
+) -> anyhow::Result<()> {
     // Auth is resolved BEFORE anything is created on disk or bound (A05-F10):
     // a misconfigured key (empty / non-UTF-8) or an unauthenticated
     // non-loopback bind without the explicit opt-in aborts the startup with
@@ -2984,7 +3229,7 @@ pub async fn run_server(
     // Fail-closed (A03-F01): con --data-dir un WAL que no se puede abrir ni
     // replayear ABORTA el arranque. Arrancar "sin durabilidad" devolvería
     // 200 `stored` sobre un store que se pierde al salir.
-    let (durability, next_id_seed) = match Durability::open(data_dir) {
+    let (durability, next_id_seed) = match Durability::open_with_mode(data_dir, wal_mode) {
         Ok(d) => match replay_wal(&mut store, &d) {
             Ok((n, max_auto)) => {
                 if n > 0 {
@@ -3138,7 +3383,8 @@ fn replay_wal(store: &mut SplatStore, d: &Durability) -> anyhow::Result<(usize, 
     let mut applied = 0usize;
     let mut max_auto = 0usize;
     let mut unapplied = Vec::new();
-    for e in entries {
+    let mut seen_idx = std::collections::HashMap::new();
+    for e in &entries {
         if e.operation != "store" {
             continue;
         }
@@ -3150,6 +3396,16 @@ fn replay_wal(store: &mut SplatStore, d: &Durability) -> anyhow::Result<(usize, 
             .unwrap_or(usize::MAX);
         if idx < shard_n {
             continue; // ya está dentro del shard persistido
+        }
+        if let Some(previous) = seen_idx.insert(idx, e) {
+            if previous.data.get("id") != e.data.get("id")
+                || previous.data.get("vector") != e.data.get("vector")
+            {
+                unapplied.push(e.lsn);
+            } else {
+                eprintln!("[splatsdb] WAL: duplicate idx {idx} (ambiguous retry) skipped");
+            }
+            continue;
         }
         let Some(vals) = e.data.get("vector").and_then(|v| v.as_array()) else {
             eprintln!("[splatsdb] WAL: entrada {} sin vector, salteada", e.lsn);

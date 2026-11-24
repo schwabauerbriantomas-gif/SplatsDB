@@ -70,6 +70,16 @@ pub trait CandidateBackend: Send + Sync {
 
     /// Persist the index to `path` using the backend's own format.
     fn save(&self, path: &Path) -> Result<(), String>;
+
+    /// Persist with an explicit source identity. Backends whose format has no
+    /// source fingerprint retain their existing `save` behavior.
+    fn save_with_fingerprint(
+        &self,
+        path: &Path,
+        _fingerprint: &crate::hnsw_index::ContentFingerprint,
+    ) -> Result<(), String> {
+        self.save(path)
+    }
 }
 
 /// Adapter that puts the existing homegrown HNSW behind [`CandidateBackend`].
@@ -170,6 +180,14 @@ impl CandidateBackend for HnswBackend {
 
     fn save(&self, path: &Path) -> Result<(), String> {
         self.index.save(path)
+    }
+
+    fn save_with_fingerprint(
+        &self,
+        path: &Path,
+        fingerprint: &crate::hnsw_index::ContentFingerprint,
+    ) -> Result<(), String> {
+        self.index.save_with_fingerprint(path, fingerprint)
     }
 }
 

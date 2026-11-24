@@ -410,13 +410,27 @@ pub fn cmd_preset_info(preset: Option<String>) {
     );
 }
 
-pub fn cmd_serve(data_dir: String, port: u16, host: &str, config: SplatsDBConfig, gpu: bool) {
+pub fn cmd_serve(
+    data_dir: String,
+    port: u16,
+    host: &str,
+    config: SplatsDBConfig,
+    gpu: bool,
+    wal_mode: splatsdb::storage::wal::WalDurability,
+) {
     println!("[splatsdb] Starting API server on {}:{}...", host, port);
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     let host_owned = host.to_string();
     rt.block_on(async {
-        if let Err(e) =
-            splatsdb::api_server::run_server(&host_owned, port, config, &data_dir, gpu).await
+        if let Err(e) = splatsdb::api_server::run_server_with_mode(
+            &host_owned,
+            port,
+            config,
+            &data_dir,
+            gpu,
+            wal_mode,
+        )
+        .await
         {
             eprintln!("[splatsdb] Server error: {}", e);
             std::process::exit(1);

@@ -18,6 +18,7 @@
 //!   followed by an fsync of the parent directory, like every rename in
 //!   `persistence::atomic_write`.
 
+use clap::ValueEnum;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -47,12 +48,60 @@ pub struct WalRecovery {
     pub backup_path: PathBuf,
 }
 
+/// Durability contract selected once for a WAL/session. Process-crash means
+/// each accepted record reached the kernel; power-loss additionally requires
+/// a successful `sync_all` before its acknowledgement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum WalDurability {
+    ProcessCrash,
+    PowerLoss,
+}
+
+impl WalDurability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProcessCrash => "process-crash",
+            Self::PowerLoss => "power-loss",
+        }
+    }
+}
+
+/// A failed log operation. `may_be_persisted` is deliberately conservative:
+/// a completed write whose rollback/fsync failed may still exist on disk.
+#[derive(Debug)]
+pub struct WalLogError {
+    pub source: std::io::Error,
+    pub lsn: Option<u64>,
+    pub entry_reached_kernel: bool,
+    pub may_be_persisted: bool,
+}
+
+impl WalLogError {
+    fn before_entry(source: std::io::Error) -> Self {
+        Self {
+            source,
+            lsn: None,
+            entry_reached_kernel: false,
+            may_be_persisted: false,
+        }
+    }
+}
+
+impl std::fmt::Display for WalLogError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+impl std::error::Error for WalLogError {}
+
 /// Write-Ahead Log ensuring durability of operations.
 pub struct WriteAheadLog {
     path: PathBuf,
     inner: Mutex<WALInner>,
     /// `Some` iff the file had a torn tail that was repaired by [`Self::new`].
     recovery: Option<WalRecovery>,
+    mode: WalDurability,
 }
 
 struct WALInner {
@@ -66,6 +115,8 @@ struct WALInner {
     /// Test-only fault injection.
     #[cfg(test)]
     fail_next_entry_after: Option<usize>,
+    #[cfg(test)]
+    fail_next_sync: bool,
 }
 
 /// How the file ends after the last valid entry.
@@ -171,7 +222,17 @@ impl WriteAheadLog {
     /// `_sync_interval` is accepted for API compatibility only: every entry
     /// is flushed to the kernel before its `log_operation` returns, so an
     /// acknowledged entry can never be stranded in a userspace buffer.
-    pub fn new(path: &str, _sync_interval: u32) -> std::io::Result<Self> {
+    pub fn new(path: &str, sync_interval: u32) -> std::io::Result<Self> {
+        Self::new_with_mode(path, sync_interval, WalDurability::ProcessCrash)
+    }
+
+    /// Open with an explicit durability mode. The mode never changes on an
+    /// existing handle, so one session cannot mix incompatible ACK flags.
+    pub fn new_with_mode(
+        path: &str,
+        _sync_interval: u32,
+        mode: WalDurability,
+    ) -> std::io::Result<Self> {
         let pb = PathBuf::from(path);
         if let Some(parent) = pb.parent() {
             std::fs::create_dir_all(parent)?;
@@ -211,9 +272,12 @@ impl WriteAheadLog {
                 poisoned: false,
                 #[cfg(test)]
                 fail_next_entry_after: None,
+                #[cfg(test)]
+                fail_next_sync: false,
             }),
             recovery,
             path: pb,
+            mode,
         })
     }
 
@@ -229,7 +293,7 @@ impl WriteAheadLog {
     /// On `Err` that entry — and only that entry — is rolled back, so the
     /// file again ends at the last complete entry and later appends stay
     /// readable.
-    pub fn log_operation(&self, op: &str, data: serde_json::Value) -> std::io::Result<u64> {
+    pub fn log_operation(&self, op: &str, data: serde_json::Value) -> Result<u64, WalLogError> {
         let mut inner = self.inner.lock();
         let entry = WALEntry {
             lsn: inner.lsn,
@@ -237,9 +301,45 @@ impl WriteAheadLog {
             operation: op.to_string(),
             data,
         };
-        inner.append_entry(&entry)?;
+        let appended = inner.append_entry_detailed(&entry, self.mode == WalDurability::PowerLoss);
+        if let Err(mut e) = appended {
+            if e.may_be_persisted {
+                let lsn = inner.lsn;
+                inner.lsn = inner.lsn.saturating_add(1);
+                e.lsn = Some(lsn);
+            }
+            return Err(e);
+        }
+        // The record already owns this LSN even if its sync fails: a retry of
+        // a *different* operation must never reuse it.
         let lsn = inner.lsn;
         inner.lsn = inner.lsn.saturating_add(1);
+        if self.mode == WalDurability::PowerLoss {
+            #[cfg(test)]
+            let injected = inner.fail_next_sync;
+            #[cfg(test)]
+            {
+                inner.fail_next_sync = false;
+            }
+            #[cfg(not(test))]
+            let injected = false;
+            let synced = if injected {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "injected WAL fsync failure",
+                ))
+            } else {
+                inner.file.sync_all()
+            };
+            if let Err(source) = synced {
+                return Err(WalLogError {
+                    source,
+                    lsn: Some(lsn),
+                    entry_reached_kernel: true,
+                    may_be_persisted: true,
+                });
+            }
+        }
         Ok(lsn)
     }
 
@@ -416,31 +516,55 @@ impl WriteAheadLog {
     pub(crate) fn debug_fail_next_entry_after(&self, bytes: usize) {
         self.inner.lock().fail_next_entry_after = Some(bytes);
     }
+
+    #[cfg(test)]
+    pub(crate) fn debug_fail_next_sync(&self) {
+        self.inner.lock().fail_next_sync = true;
+    }
 }
 
 impl WALInner {
     fn append_entry(&mut self, entry: &WALEntry) -> std::io::Result<()> {
+        self.append_entry_detailed(entry, false)
+            .map_err(|e| e.source)
+    }
+
+    fn append_entry_detailed(
+        &mut self,
+        entry: &WALEntry,
+        power_loss: bool,
+    ) -> Result<(), WalLogError> {
         if self.poisoned {
-            return Err(std::io::Error::other(
+            return Err(WalLogError::before_entry(std::io::Error::other(
                 "WAL poisoned: an earlier write failure could not be rolled back",
-            ));
+            )));
         }
-        let record = encode(entry)?;
+        let record = encode(entry).map_err(WalLogError::before_entry)?;
         if let Err(e) = self.write_record(&record) {
             // Roll back to the last complete entry. Every earlier entry was
             // written to the kernel before it was acknowledged, so the file
             // on disk is never shorter than `good_offset`.
             if let Err(rb) = self.file.set_len(self.good_offset) {
                 self.poisoned = true;
-                return Err(std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "{e}; rolling back to offset {} failed ({rb}) — WAL poisoned",
-                        self.good_offset
+                return Err(WalLogError {
+                    source: std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "{e}; rolling back to offset {} failed ({rb}) — WAL poisoned",
+                            self.good_offset
+                        ),
                     ),
-                ));
+                    lsn: Some(entry.lsn),
+                    entry_reached_kernel: true,
+                    may_be_persisted: true,
+                });
             }
-            return Err(e);
+            return Err(WalLogError {
+                source: e,
+                lsn: Some(entry.lsn),
+                entry_reached_kernel: false,
+                may_be_persisted: power_loss,
+            });
         }
         self.good_offset += record.len() as u64;
         Ok(())
@@ -756,6 +880,46 @@ mod tests {
         let wal = WriteAheadLog::new(p, 100).unwrap();
         assert!(wal.recovery_info().is_none());
         assert_eq!(ops_of(&wal), ["op0", "op1", "op2"]);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn power_loss_sync_failure_is_ambiguous_and_retry_does_not_reuse_lsn() {
+        let path = temp_wal_path("power-loss-eio");
+        let p = path.to_str().unwrap();
+        let wal = WriteAheadLog::new_with_mode(p, 0, WalDurability::PowerLoss).unwrap();
+        assert_eq!(
+            wal.log_operation("op0", serde_json::json!({ "i": 0 }))
+                .unwrap(),
+            0
+        );
+        wal.debug_fail_next_sync();
+        let err = wal
+            .log_operation("op1", serde_json::json!({ "i": 1 }))
+            .unwrap_err();
+        assert!(err.entry_reached_kernel);
+        assert!(err.may_be_persisted);
+        assert_eq!(err.lsn, Some(1));
+        assert_eq!(ops_of(&wal), ["op0", "op1"]);
+        assert_eq!(
+            wal.log_operation("op2", serde_json::json!({ "i": 2 }))
+                .unwrap(),
+            2
+        );
+        assert_eq!(ops_of(&wal), ["op0", "op1", "op2"]);
+        wal.close().unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn process_crash_mode_does_not_claim_power_loss_or_need_fsync_per_entry() {
+        let path = temp_wal_path("process-mode");
+        let p = path.to_str().unwrap();
+        let wal = WriteAheadLog::new(p, 0).unwrap();
+        wal.debug_fail_next_sync(); // must remain set/unused in this mode
+        assert_eq!(wal.log_operation("op0", serde_json::json!({})).unwrap(), 0);
+        assert_eq!(ops_of(&wal), ["op0"]);
+        wal.close().unwrap();
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 
