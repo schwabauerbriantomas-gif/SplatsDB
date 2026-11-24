@@ -196,18 +196,29 @@ pub fn cmd_quant_search(
     let dim = vectors.ncols();
     let qcfg = QuantConfig::for_search(dim);
     let mut qstore = QuantizedStore::new(dim, qcfg).unwrap();
-    qstore.add_batch(&vectors, 0);
+    if let Err(e) = qstore.add_batch(&vectors, 0) {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
 
     let t0 = std::time::Instant::now();
-    let results = qstore.search(&q_vec.view(), top_k);
+    // D18: the ranking objective is explicit and travels in the response.
+    let score_mode = QuantizedStore::default_score_mode();
+    let results = match qstore.search_scored(&q_vec.view(), top_k, score_mode) {
+        Ok(hits) => hits,
+        Err(e) => {
+            eprintln!("Error: quantized search rejected the query: {}", e);
+            std::process::exit(1);
+        }
+    };
     let elapsed = t0.elapsed();
 
     let entries: Vec<serde_json::Value> = results
         .iter()
-        .map(|(id, score)| {
+        .map(|hit| {
             serde_json::json!({
-                "id": id,
-                "score": (score * 10000.0).round() / 10000.0,
+                "id": hit.id,
+                "score": (hit.score * 10000.0).round() / 10000.0,
             })
         })
         .collect();
@@ -216,6 +227,8 @@ pub fn cmd_quant_search(
         "{}",
         serde_json::json!({
             "query_time_ms": elapsed.as_millis() as u64,
+            "bits": qstore.config().bits,
+            "score_mode": score_mode.as_str(),
             "n_results": entries.len(),
             "results": entries,
         })

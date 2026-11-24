@@ -263,7 +263,13 @@ pub fn cmd_quant_index(input: PathBuf, bits: u8, algorithm: String, seed: u64) {
         }
     };
     let t0 = std::time::Instant::now();
-    let indexed = qstore.add_batch(&vectors, 0);
+    let indexed = match qstore.add_batch(&vectors, 0) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Error: quantization failed: {}", e);
+            std::process::exit(1);
+        }
+    };
     let elapsed = t0.elapsed();
 
     let ratio = qstore.compression_ratio();
@@ -300,22 +306,27 @@ pub fn cmd_quant_status(dim: usize) {
         "{}",
         serde_json::json!( {
             "dim": dim,
+            "default_score_mode": QuantizedStore::default_score_mode().as_str(),
             "presets": {
-                "search_8bit": {
+                // Named after what it builds: for_search() is 4-bit. The key used to read
+                // "search_8bit" / bits 8 while building the 4-bit index; the preset itself
+                // is unchanged, only the label reports the real bits.
+                "search_4bit": {
                     "algorithm": "TurboQuant",
-                    "bits": 8,
+                    "bits": qstore.config().bits,
+                    "projections": qstore.config().projections,
                     "compression_ratio": (qstore.compression_ratio() * 100.0).round() / 100.0,
                     "bytes_per_vector": (qstore.compression_ratio().recip() * dim as f32 * 4.0) as usize,
                 },
                 "balanced_4bit": {
                     "algorithm": "TurboQuant",
-                    "bits": 4,
+                    "bits": qs_4bit.config().bits,
                     "compression_ratio": (qs_4bit.compression_ratio() * 100.0).round() / 100.0,
                     "bytes_per_vector": (qs_4bit.compression_ratio().recip() * dim as f32 * 4.0) as usize,
                 },
                 "max_compression_3bit": {
                     "algorithm": "PolarQuant",
-                    "bits": 3,
+                    "bits": qs_3bit.config().bits,
                     "compression_ratio": (qs_3bit.compression_ratio() * 100.0).round() / 100.0,
                     "bytes_per_vector": (qs_3bit.compression_ratio().recip() * dim as f32 * 4.0) as usize,
                 },
@@ -324,7 +335,8 @@ pub fn cmd_quant_status(dim: usize) {
                 "Data-oblivious: no training or calibration needed",
                 "Deterministic: same (dim, bits, seed) always produces same codes",
                 "Instant indexing: no offline training phase",
-                "Unbiased inner product estimation",
+                "Default search order: l2_heuristic (legacy estimate/||x||, an L2 candidate heuristic)",
+                "Unbiased inner product estimation (score mode ip)",
             ],
         })
     );
