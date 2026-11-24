@@ -23,7 +23,8 @@ fn identical_hnsw_state_has_identical_bytes_across_processes() {
     let hash = fnv1a64(&bytes);
     println!("HNSW_CANONICAL_FNV1A64={hash:016x} bytes={}", bytes.len());
 
-    // Pins bytes, not only load/search results: HashSet iteration order must
-    // never leak into the file. Regenerate deliberately if the format changes.
-    assert_eq!(hash, 0xa059f2a4ee21b673, "canonical HNSW bytes changed");
+    // Pins v2 bytes, not only load/search results: HashSet iteration order and
+    // the content fingerprint must never leak nondeterminism into the file.
+    // Regenerate deliberately if the versioned format changes again.
+    assert_eq!(hash, 0xbf0f4cad99987c0e, "canonical HNSW v2 bytes changed");
 }
