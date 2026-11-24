@@ -9,7 +9,7 @@
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, StandardNormal};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::error::{QuantError, Result};
 
@@ -17,12 +17,59 @@ use super::error::{QuantError, Result};
 ///
 /// Seeded deterministically so that quantizer state can be reconstructed
 /// without storing the matrix — only the seed and dimension need to be persisted.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StoredRotation {
     dim: usize,
     seed: u64,
     /// Row-major storage of the d×d orthogonal matrix.
     matrix: Vec<f32>,
+}
+
+/// Fail-closed read (probe p11): `apply` slices the `dim`-wide row and `apply_inverse`
+/// indexes the matrix without a per-entry bounds check, so a payload is a rotation only
+/// if it carries exactly `dim * dim` finite entries. The derived `Deserialize` this
+/// replaces accepted a truncated, over-long or non-finite matrix, and the quantizer read
+/// from it panicked on its first `encode` / `rotated_query` instead of being an `Err`.
+impl<'de> Deserialize<'de> for StoredRotation {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Same wire fields as the derive this replaces.
+        #[derive(Deserialize)]
+        struct Repr {
+            dim: usize,
+            seed: u64,
+            matrix: Vec<f32>,
+        }
+        let repr = Repr::deserialize(deserializer)?;
+        // A dimension `new` refuses, and one whose `dim * dim` does not fit in a `usize`.
+        if repr.dim == 0 {
+            return Err(malformed_rotation("dimension must be non-zero"));
+        }
+        if repr.dim.checked_mul(repr.dim) != Some(repr.matrix.len()) {
+            return Err(malformed_rotation(format!(
+                "dimension {} does not describe a matrix of {} entries",
+                repr.dim,
+                repr.matrix.len()
+            )));
+        }
+        if let Some(index) = repr.matrix.iter().position(|entry| !entry.is_finite()) {
+            return Err(malformed_rotation(format!(
+                "matrix entry {index} is not finite (NaN/Inf)"
+            )));
+        }
+        Ok(Self {
+            dim: repr.dim,
+            seed: repr.seed,
+            matrix: repr.matrix,
+        })
+    }
+}
+
+/// The `Err` of a persisted rotation that could not be applied without a bounds check.
+fn malformed_rotation<E: serde::de::Error>(detail: impl std::fmt::Display) -> E {
+    E::custom(format!("malformed rotation: {detail}"))
 }
 
 impl StoredRotation {
