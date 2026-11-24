@@ -388,7 +388,9 @@ fn g01_sigkill_loses_nothing_acknowledged_and_ids_are_never_reused() {
         st["graph_persistence"],
         json!({
             "persisted": true, "ephemeral": false, "state": "durable",
-            "path": state_path(&dir).display().to_string(), "error": null
+            "path": state_path(&dir).display().to_string(), "error": null,
+            "quarantined_nodes": [],
+            "quarantined_edges": 0
         }),
         "{st}"
     );
@@ -421,7 +423,10 @@ fn g02_without_a_data_dir_the_graph_is_explicitly_ephemeral() {
     let st = a.status(1);
     assert_eq!(
         st["graph_persistence"],
-        json!({"persisted": false, "ephemeral": true, "state": "ephemeral", "path": null, "error": null}),
+        json!({
+            "persisted": false, "ephemeral": true, "state": "ephemeral",
+            "path": null, "error": null, "quarantined_nodes": [], "quarantined_edges": 0
+        }),
         "{st}"
     );
     let d = a.add_doc(2, "ephemeral by explicit configuration");
