@@ -364,6 +364,7 @@ pub fn cmd_preset_info(preset: Option<String>) {
     let presets = vec![
         ("simple", SplatsDBConfig::simple(None)),
         ("advanced", SplatsDBConfig::advanced(None)),
+        ("hermes", SplatsDBConfig::hermes(None)),
         ("gpu", SplatsDBConfig::gpu(None)),
     ];
 
