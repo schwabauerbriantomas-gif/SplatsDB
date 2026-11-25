@@ -457,6 +457,12 @@ On synthetic data HNSW delivers **~875× speedup** over linear scan at 10K. Real
 - Benchmark script: `bench-data/longmemeval_full.py`
 - Previous keyword baseline: `bench-data/longmemeval_baseline_results.json`
 
+#### Adapted M3 context-reduction evaluation
+
+<p align="center"><img src="assets/splatsdb-m3-context.png" alt="Adapted M3 context reduction and accuracy" width="900"/></p>
+
+A separate local adaptation of `m3-glm-protocol` @ `15795ca` was evaluated with GLM-5.4 and GLM-5.3-Flash using crossed judges and a full-context baseline. On completed calls, median prompt usage fell **93.77%** (70,241 to 4,376.5/4,378.5 tokens); symmetric accuracy was **81.46% vs 79.56%**. The formal verdict is **NO_GO by the predeclared coverage rule**: 498/500 complete token pairs and one M3 question blocked by the provider's content filter. The numerical reduction and observed non-regression pass, but complete coverage does not; no values were imputed. See [methodology, results and limitations](docs/validation/m3-adaptation.md).
+
 ### GPU Top-K Search (Custom CUDA Kernels)
 
 Combined distance + top-k selection in one GPU pass. Dataset persists in VRAM between queries. Benchmarked on RTX 3090 (24GB VRAM), SIFT-128, 100K vectors, 1,000 queries, **k=10, exact brute-force** (recall 1.0 — top-k verified identical to CPU reference). Source: `bench-data/benchmark_results_hardware.json` (2026-04-10).
@@ -626,6 +632,8 @@ splatsdb --dim 768 serve --profile hermes --gpu \
 ```
 
 The profile keeps the hub's HNSW candidate path and exact GPU L2 re-rank, uses the e-means trainer, and disables unused quantization, graph, LSH, map-reduce, auto-scaling, quality-reflection, training, data-lake and entity-extraction paths. `--profile` accepts `default` or `hermes`; an unknown name exits with code 2. `--max-splats` and the other server flags remain explicit overrides.
+
+**Local profile validation** (RTX 3090, 768D, top-30, three rounds per arm): **9/9 ranking parity**, median startup **0.950 s vs 2.415 s**, p50 **3.774 vs 3.949 ms**, p95 **4.259 vs 4.321 ms**, and RSS **136,064 vs 139,164 KiB** for Hermes vs default at the same 32,768-splat capacity. This is a no-regression result for the tested configuration, not a universal performance claim. See [the A/B report](docs/validation/hermes-profile-ab.md) for methodology and limits.
 
 ---
 
