@@ -9,10 +9,10 @@ Vector search with uncertainty awareness. Knowledge graph + HNSW + GPU in a sing
 </p>
 
 [![CI](https://github.com/schwabauerbriantomas-gif/splatdb/actions/workflows/ci.yml/badge.svg)](https://github.com/schwabauerbriantomas-gif/splatdb/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-2.10.0-blue.svg)](https://github.com/schwabauerbriantomas-gif/splatdb/releases/tag/v2.10.0)
+[![Version](https://img.shields.io/badge/version-2.11.0-blue.svg)](https://github.com/schwabauerbriantomas-gif/splatdb/releases)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-285%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-561%20default%20%2B%20545%20CPU-brightgreen.svg)](https://github.com/schwabauerbriantomas-gif/splatdb/actions/workflows/ci.yml)
 [![LOC](https://img.shields.io/badge/LOC-27.6K-informational.svg)]()
 [![CUDA](https://img.shields.io/badge/GPU-RTX%203090-76B900.svg)]()
 
@@ -457,6 +457,12 @@ On synthetic data HNSW delivers **~875× speedup** over linear scan at 10K. Real
 - Benchmark script: `bench-data/longmemeval_full.py`
 - Previous keyword baseline: `bench-data/longmemeval_baseline_results.json`
 
+#### Adapted M3 context-reduction evaluation — independent rerun
+
+<p align="center"><img src="assets/splatsdb-m3-context-rerun.png" alt="Adapted M3 independent rerun: context reduction, accuracy and GO verdict" width="900"/></p>
+
+A separate local adaptation of `m3-glm-protocol` @ `15795ca` was evaluated with GLM-5.4 and GLM-5.3-Flash using crossed judges and a new full-context baseline. A **[predeclared independent rerun](docs/validation/m3-adaptation-rerun-protocol.md)** (protocol SHA `c6973edb93af`) returned **GO**: median prompt usage fell **93.76%** (70,241 to 4,384.5/4,383.5 tokens), with 498/500 complete token pairs; symmetric accuracy was **81.46% vs 80.16%** (+1.30 pp, McNemar p=0.2624), and the intent-to-treat sensitivity also passed. One question per stage was filtered in both models, within the predeclared budget; there were zero non-filter errors and no imputation. See [methodology, results and limitations](docs/validation/m3-adaptation-rerun.md). The [earlier run](docs/validation/m3-adaptation.md) remains **NO_GO** under its stricter 500/500 rule; this rerun does not reinterpret it.
+
 ### GPU Top-K Search (Custom CUDA Kernels)
 
 Combined distance + top-k selection in one GPU pass. Dataset persists in VRAM between queries. Benchmarked on RTX 3090 (24GB VRAM), SIFT-128, 100K vectors, 1,000 queries, **k=10, exact brute-force** (recall 1.0 — top-k verified identical to CPU reference). Source: `bench-data/benchmark_results_hardware.json` (2026-04-10).
@@ -582,11 +588,12 @@ An earlier Python prototype claimed a **32× speedup** for HRM2 vs linear scan o
 
 ## Configuration Presets
 
-Five presets cover edge devices to GPU workstations. Each preset configures all subsystems at once — no manual flag toggling required. (The `training` preset and its subsystems — data lake, distillation, leader clustering — were removed in v2.6.1 as unvalidated dead weight.)
+The presets cover edge devices to GPU workstations, including the `hermes` runtime profile for local memory hubs. Each preset configures all subsystems at once — no manual flag toggling required. (The `training` preset and its subsystems — data lake, distillation, leader clustering — were removed in v2.6.1 as unvalidated dead weight.)
 
 | Preset | Use Case | Capacity | Quantization | Graph | Semantic | GPU | HNSW | LSH |
 |--------|----------|----------|-------------|-------|----------|-----|------|-----|
 | `default` | General purpose | 100K | 8-bit TurboQuant | ✅ | ✅ RRF | — | — | — |
+| `hermes` | Local Hermes memory hub | 100K | — | — | — | Auto (`--gpu`) | ✅ | — |
 | `simple` | Edge / IoT | 10K | — | — | — | — | — | — |
 | `mcp` | AI agent memory | 100K | 8-bit TurboQuant | ✅ | ✅ RRF | Auto | — | — |
 | `advanced` | AI agents | 1M | 4-bit TurboQuant | ✅ | ✅ RRF | Optional | ✅ M=32 | — |
@@ -597,6 +604,7 @@ use splatsdb::config::SplatsDBConfig;
 
 let edge    = SplatsDBConfig::simple(None);              // Raspberry Pi
 let agent   = SplatsDBConfig::mcp(None);                 // AI agent memory (auto GPU)
+let hermes  = SplatsDBConfig::hermes(None);              // Local memory hub
 let heavy   = SplatsDBConfig::advanced(Some("cuda"));    // Full-featured with GPU
 let server  = SplatsDBConfig::gpu(None);                 // Maximum GPU performance
 ```
@@ -609,9 +617,23 @@ let server  = SplatsDBConfig::gpu(None);                 // Maximum GPU performa
 Start
   ├─ <10K docs, no GPU? → simple
   ├─ AI agent, need memory? → mcp (auto GPU)
+  ├─ Hermes memory hub? → hermes (HNSW + exact GPU with --gpu)
   ├─ >100K docs, need speed? → advanced (HNSW M=32)
   ├─ >5M docs + CUDA? → gpu (M=48, VRAM-persistent)
 ```
+
+### Hermes runtime profile
+
+For a local Hermes memory hub, use the named profile rather than disabling subsystems ad hoc:
+
+```bash
+splatsdb --dim 768 serve --profile hermes --gpu \
+  --host 127.0.0.1 --port 8872 --data-dir /path/to/hub
+```
+
+The profile keeps the hub's HNSW candidate path and exact GPU L2 re-rank, uses the e-means trainer, and disables unused quantization, graph, LSH, map-reduce, auto-scaling, quality-reflection, training, data-lake and entity-extraction paths. `--profile` accepts `default` or `hermes`; an unknown name exits with code 2. `--max-splats` and the other server flags remain explicit overrides.
+
+**Local profile validation** (RTX 3090, 768D, top-30, three rounds per arm): **9/9 ranking parity**, median startup **0.950 s vs 2.415 s**, p50 **3.774 vs 3.949 ms**, p95 **4.259 vs 4.321 ms**, and RSS **136,064 vs 139,164 KiB** for Hermes vs default at the same 32,768-splat capacity. This is a no-regression result for the tested configuration, not a universal performance claim. See [the A/B report](docs/validation/hermes-profile-ab.md) for methodology and limits.
 
 ---
 
@@ -703,9 +725,9 @@ SplatsDB provides a comprehensive CLI for all operations. Global options apply t
 
 | Command | Description |
 |---------|-------------|
-| `serve --host 0.0.0.0 --port 8199` | Start HTTP API server (`--gpu` enables exact GPU search) |
+| `serve --host 0.0.0.0 --port 8199 [--profile default\|hermes]` | Start HTTP API server (`--gpu` enables exact GPU search; `hermes` optimizes the local memory-hub runtime) |
 | `mcp` | Start MCP server (stdio JSON-RPC 2.0) |
-| `preset-info` | Show which subsystems each preset enables |
+| `preset-info [--preset default\|simple\|mcp\|advanced\|gpu\|hermes]` | Show which subsystems each preset enables |
 
 ### ML & Entity Commands
 
@@ -875,7 +897,7 @@ curl http://localhost:8199/health
 ```
 
 ```json
-{"status": "ok", "version": "2.10.0"}
+{"status": "ok", "version": "2.11.0"}
 ```
 
 #### `POST /status` — Store Statistics
@@ -1547,7 +1569,7 @@ python benchmarks/benchmark_reproducible.py --suite ann --dataset sift-128-eucli
 | [BEIR](https://github.com/beir-cellar/beir) | Information retrieval (5 domains) | ✅ Published |
 | [LOCOMO](https://arxiv.org/abs/2402.10790) | Long-form conversational memory | ✅ Published |
 | MemoBench (synthetic) | Multi-agent dialog memory | ✅ Published |
-| [LongMemEval](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned) | Agent memory recall | 🔄 Planned |
+| [LongMemEval](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned) | Agent memory recall | ✅ Retrieval benchmark published |
 
 ### BEIR Information Retrieval
 

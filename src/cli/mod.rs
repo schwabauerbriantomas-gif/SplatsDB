@@ -13,6 +13,8 @@ mod verbatim_cmds;
 use clap::Subcommand;
 use std::path::PathBuf;
 
+use splatsdb::SplatsDBConfig;
+
 use crate::Cli;
 
 #[derive(Subcommand)]
@@ -264,9 +266,15 @@ pub enum Commands {
         port: u16,
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+        /// Named runtime profile: default (compatibility) or hermes (exact-GPU memory hub)
+        #[arg(long, default_value = "default")]
+        profile: String,
         /// Búsqueda exacta en GPU (kernel PTX l2_topk) para /search
         #[arg(long)]
         gpu: bool,
+        /// WAL acknowledgement mode: process-crash (write) or power-loss (fsync before ACK)
+        #[arg(long, default_value = "process-crash")]
+        wal_mode: splatsdb::storage::wal::WalDurability,
     },
     /// Start MCP server (stdio transport for AI agent integration)
     Mcp,
@@ -622,8 +630,25 @@ pub fn dispatch(cli: Cli) {
             hnsw_ef_search,
             candidate_mult,
         ),
-        Commands::Serve { port, host, gpu } => {
-            data_cmds::cmd_serve(cli.data_dir, port, &host, config, gpu)
+        Commands::Serve {
+            port,
+            host,
+            profile,
+            gpu,
+            wal_mode,
+        } => {
+            if profile != "default" && profile != "hermes" {
+                eprintln!("profile inválido: '{profile}' (usar default|hermes)");
+                std::process::exit(2);
+            }
+            if profile == "hermes" {
+                let mut hermes = SplatsDBConfig::hermes(Some("auto"));
+                hermes.latent_dim = cli.dim;
+                hermes.max_splats = cli.max_splats;
+                hermes.cluster_trainer = config.cluster_trainer;
+                config = hermes;
+            }
+            data_cmds::cmd_serve(cli.data_dir, port, &host, config, gpu, wal_mode)
         }
         Commands::Mcp => splatsdb::mcp_server::run_mcp_server(),
         // ── Graph Splat ──

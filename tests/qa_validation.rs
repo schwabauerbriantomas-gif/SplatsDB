@@ -519,21 +519,34 @@ fn qa_polar_inner_product_estimate_accuracy() {
 
 #[test]
 fn qa_turbo_encode_and_ip_estimate() {
+    // QJL is an unbiased ESTIMATOR: E[estimate] = <x, y>. A single estimate with 16
+    // projections has a relative std of about sqrt(pi/2 / 16) ~ 30%, so the contract
+    // is checked on the mean over deterministic queries, not on one draw. y = x + noise
+    // keeps the inner product far from zero so that a relative error is meaningful.
     let q = TurboQuantizer::new(16, 8, 16, 42).unwrap();
     let x = random_vec(16, 1);
-    let y = random_vec(16, 2);
     let code = q.encode(&x).unwrap();
-
-    let estimated = q.inner_product_estimate(&code, &y).unwrap();
-    let exact: f32 = x.iter().zip(y.iter()).map(|(a, b)| a * b).sum();
-    let rel_error = (estimated - exact).abs() / (exact.abs() + 1e-6);
+    const QUERIES: usize = 400;
+    let mut mean_est = 0.0f32;
+    let mut mean_exact = 0.0f32;
+    for i in 0..QUERIES {
+        let y: Vec<f32> = x
+            .iter()
+            .zip(random_vec(16, 2 + i as u64))
+            .map(|(a, n)| a + 0.25 * n)
+            .collect();
+        mean_est += q.inner_product_estimate(&code, &y).unwrap();
+        mean_exact += x.iter().zip(y.iter()).map(|(a, b)| a * b).sum::<f32>();
+    }
+    let (mean_est, mean_exact) = (mean_est / QUERIES as f32, mean_exact / QUERIES as f32);
+    let rel_error = (mean_est - mean_exact).abs() / (mean_exact.abs() + 1e-6);
 
     assert!(
         rel_error < 0.20,
-        "turbo IP relative error too high: {:.4} (est={:.4}, exact={:.4})",
+        "turbo IP mean relative error too high: {:.4} (mean est={:.4}, mean exact={:.4})",
         rel_error,
-        estimated,
-        exact
+        mean_est,
+        mean_exact
     );
 }
 
@@ -590,7 +603,7 @@ fn qa_graph_search_entities_returns_correct_order() {
     g.add_entity("Dog", &[0.9, 0.1], "animal").unwrap();
     g.add_entity("Car", &[0.0, 1.0], "vehicle").unwrap();
 
-    let results = g.search_entities(&[1.0, 0.0], 2);
+    let results = g.search_entities(&[1.0, 0.0], 2).unwrap();
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].content, "Cat"); // Most similar
 }

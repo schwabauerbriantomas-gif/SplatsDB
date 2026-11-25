@@ -37,6 +37,10 @@ pub fn cmd_status(data_dir: String, max_splats: usize, config: SplatsDBConfig, v
 }
 
 pub fn cmd_save(data_dir: String, config: SplatsDBConfig, shard: String) {
+    // F02f: a writer holds the data-dir lock (the same `serve` holds) for
+    // its whole read→write window, or exits 3 before touching anything.
+    let _data_dir_lock = crate::cli::helpers::exit_if_data_dir_locked(&data_dir, "save");
+
     let (store, persist) = load_or_create_store(&data_dir, &config);
     let persist = match persist {
         Some(p) => p,
@@ -124,6 +128,10 @@ pub fn cmd_doc_add(
     text: String,
     metadata: Option<String>,
 ) {
+    // F02f: a writer holds the data-dir lock (the same `serve` holds) for
+    // its whole read→write window, or exits 3 before touching anything.
+    let _data_dir_lock = crate::cli::helpers::exit_if_data_dir_locked(&data_dir, "doc-add");
+
     let persist = make_persistence(&data_dir, &backend, true).unwrap_or_else(|e| {
         eprintln!("Storage error: {}", e);
         std::process::exit(1);
@@ -170,6 +178,10 @@ pub fn cmd_doc_get(data_dir: String, backend: String, id: String) {
 }
 
 pub fn cmd_doc_del(data_dir: String, backend: String, id: String) {
+    // F02f: a writer holds the data-dir lock (the same `serve` holds) for
+    // its whole read→write window, or exits 3 before touching anything.
+    let _data_dir_lock = crate::cli::helpers::exit_if_data_dir_locked(&data_dir, "doc-del");
+
     let persist = make_persistence(&data_dir, &backend, true).unwrap_or_else(|e| {
         eprintln!("Storage error: {}", e);
         std::process::exit(1);
@@ -251,7 +263,13 @@ pub fn cmd_quant_index(input: PathBuf, bits: u8, algorithm: String, seed: u64) {
         }
     };
     let t0 = std::time::Instant::now();
-    let indexed = qstore.add_batch(&vectors, 0);
+    let indexed = match qstore.add_batch(&vectors, 0) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Error: quantization failed: {}", e);
+            std::process::exit(1);
+        }
+    };
     let elapsed = t0.elapsed();
 
     let ratio = qstore.compression_ratio();
@@ -288,22 +306,27 @@ pub fn cmd_quant_status(dim: usize) {
         "{}",
         serde_json::json!( {
             "dim": dim,
+            "default_score_mode": QuantizedStore::default_score_mode().as_str(),
             "presets": {
-                "search_8bit": {
+                // Named after what it builds: for_search() is 4-bit. The key used to read
+                // "search_8bit" / bits 8 while building the 4-bit index; the preset itself
+                // is unchanged, only the label reports the real bits.
+                "search_4bit": {
                     "algorithm": "TurboQuant",
-                    "bits": 8,
+                    "bits": qstore.config().bits,
+                    "projections": qstore.config().projections,
                     "compression_ratio": (qstore.compression_ratio() * 100.0).round() / 100.0,
                     "bytes_per_vector": (qstore.compression_ratio().recip() * dim as f32 * 4.0) as usize,
                 },
                 "balanced_4bit": {
                     "algorithm": "TurboQuant",
-                    "bits": 4,
+                    "bits": qs_4bit.config().bits,
                     "compression_ratio": (qs_4bit.compression_ratio() * 100.0).round() / 100.0,
                     "bytes_per_vector": (qs_4bit.compression_ratio().recip() * dim as f32 * 4.0) as usize,
                 },
                 "max_compression_3bit": {
                     "algorithm": "PolarQuant",
-                    "bits": 3,
+                    "bits": qs_3bit.config().bits,
                     "compression_ratio": (qs_3bit.compression_ratio() * 100.0).round() / 100.0,
                     "bytes_per_vector": (qs_3bit.compression_ratio().recip() * dim as f32 * 4.0) as usize,
                 },
@@ -312,7 +335,8 @@ pub fn cmd_quant_status(dim: usize) {
                 "Data-oblivious: no training or calibration needed",
                 "Deterministic: same (dim, bits, seed) always produces same codes",
                 "Instant indexing: no offline training phase",
-                "Unbiased inner product estimation",
+                "Default search order: l2_heuristic (legacy estimate/||x||, an L2 candidate heuristic)",
+                "Unbiased inner product estimation (score mode ip)",
             ],
         })
     );
@@ -340,6 +364,7 @@ pub fn cmd_preset_info(preset: Option<String>) {
     let presets = vec![
         ("simple", SplatsDBConfig::simple(None)),
         ("advanced", SplatsDBConfig::advanced(None)),
+        ("hermes", SplatsDBConfig::hermes(None)),
         ("gpu", SplatsDBConfig::gpu(None)),
     ];
 
@@ -398,13 +423,27 @@ pub fn cmd_preset_info(preset: Option<String>) {
     );
 }
 
-pub fn cmd_serve(data_dir: String, port: u16, host: &str, config: SplatsDBConfig, gpu: bool) {
+pub fn cmd_serve(
+    data_dir: String,
+    port: u16,
+    host: &str,
+    config: SplatsDBConfig,
+    gpu: bool,
+    wal_mode: splatsdb::storage::wal::WalDurability,
+) {
     println!("[splatsdb] Starting API server on {}:{}...", host, port);
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     let host_owned = host.to_string();
     rt.block_on(async {
-        if let Err(e) =
-            splatsdb::api_server::run_server(&host_owned, port, config, &data_dir, gpu).await
+        if let Err(e) = splatsdb::api_server::run_server_with_mode(
+            &host_owned,
+            port,
+            config,
+            &data_dir,
+            gpu,
+            wal_mode,
+        )
+        .await
         {
             eprintln!("[splatsdb] Server error: {}", e);
             std::process::exit(1);

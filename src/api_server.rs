@@ -22,11 +22,19 @@
 //!     (R9 §2). The snapshot (version, n, dim) additionally keys a
 //!     process-level VRAM-resident `GpuIndex` (`gpu::cached_dataset_index`)
 //!     so the dataset uploads to the GPU once per version, not per batch.
+//!   - GPU fast path (the startup exact index, `serve --gpu`): answers only
+//!     while the store is still the dataset that was uploaded
+//!     (`GpuIndexKey::is_current`); any mutation (`/store`, WAL replay,
+//!     reload, compact) bumps `data_version` and the query falls through to
+//!     the batch worker (A03-F05).
 //!   - `simple_hash_embedding` hashes the text ONCE and derives the D
 //!     dimensions from a SplitMix64 PRNG (O(1) hashes instead of O(D)).
 //!
 //! Security:
-//!   - API key authentication via SPLATSDB_API_KEY env var (optional)
+//!   - API key authentication via SPLATSDB_API_KEY env var (optional): the
+//!     variable present but EMPTY or not UTF-8 aborts the startup (never
+//!     "auth off"); a non-loopback bind without a key is refused unless the
+//!     operator opts in with SPLATSDB_ALLOW_UNAUTHENTICATED=1
 //!   - CORS restricted to localhost by default
 //!   - Input size limits enforced
 
@@ -51,7 +59,10 @@ use tower_http::cors::CorsLayer;
 use crate::config::SplatsDBConfig;
 use crate::splats::SplatStore;
 use crate::storage::persistence::{SplatsDBPersistence, StorageBackend};
-use crate::storage::wal::WriteAheadLog;
+use crate::storage::shard_guard::{
+    fingerprint, read_wal_base, write_wal_base, DataDirLock, WalBase, WAL_BASE_FILE,
+};
+use crate::storage::wal::{WalDurability, WriteAheadLog};
 
 // ─── Security constants ──────────────────────────────────
 const MAX_TEXT_LEN: usize = 100_000; // 100KB max text input
@@ -66,6 +77,248 @@ const MAX_TOP_K: usize = 1000;
 /// entry point validates this before touching the store.
 fn all_finite(e: &[f32]) -> bool {
     e.iter().all(|v| v.is_finite())
+}
+
+// ─── GPU fast path dataset key (A03-F05) ──────────────────
+/// Identity of the dataset uploaded to the startup GPU index (`serve --gpu`):
+/// the store's `data_version` when it was built and the number of rows
+/// uploaded.
+///
+/// `data_version` bumps on every mutation of the store (add/load/compact —
+/// hence `/store`, the WAL replay of the boot and any reload), so the fast
+/// path can answer only while the store is EXACTLY the dataset that was
+/// uploaded. A frozen snapshot never answers for a mutated store.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct GpuIndexKey {
+    version: u64,
+    n: usize,
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+impl GpuIndexKey {
+    /// True iff `version` / `n` describe the dataset this index holds.
+    pub(crate) fn is_current(&self, version: u64, n: usize) -> bool {
+        self.version == version && self.n == n
+    }
+}
+
+/// Serve-level holder of the exact GPU index (feature `cuda`), F06a.
+///
+/// The resident index is a snapshot of ONE dataset version. `/store` (WAL
+/// replay, compact) bumps `data_version`; the first request that no longer
+/// matches rebuilds the index ONCE for the version current at that moment
+/// and swaps it in — concurrent stale requests wait on `rebuild_lock` and
+/// reuse the fresh index (a burst of mutations costs one upload, not one per
+/// query or per store). Requests whose version matches never touch the GPU
+/// state beyond a read lock. An explicit GPU failure (no CUDA, failed upload)
+/// disables the fast path for the process: those requests take the batch
+/// worker, as before. Before F06a the startup key went stale on the first
+/// mutation and every later `/search` took the batch worker (`backend:
+/// null`, 2 ms coalescing window: after-mutation p50 was 2.0-2.3× the base).
+// The exact-index latch below is the only AtomicBool user in this module and
+// it only exists with the cuda feature; without it the import would be dead.
+#[cfg(feature = "cuda")]
+use std::sync::atomic::AtomicBool;
+
+#[cfg(feature = "cuda")]
+pub struct GpuExactIndex {
+    current: parking_lot::RwLock<Option<Arc<GpuFastPath>>>,
+    rebuild_lock: parking_lot::Mutex<()>,
+    /// Set by an explicit GPU failure: no more rebuild attempts.
+    disabled: AtomicBool,
+    /// Dataset versions uploaded after the startup one (observability/tests).
+    rebuilds: AtomicUsize,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuExactIndex {
+    /// Startup upload of the current dataset, read straight from the store's
+    /// buffer (no host copy). Returns `(holder, corpus_n)`; the holder is
+    /// `None` only when CUDA is not available at all.
+    fn startup(store: &SplatStore) -> (Option<Arc<Self>>, usize) {
+        let n = store.n_active();
+        let holder = Self {
+            current: parking_lot::RwLock::new(None),
+            rebuild_lock: parking_lot::Mutex::new(()),
+            disabled: AtomicBool::new(false),
+            rebuilds: AtomicUsize::new(0),
+        };
+        let Some(mut index) = crate::gpu::cuda_kernel::GpuIndex::new() else {
+            eprintln!("[splatsdb] serve: GPU no disponible (--gpu ignorado); búsqueda en CPU");
+            return (None, n);
+        };
+        match store.mu_view() {
+            Some(view) => {
+                let dim = view.ncols();
+                let uploaded = view
+                    .as_slice()
+                    .map(|flat| index.upload_dataset(flat, n, dim))
+                    == Some(true);
+                if uploaded {
+                    let version = store.data_version();
+                    eprintln!(
+                        "[splatsdb] serve: GPU exact index listo ({n} vectores, dim {dim}, \
+                         data_version {version})"
+                    );
+                    *holder.current.write() = Some(Arc::new(GpuFastPath {
+                        key: GpuIndexKey { version, n },
+                        index,
+                    }));
+                } else {
+                    eprintln!("[splatsdb] serve: upload GPU falló; búsqueda en CPU");
+                    holder.disabled.store(true, Ordering::Relaxed);
+                }
+            }
+            None => eprintln!("[splatsdb] serve: store vacío, GPU sin dataset"),
+        }
+        (Some(Arc::new(holder)), n)
+    }
+
+    /// The resident index when it is exactly the dataset `(version, n)` this
+    /// request read — a read lock and an Arc clone, nothing else.
+    fn current_index(&self, version: u64, n: usize) -> Option<Arc<GpuFastPath>> {
+        self.current
+            .read()
+            .as_ref()
+            .filter(|f| f.key.is_current(version, n))
+            .cloned()
+    }
+
+    /// [`Self::current_index`], rebuilding the index once when stale.
+    fn index_for_request(
+        &self,
+        store: &Arc<Mutex<SplatStore>>,
+        version: u64,
+        n: usize,
+    ) -> Option<Arc<GpuFastPath>> {
+        if let Some(fast) = self.current_index(version, n) {
+            return Some(fast);
+        }
+        // One rebuild at a time: the others re-check and reuse its result.
+        let _serial = self.rebuild_lock.lock();
+        if let Some(fast) = self.current_index(version, n) {
+            return Some(fast);
+        }
+        if self.disabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let Some(mut index) = crate::gpu::cuda_kernel::GpuIndex::new() else {
+            self.fail("CUDA no disponible al reconstruir el índice");
+            return None;
+        };
+        // Upload straight from the store's buffer — no host copy (each copy of
+        // a 10000×768 dataset is ~30 MB of RSS). The store lock is held only
+        // for the duration of the H2D copy, never during a kernel launch.
+        let (key, uploaded) = {
+            let s = store.blocking_lock();
+            let (version, n) = (s.data_version(), s.n_active());
+            if let Some(fast) = self.current_index(version, n) {
+                return Some(fast);
+            }
+            let uploaded = match s.mu_view() {
+                Some(view) => match view.as_slice() {
+                    Some(flat) => index.upload_dataset(flat, n, view.ncols()),
+                    None => false,
+                },
+                None => false,
+            };
+            (GpuIndexKey { version, n }, uploaded)
+        };
+        if !uploaded {
+            self.fail("upload del dataset falló al reconstruir el índice");
+            return None;
+        }
+        let fast = Arc::new(GpuFastPath { key, index });
+        *self.current.write() = Some(fast.clone());
+        self.rebuilds.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "[splatsdb] serve: GPU exact index reconstruido ({} vectores, data_version {})",
+            key.n, key.version
+        );
+        Some(fast)
+    }
+
+    /// Dataset versions uploaded after the startup one.
+    pub fn rebuilds(&self) -> usize {
+        self.rebuilds.load(Ordering::Relaxed)
+    }
+
+    /// Explicit GPU failure: drop the resident index and stop trying.
+    fn fail(&self, why: &str) {
+        self.disabled.store(true, Ordering::Relaxed);
+        *self.current.write() = None;
+        eprintln!("[splatsdb] serve: GPU fast path desactivada ({why}); batch worker");
+    }
+}
+
+/// Exact GPU index built once at startup plus the dataset key it was built
+/// from ([`GpuIndexKey`]).
+#[cfg(feature = "cuda")]
+pub struct GpuFastPath {
+    key: GpuIndexKey,
+    index: crate::gpu::cuda_kernel::GpuIndex,
+}
+
+/// One exact top-k row from the startup GPU index, sorted by distance, or
+/// `None` when the kernel declined or violated its contract (row count ≠ 1,
+/// idx/dist length mismatch, out-of-range index). The caller then falls
+/// through to the batch path (GPU cached-by-version, else CPU) instead of
+/// returning a truncated or fabricated row.
+#[cfg(feature = "cuda")]
+fn gpu_fast_path_results(
+    fast: &GpuFastPath,
+    embedding: &[f32],
+    k: usize,
+) -> Option<Vec<SearchResult>> {
+    // F02e1: the kernel orders exact ties by scan position, not by id.
+    // `contractual_topk` asks for k+1 pairs, proves the k-set against a tie
+    // at the boundary (escalating to the kernel's largest window) and
+    // returns the canonical (d², id) order — untied answers are the kernel's
+    // own k pairs, bit for bit. A tie the kernel cannot resolve, or a
+    // malformed row, falls through to the batch worker (host-exact there).
+    let fetch = |window: usize| -> Option<Vec<(usize, f32)>> {
+        let rows = fast.index.topk_search(embedding, 1, window, "l2")?;
+        let [(idxs, dists)] = rows.as_slice() else {
+            eprintln!(
+                "[splatsdb] GPU topk devolvió {} filas para 1 query; query cae a CPU",
+                rows.len()
+            );
+            return None;
+        };
+        if idxs.len() != dists.len() || idxs.iter().any(|&i| i >= fast.key.n) {
+            eprintln!(
+                "[splatsdb] GPU topk devolvió una fila inválida ({} índices / {} distancias sobre \
+                 {} vectores); query cae a CPU",
+                idxs.len(),
+                dists.len(),
+                fast.key.n
+            );
+            return None;
+        }
+        Some(
+            idxs.iter()
+                .zip(dists.iter())
+                .map(|(&i, &d)| (i, d))
+                .collect(),
+        )
+    };
+    let pairs = match crate::splats::contractual_topk(fast.key.n, k, false, fetch) {
+        crate::splats::Contract::Exact(pairs) => pairs,
+        crate::splats::Contract::Saturated(_) | crate::splats::Contract::NoFetch => return None,
+    };
+    Some(
+        pairs
+            .into_iter()
+            .map(|(index, score)| SearchResult {
+                index,
+                score,
+                metadata: None,
+                confidence: None,
+                topic: None,
+            })
+            .collect(),
+    )
 }
 
 // ─── Micro-batching constants (R9 §2) ────────────────────
@@ -87,15 +340,20 @@ pub struct AppState {
     pub batch_tx: mpsc::Sender<BatchRequest>,
     /// Number of batches served by the worker (observability / tests).
     pub batches_served: Arc<AtomicUsize>,
-    /// Índice exacto en GPU (kernel PTX l2_topk). topk_search es &self → se
-    /// comparte sin Mutex. Presente solo con serve --gpu y feature cuda.
+    /// Índice exacto en GPU (kernel PTX l2_topk): subido en el arranque de
+    /// serve --gpu y reconstruido UNA vez por versión de dataset tras una
+    /// mutación (F06a), con la clave del dataset que subió (`GpuIndexKey`).
+    /// topk_search es &self → se comparte sin Mutex. El handler sólo lo usa
+    /// mientras la clave siga vigente (A03-F05).
     #[cfg(feature = "cuda")]
-    pub gpu: Option<Arc<crate::gpu::cuda_kernel::GpuIndex>>,
+    pub gpu: Option<Arc<GpuExactIndex>>,
     /// Campo splat (celdas con radio) para /field-search exacto. None si no
     /// hay field/ persistido en el data-dir.
     pub field: Option<Arc<FieldData>>,
-    /// Tamaño del corpus que atiende /search: field.raw si hay field/ (los
-    /// ids de resultados son chunks), o el shard cargado (los ids son splats).
+    /// Filas del dataset que subió al fast path GPU en el arranque (la clave
+    /// `GpuIndexKey` lo coteja): los splats del shard, nunca los chunks de
+    /// field/ (ver `serve_corpus`). Sólo lo lee el fast path (feature cuda).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub corpus_n: usize,
     /// Directorio de datos del server (flag --data-dir). /recall lo usa para
     /// abrir {data_dir}/sidecar.db en mode=ro y loggear fires. None en tests.
@@ -104,88 +362,418 @@ pub struct AppState {
     /// /store se loggea al WAL y cada COMPACT_EVERY se persiste el shard.
     /// None en tests sin data-dir (comportamiento in-memory clásico).
     pub durability: Option<Arc<Durability>>,
+    /// Authentication resolved ONCE at startup from `SPLATSDB_API_KEY`
+    /// (A05-F10). The middleware reads it from here and never from the
+    /// environment, so an empty/non-UTF-8 key cannot turn into "auth off"
+    /// per request.
+    pub auth: AuthConfig,
 }
 
-/// Durabilidad del `serve` cuando hay --data-dir: cada /store agregado se
-/// escribe en un WAL append-only (bajo el lock del store, así el orden del
-/// WAL == orden de índices y el replay reconstruye el dataset idéntico), y
-/// cada COMPACT_EVERY stores — y en el shutdown — se persiste el shard
-/// "default" completo y se trunca el WAL. Un crash de proceso pierde a lo
-/// sumo los últimos stores bufferados, no el dataset entero.
+/// Durabilidad del `serve` con --data-dir: cada /store aceptado se escribe
+/// en un WAL append-only (bajo el lock del store, así el orden del WAL ==
+/// orden de índices y el replay reconstruye el dataset idéntico), y cada
+/// COMPACT_EVERY stores — y en el shutdown — se persiste el shard
+/// "default" completo y se trunca el WAL.
+///
+/// Durability is interpreted through the session's fixed `WalDurability` mode:
+/// - **process-crash** (default): a complete WAL write acknowledges `stored`,
+///   `durable:true`, `crash_durable:true`, `power_loss_durable:false`. Group
+///   `sync_all` only clears `wal_pending`; it does not change the declared mode.
+/// - **power-loss**: `sync_all` must succeed before `stored`; a failed/ambiguous
+///   sync returns `outcome:unknown` and never acknowledges `power_loss_durable`.
+///
+/// Pending entries are therefore "not yet power-loss safe", never "not crash
+/// durable" in the default mode.
+#[derive(Debug)]
+struct LoggedStore {
+    _lsn: u64,
+    already_logged: bool,
+}
+
+#[derive(Debug)]
+struct StoreWorkerError {
+    status: StatusCode,
+    message: String,
+    response: Option<Box<StoreResponse>>,
+}
+
 pub struct Durability {
     wal: WriteAheadLog,
     persist: SplatsDBPersistence,
+    /// Sidecar `wal/store.wal.base` de este data-dir.
+    base_path: std::path::PathBuf,
+    /// Shard "default" contra el que abrió esta generación del WAL.
+    /// `compact` se niega a sobrescribir el shard si en disco ya no es este
+    /// (lost update, A03-F12).
+    base: std::sync::Mutex<WalBase>,
+    /// Entradas "store" del WAL que el replay NO pudo aplicar: su única
+    /// copia. Mientras haya, `compact` no trunca el WAL.
+    unapplied: std::sync::Mutex<Vec<u64>>,
+    last_compact_error: std::sync::Mutex<Option<String>>,
     /// Último LSN asignado a un "store" (fetch_max: monotónico).
     last_lsn: AtomicU64,
-    /// Stores loggeados desde la última compactación.
+    /// Stores aceptados que todavía no pasaron por `sync_all`.
+    pending: AtomicU64,
+    /// Stores loggeados desde el arranque.
     since_compact: AtomicUsize,
+    /// Fixed for the whole session; ACK flags are interpreted through it.
+    mode: WalDurability,
+    /// Idempotency keys of records that may exist in the WAL. A retry after
+    /// an ambiguous result reconciles against these instead of appending twice.
+    known_ids: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Durability {
     /// Stores entre compactaciones (persistir shard + truncar WAL).
     const COMPACT_EVERY: usize = 1000;
-    /// Stores entre checkpoints del WAL (flush + fsync — protege contra
-    /// corte de luz; el flush por store ya protege contra crash de proceso).
+    /// Stores between group `sync_all` calls. Default-mode entries are already
+    /// process-crash durable while pending; they are not yet power-loss safe.
     const CHECKPOINT_EVERY: u32 = 32;
 
+    /// Abre el WAL de `data_dir`. Devuelve `Err` si el WAL no se puede abrir
+    /// ni leer, o si el shard cambió debajo de un WAL con stores sin compactar.
+    #[cfg(test)]
     fn open(data_dir: &str) -> anyhow::Result<Self> {
-        let persist = SplatsDBPersistence::with_backend(
-            data_dir,
-            StorageBackend::Sqlite,
-            false, // WAL propio: {data_dir}/wal/store.wal, no el interno del persistence
-        )
-        .map_err(|e| anyhow::anyhow!("persistence init falló: {e}"))?;
-        // sync_interval=1: flush del WAL en CADA store (page cache: un kill
-        // -9 no lo pierde; el fsync real viene con CHECKPOINT_EVERY).
-        let wal = WriteAheadLog::new(&format!("{data_dir}/wal/store.wal"), 1)?;
+        Self::open_with_mode(data_dir, WalDurability::ProcessCrash)
+    }
+
+    fn open_with_mode(data_dir: &str, mode: WalDurability) -> anyhow::Result<Self> {
+        let persist = SplatsDBPersistence::with_backend(data_dir, StorageBackend::Sqlite, false)
+            .map_err(|e| anyhow::anyhow!("persistence init falló: {e}"))?;
+        let shard_path = Self::shard_path(&persist)?;
+        let current = fingerprint(&shard_path)?;
+        let base_path = std::path::Path::new(data_dir)
+            .join("wal")
+            .join(WAL_BASE_FILE);
+        let wal = WriteAheadLog::new_with_mode(&format!("{data_dir}/wal/store.wal"), 1, mode)?;
+        let entries = wal.recover()?;
+        let pending = entries.iter().filter(|e| e.operation == "store").count();
+        let known_ids = entries
+            .iter()
+            .filter(|e| e.operation == "store")
+            .filter_map(|e| e.data.get("id").and_then(|v| v.as_str()))
+            .map(str::to_owned)
+            .collect();
+        if let Some(recorded) = read_wal_base(&base_path)? {
+            if recorded.shard != current && pending > 0 {
+                anyhow::bail!(
+                    "shard 'default' de {data_dir} cambió en disco mientras el WAL tenía {pending} \
+                     store(s) sin compactar: replay por idx no es seguro. Restaurá el shard contra \
+                     el que se escribió el WAL, o respaldá y reconciliá wal/store.wal a mano"
+                );
+            }
+        }
+        write_wal_base(&base_path, &WalBase { shard: current })?;
+        wal.checkpoint()?;
         Ok(Self {
             wal,
             persist,
-            last_lsn: AtomicU64::new(0),
+            base_path,
+            base: std::sync::Mutex::new(WalBase { shard: current }),
+            unapplied: std::sync::Mutex::new(Vec::new()),
+            last_compact_error: std::sync::Mutex::new(None),
+            last_lsn: AtomicU64::new(entries.last().map_or(0, |e| e.lsn)),
+            pending: AtomicU64::new(0),
             since_compact: AtomicUsize::new(0),
+            mode,
+            known_ids: std::sync::Mutex::new(known_ids),
         })
     }
 
-    /// Loggea un store YA insertado en el store en memoria. DEBE llamarse
-    /// con el lock del store tomado (ver orden WAL == orden índices).
+    /// `data/vectors/default.bin` del data-dir (mismo layout que
+    /// `SplatsDBPersistence::save_vectors`).
+    fn shard_path(persist: &SplatsDBPersistence) -> std::io::Result<std::path::PathBuf> {
+        Ok(persist
+            .storage_path
+            .join("data")
+            .join("vectors")
+            .join("default.bin"))
+    }
+
+    fn count_stores(wal: &WriteAheadLog) -> std::io::Result<usize> {
+        Ok(wal
+            .recover()?
+            .iter()
+            .filter(|e| e.operation == "store")
+            .count())
+    }
+
+    fn lock<'a, T>(
+        slot: &'a std::sync::Mutex<T>,
+        what: &str,
+    ) -> std::io::Result<std::sync::MutexGuard<'a, T>> {
+        slot.lock()
+            .map_err(|_| std::io::Error::other(format!("lock de {what} envenenado")))
+    }
+
+    /// Log before the in-memory mutation. A failed write therefore never
+    /// leaves an unacknowledged vector in memory. An ambiguous sync/write is
+    /// reported as such and its id is retained for idempotent reconciliation.
     fn log_store(
         &self,
         id: &str,
         auto_id: Option<usize>,
         idx: usize,
         vector: &[f32],
-    ) -> std::io::Result<()> {
-        let data = serde_json::json!({
-            "id": id,
-            "auto_id": auto_id,
-            "idx": idx,
-            "vector": vector,
-        });
-        let lsn = self.wal.log_operation("store", data)?;
-        self.last_lsn.fetch_max(lsn, Ordering::SeqCst);
-        let n = self.since_compact.fetch_add(1, Ordering::SeqCst) + 1;
-        if (n as u32).is_multiple_of(Self::CHECKPOINT_EVERY) {
-            self.wal.checkpoint()?;
+    ) -> Result<LoggedStore, StoreWorkerError> {
+        {
+            let known = self
+                .known_ids
+                .lock()
+                .map_err(|_| self.poisoned_failure(id))?;
+            if known.contains(id) {
+                drop(known);
+                return self.reconcile_retry(id, auto_id, idx, vector);
+            }
         }
+        let data =
+            serde_json::json!({ "id": id, "auto_id": auto_id, "idx": idx, "vector": vector });
+        match self.wal.log_operation("store", data) {
+            Ok(lsn) => {
+                self.known_ids
+                    .lock()
+                    .map_err(|_| self.poisoned_failure(id))?
+                    .insert(id.to_owned());
+                self.last_lsn.fetch_max(lsn, Ordering::SeqCst);
+                if self.mode == WalDurability::ProcessCrash {
+                    self.pending.fetch_add(1, Ordering::SeqCst);
+                }
+                let n = self.since_compact.fetch_add(1, Ordering::SeqCst) + 1;
+                if self.mode == WalDurability::ProcessCrash
+                    && (n as u32).is_multiple_of(Self::CHECKPOINT_EVERY)
+                {
+                    if let Err(e) = self.checkpoint_now() {
+                        return Err(self.failure(id, &e.to_string(), true, true));
+                    }
+                }
+                Ok(LoggedStore {
+                    _lsn: lsn,
+                    already_logged: false,
+                })
+            }
+            Err(e) => {
+                if e.entry_reached_kernel || e.may_be_persisted {
+                    self.known_ids
+                        .lock()
+                        .map_err(|_| self.poisoned_failure(id))?
+                        .insert(id.to_owned());
+                    if self.mode == WalDurability::PowerLoss {
+                        self.pending.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                Err(self.failure(
+                    id,
+                    &format!("WAL write failed: {e}"),
+                    e.entry_reached_kernel,
+                    e.may_be_persisted,
+                ))
+            }
+        }
+    }
+
+    /// Reconcile an id returned after an ambiguous failure. Never append a
+    /// second record for it; conflicting reuse of an id is rejected.
+    fn reconcile_retry(
+        &self,
+        id: &str,
+        auto_id: Option<usize>,
+        idx: usize,
+        vector: &[f32],
+    ) -> Result<LoggedStore, StoreWorkerError> {
+        let entries = self
+            .wal
+            .recover()
+            .map_err(|e| self.failure(id, &e.to_string(), false, true))?;
+        let entry = entries.iter().rev().find(|e| {
+            e.operation == "store" && e.data.get("id").and_then(|v| v.as_str()) == Some(id)
+        });
+        let Some(entry) = entry else {
+            return Err(self.failure(
+                id,
+                "WAL id disappeared before retry reconciliation",
+                false,
+                true,
+            ));
+        };
+        let same = entry.data.get("idx").and_then(|v| v.as_u64()) == Some(idx as u64)
+            && entry.data.get("auto_id").and_then(|v| v.as_u64()) == auto_id.map(|v| v as u64)
+            && entry.data.get("vector") == Some(&serde_json::json!(vector));
+        if !same {
+            return Err(StoreWorkerError {
+                status: StatusCode::CONFLICT,
+                message: "id already belongs to a different WAL entry".into(),
+                response: Some(Box::new(StoreResponse {
+                    error: Some("id already belongs to a different WAL entry".into()),
+                    id: id.into(),
+                    status: "conflict".into(),
+                    outcome: "not_stored".into(),
+                    may_be_persisted: false,
+                    durable: false,
+                    crash_durable: false,
+                    power_loss_durable: false,
+                    wal_pending: self.wal_pending(),
+                    durability_mode: self.mode.as_str().into(),
+                    persistence: "wal".into(),
+                })),
+            });
+        }
+        if self.mode == WalDurability::PowerLoss {
+            self.checkpoint_now()
+                .map_err(|e| self.failure(id, &e.to_string(), true, true))?;
+        }
+        Ok(LoggedStore {
+            _lsn: entry.lsn,
+            already_logged: true,
+        })
+    }
+
+    /// `sync_all` del WAL: todo lo aceptado hasta acá pasa a ser duradero.
+    fn checkpoint_now(&self) -> std::io::Result<()> {
+        self.wal.checkpoint()?;
+        self.pending.store(0, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Mode-level durability. In process-crash mode pending means "not yet
+    /// power-loss safe", not "not crash durable".
+    fn is_durable(&self) -> bool {
+        self.mode == WalDurability::ProcessCrash || self.wal_pending() == 0
+    }
+
+    fn crash_durable(&self) -> bool {
+        true
+    }
+
+    fn power_loss_durable(&self) -> bool {
+        self.mode == WalDurability::PowerLoss && self.wal_pending() == 0
+    }
+
+    fn wal_pending(&self) -> u64 {
+        self.pending.load(Ordering::SeqCst)
+    }
+
+    fn success(&self, id: &str) -> StoreResponse {
+        StoreResponse {
+            error: None,
+            id: id.into(),
+            status: "stored".into(),
+            outcome: "stored".into(),
+            may_be_persisted: true,
+            durable: self.is_durable(),
+            crash_durable: self.crash_durable(),
+            power_loss_durable: self.power_loss_durable(),
+            wal_pending: self.wal_pending(),
+            durability_mode: self.mode.as_str().into(),
+            persistence: "wal".into(),
+        }
+    }
+
+    fn failure(
+        &self,
+        id: &str,
+        message: &str,
+        reached_kernel: bool,
+        may_be_persisted: bool,
+    ) -> StoreWorkerError {
+        StoreWorkerError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+            response: Some(Box::new(StoreResponse {
+                error: Some(message.into()),
+                id: id.into(),
+                status: if may_be_persisted {
+                    "unknown"
+                } else {
+                    "not_stored"
+                }
+                .into(),
+                outcome: if may_be_persisted {
+                    "unknown"
+                } else {
+                    "not_stored"
+                }
+                .into(),
+                may_be_persisted,
+                durable: false,
+                crash_durable: reached_kernel,
+                power_loss_durable: false,
+                wal_pending: self.wal_pending(),
+                durability_mode: self.mode.as_str().into(),
+                persistence: "wal".into(),
+            })),
+        }
+    }
+
+    fn poisoned_failure(&self, id: &str) -> StoreWorkerError {
+        self.failure(id, "WAL idempotency state is poisoned", false, true)
     }
 
     fn stores_since_compact(&self) -> usize {
         self.since_compact.load(Ordering::SeqCst)
     }
 
-    /// Flush + fsync del WAL. Solo tests: simular un crash determinista
-    /// (el flush por store de `log_store` ya cubre el caso real).
+    fn last_compact_error(&self) -> Option<String> {
+        self.last_compact_error.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Flush + fsync del WAL. Solo tests.
     #[cfg(test)]
     fn flush(&self) -> std::io::Result<()> {
-        self.wal.checkpoint()
+        self.checkpoint_now()
     }
 
     /// Persiste el shard "default" con el estado ACTUAL del store y trunca
     /// el WAL (todo lo loggeado ya quedó en el shard). Llamar con el lock
     /// del store tomado. Devuelve la cantidad de splats persistidos.
+    ///
+    /// Se niega (Err, WAL intacto) si el shard en disco ya no es el que esta
+    /// generación del WAL vio al arrancar (lost update) o si el WAL todavía
+    /// tiene entradas que no se pudieron aplicar.
     fn compact(&self, store: &SplatStore) -> std::io::Result<usize> {
+        let outcome = self.compact_checked(store);
+        if let Err(e) = &outcome {
+            if let Ok(mut slot) = self.last_compact_error.lock() {
+                *slot = Some(e.to_string());
+            }
+        }
+        outcome
+    }
+
+    fn compact_checked(&self, store: &SplatStore) -> std::io::Result<usize> {
+        // (1) Lost update (A03-F12): el shard en disco tiene que seguir
+        // siendo el que esta generación del WAL vio al arrancar.
+        let shard_path = Self::shard_path(&self.persist)?;
+        let current = fingerprint(&shard_path)?;
+        let base = *Self::lock(&self.base, "base de WAL")?;
+        let pending = Self::count_stores(&self.wal)?;
+        if current != base.shard {
+            return Err(std::io::Error::other(format!(
+                "shard 'default' ({}) cambió en disco desde el arranque de este serve: NO se \
+                 sobrescribe con el estado stale en memoria; {pending} store(s) aceptados se \
+                 conservan en wal/store.wal",
+                shard_path.display()
+            )));
+        }
+        // (2) Entradas del WAL que el replay no pudo aplicar son la única
+        // copia de esos datos: no se trunca el WAL mientras existan.
+        let unapplied = Self::lock(&self.unapplied, "unapplied")?.clone();
         let n = store.n_active();
+        if n > 0 && !unapplied.is_empty() {
+            return Err(std::io::Error::other(format!(
+                "{} entrada(s) 'store' del WAL (lsn {:?}) no se aplicaron al store: no se trunca \
+                 el WAL, se conserva",
+                unapplied.len(),
+                &unapplied[..unapplied.len().min(8)]
+            )));
+        }
+        //
+        // Orden shard→WAL: el shard se escribe con `atomic_write` (fsync del
+        // tmp → rename → fsync del directorio) y recién cuando eso terminó se
+        // trunca el WAL; si el shard falla, el WAL sigue intacto.
+        //
+        // Con el store vacío NO trunca: si el WAL todavía tiene entradas
+        // "store" son la única copia de datos no recuperados (p.ej. salteados
+        // por el replay) y se conservan — devuelve `Err` para que se vea.
         if n > 0 {
             let Some(mu) = store.get_mu() else {
                 return Err(std::io::Error::other(
@@ -193,15 +781,44 @@ impl Durability {
                 ));
             };
             self.persist.save_vectors(&mu, "default")?;
+        } else {
+            let unrecovered = Self::count_stores(&self.wal)?;
+            if unrecovered > 0 {
+                return Err(std::io::Error::other(format!(
+                    "store vacío (n_active=0) con {unrecovered} entrada(s) 'store' aún en el WAL: \
+                     no se persiste ni se trunca, el WAL se conserva"
+                )));
+            }
         }
         let before = self.last_lsn.load(Ordering::SeqCst).saturating_add(1);
         self.wal.truncate(before)?;
+        // (3) Nueva generación: el WAL arranca vacío contra el shard recién
+        // escrito. El sidecar se reescribe DESPUÉS del truncate: si el
+        // proceso muere entre ambos, el WAL ya está vacío y un sidecar viejo
+        // no afirma nada (se refresca en el próximo open).
+        let fresh = WalBase {
+            shard: fingerprint(&shard_path)?,
+        };
+        *Self::lock(&self.base, "base de WAL")? = fresh;
+        self.last_lsn.store(0, Ordering::SeqCst);
+        self.pending.store(0, Ordering::SeqCst);
+        self.known_ids.lock().map(|mut ids| ids.clear()).ok();
+        if let Ok(mut slot) = self.unapplied.lock() {
+            slot.clear();
+        }
+        if let Err(e) = write_wal_base(&self.base_path, &fresh) {
+            eprintln!(
+                "[splatsdb] WAL: no se pudo actualizar {}: {e}",
+                self.base_path.display()
+            );
+        }
         Ok(n)
     }
 }
 
-/// Al dropear (panic, exit() sin TERM, tests): flush del WAL — lo mismo que
-/// un kill -9 respeta vía el flush por store de `log_store`.
+/// Al dropear (panic, exit() sin TERM, tests): flush + fsync del WAL, así lo
+/// aceptado sin compactar queda duradero en el WAL aunque el compact del
+/// shutdown se haya negado (lost update) o fallado.
 impl Drop for Durability {
     fn drop(&mut self) {
         let _ = self.wal.checkpoint();
@@ -246,10 +863,26 @@ pub struct SearchQuery {
     pub rescore: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct StoreResponse {
     pub id: String,
     pub status: String,
+    pub outcome: String,
+    pub may_be_persisted: bool,
+    /// `true` sii, además de estar en el WAL, `sync_all` del WAL ya terminó
+    /// después de esta entrada. `false` = aceptado (sobrevive a un crash del
+    /// proceso) pero todavía no duradero ante corte de energía, o bien el
+    /// server corre efímero sin data-dir.
+    pub durable: bool,
+    pub crash_durable: bool,
+    pub power_loss_durable: bool,
+    pub wal_pending: u64,
+    pub durability_mode: String,
+    /// Diagnostic for a non-stored outcome; absent on success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// "wal" (persistente en --data-dir) o "ephemeral" (sólo memoria).
+    pub persistence: String,
 }
 
 #[derive(Serialize)]
@@ -283,6 +916,20 @@ pub struct StatusResponse {
     pub has_hnsw: bool,
     pub has_lsh: bool,
     pub has_quantization: bool,
+    /// "wal": persistente en --data-dir. "ephemeral": nada sobrevive al
+    /// proceso (sólo cuando se pidió explícitamente; `serve` con --data-dir
+    /// nunca arranca efímero, A03-F01).
+    pub persistence: String,
+    /// `true` sii todo lo aceptado hasta ahora pasó por `sync_all`.
+    pub durable: bool,
+    pub crash_durable: bool,
+    pub power_loss_durable: bool,
+    /// Entradas aceptadas que todavía no pasaron por `sync_all` (group commit).
+    pub wal_pending: u64,
+    pub durability_mode: String,
+    /// Último error de compact: el shard o el WAL no se pudieron persistir.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_compact_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -301,6 +948,26 @@ async fn health() -> Json<HealthResponse> {
 async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
     let store = state.store.lock().await;
     let stats = store.get_statistics();
+    let (
+        persistence,
+        durability_mode,
+        durable,
+        crash_durable,
+        power_loss_durable,
+        wal_pending,
+        last_compact_error,
+    ) = match state.durability.as_ref() {
+        Some(d) => (
+            "wal",
+            d.mode.as_str(),
+            d.is_durable(),
+            d.crash_durable(),
+            d.power_loss_durable(),
+            d.wal_pending(),
+            d.last_compact_error(),
+        ),
+        None => ("ephemeral", "ephemeral", false, false, false, 0, None),
+    };
     Json(StatusResponse {
         n_active: store.n_active(),
         max_splats: store.max_splats(),
@@ -308,30 +975,32 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
         has_hnsw: store.has_hnsw(),
         has_lsh: store.has_lsh(),
         has_quantization: store.has_quantization(),
+        persistence: persistence.into(),
+        durable,
+        crash_durable,
+        power_loss_durable,
+        wal_pending,
+        durability_mode: durability_mode.into(),
+        last_compact_error,
     })
 }
 
 async fn store_memory(
     State(state): State<AppState>,
     Json(req): Json<StoreRequest>,
-) -> Result<(StatusCode, Json<StoreResponse>), (StatusCode, String)> {
-    // Input validation
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    let error =
+        |code: StatusCode, message: String| (code, Json(serde_json::json!({ "error": message })));
     if req.text.len() > MAX_TEXT_LEN {
-        return Err((
+        return Err(error(
             StatusCode::PAYLOAD_TOO_LARGE,
             format!("Text exceeds max length ({MAX_TEXT_LEN})"),
         ));
     }
-
-    let dim = {
-        let store = state.store.lock().await;
-        store.get_statistics().embedding_dim
-    }; // lock dropped here — embedding computation doesn't need the mutex
-
-    // Validate user-supplied embedding dimension
+    let dim = state.store.lock().await.get_statistics().embedding_dim;
     if let Some(ref emb) = req.embedding {
         if emb.len() != dim {
-            return Err((
+            return Err(error(
                 StatusCode::BAD_REQUEST,
                 format!(
                     "Embedding dimension mismatch: expected {dim}, got {}",
@@ -340,51 +1009,74 @@ async fn store_memory(
             ));
         }
         if emb.len() > MAX_EMBEDDING_DIM {
-            return Err((
+            return Err(error(
                 StatusCode::BAD_REQUEST,
                 format!("Embedding dimension exceeds max ({MAX_EMBEDDING_DIM})"),
             ));
         }
-        // NaN/inf (e.g. `1e400` parsed as inf) would poison the index.
         if !all_finite(emb) {
-            return Err((
+            return Err(error(
                 StatusCode::BAD_REQUEST,
                 "Embedding contains non-finite values (NaN/inf)".into(),
             ));
         }
     }
-
     let embedding = req
         .embedding
         .unwrap_or_else(|| simple_hash_embedding(&req.text, dim));
-
     let arr = Array2::from_shape_vec((1, dim), embedding.clone())
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Bad embedding shape: {e}")))?;
-
+        .map_err(|e| error(StatusCode::BAD_REQUEST, format!("Bad embedding shape: {e}")))?;
     let id_num = state.next_id.fetch_add(1, Ordering::SeqCst);
     let user_supplied = req.id.is_some();
     let id = req.id.unwrap_or_else(|| format!("mem_{id_num}"));
-
-    // Wrap CPU-intensive work in spawn_blocking to avoid blocking the tokio runtime
     let store = state.store.clone();
     let durability = state.durability.clone();
     let emb_for_wal = embedding.clone();
     let id_for_wal = id.clone();
     let auto_id = (!user_supplied).then_some(id_num);
-    let added = tokio::task::spawn_blocking(move || {
-        let mut store = store.blocking_lock();
-        let added = store.add_splat(&arr);
-        if added {
-            // Incrementally insert the new vector into HNSW (no full rebuild)
-            store.hnsw_sync_incremental();
-            if let Some(d) = durability.as_ref() {
-                // Mismo lock que add_splat: el orden del WAL replica el orden
-                // de índices del store, así el replay es determinista.
-                let idx = store.n_active().saturating_sub(1);
-                if let Err(e) = d.log_store(&id_for_wal, auto_id, idx, &emb_for_wal) {
-                    eprintln!("[splatsdb] WAL: fallo al loggear store (queda en memoria): {e}");
+    let wal_outcome =
+        tokio::task::spawn_blocking(move || -> Result<LoggedStore, StoreWorkerError> {
+            let mut store = store.blocking_lock();
+            if store.n_active() >= store.max_splats() {
+                return Err(StoreWorkerError {
+                    status: StatusCode::INSUFFICIENT_STORAGE,
+                    message: "Store full".into(),
+                    response: None,
+                });
+            }
+            let idx = store.n_active();
+            let logged = if let Some(d) = durability.as_ref() {
+                // WAL first: no unconfirmed mutation is ever applied in memory.
+                d.log_store(&id_for_wal, auto_id, idx, &emb_for_wal)?
+            } else {
+                // The common apply path below owns the only in-memory mutation.
+                LoggedStore {
+                    _lsn: 0,
+                    already_logged: false,
                 }
-                if d.stores_since_compact() % Durability::COMPACT_EVERY == 0 {
+            };
+            if !logged.already_logged || store.n_active() == idx {
+                if !store.add_splat(&arr) {
+                    if let Some(d) = durability.as_ref() {
+                        return Err(d.failure(
+                            &id_for_wal,
+                            "memory apply failed after WAL acceptance",
+                            true,
+                            true,
+                        ));
+                    }
+                    return Err(StoreWorkerError {
+                        status: StatusCode::INSUFFICIENT_STORAGE,
+                        message: "Store full".into(),
+                        response: None,
+                    });
+                }
+                store.hnsw_sync_incremental();
+            }
+            if let Some(d) = durability.as_ref() {
+                if d.stores_since_compact() > 0
+                    && d.stores_since_compact() % Durability::COMPACT_EVERY == 0
+                {
                     match d.compact(&store) {
                         Ok(n) => {
                             eprintln!("[splatsdb] compact: shard 'default' persistido ({n} splats)")
@@ -393,27 +1085,45 @@ async fn store_memory(
                     }
                 }
             }
+            Ok(logged)
+        })
+        .await
+        .map_err(|e| {
+            eprintln!("[splatsdb] /store: background task failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "internal error" })),
+            )
+        })?;
+    let response = match wal_outcome {
+        Ok(_) => match state.durability.as_ref() {
+            Some(d) => d.success(&id),
+            None => StoreResponse {
+                error: None,
+                id: id.clone(),
+                status: "stored".into(),
+                outcome: "stored".into(),
+                may_be_persisted: false,
+                durable: false,
+                crash_durable: false,
+                power_loss_durable: false,
+                wal_pending: 0,
+                durability_mode: "ephemeral".into(),
+                persistence: "ephemeral".into(),
+            },
+        },
+        Err(e) => {
+            eprintln!("[splatsdb] /store: {}", e.message);
+            let body = e
+                .response
+                .map(|r| serde_json::to_value(r).expect("serializable store response"))
+                .unwrap_or_else(|| serde_json::json!({ "error": e.message }));
+            return Err((e.status, Json(body)));
         }
-        added
-    })
-    .await
-    .map_err(|e| {
-        // Log the real cause server-side; the client gets a generic 500
-        // (JoinError strings can carry panic payloads).
-        eprintln!("[splatsdb] /store: background task failed: {e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
-    })?;
-
-    if !added {
-        return Err((StatusCode::INSUFFICIENT_STORAGE, "Store full".into()));
-    }
-
+    };
     Ok((
         StatusCode::OK,
-        Json(StoreResponse {
-            id,
-            status: "stored".into(),
-        }),
+        Json(serde_json::to_value(response).expect("serializable store response")),
     ))
 }
 
@@ -430,12 +1140,14 @@ async fn search_memories(
         ));
     }
 
-    let (dim, n_active) = {
+    let (dim, n_active, data_version) = {
         let store = state.store.lock().await;
         let dim = store.get_statistics().embedding_dim;
         let n = store.n_active();
-        (dim, n)
+        (dim, n, store.data_version())
     }; // lock dropped — the hot path below never re-acquires it
+    #[cfg(not(feature = "cuda"))]
+    let _ = data_version;
 
     // Validate user-supplied embedding dimension BEFORE the empty-store
     // early-return so malformed requests (dim, max-dim, NaN/inf) are always
@@ -503,32 +1215,51 @@ async fn search_memories(
     // ── GPU exact fast path (serve --gpu): kernel PTX fused l2+topk.
     // Exacto, sin store mutex (índice compartido &self). Rescore gaussiano y
     // query de texto (hash embedding) siguen por el camino CPU.
+    //
+    // A03-F05: el índice es una foto de UNA versión del dataset, así que sólo
+    // puede responder mientras el store siga siendo EXACTAMENTE el dataset que
+    // subió (`GpuIndexKey::is_current` sobre la `data_version` que esta
+    // request acaba de leer). Antes de este guard, toda búsqueda posterior al
+    // primer /store se respondía desde el dataset congelado del arranque.
+    //
+    // F06a: cuando la clave no calza (un /store, replay o compact movió la
+    // versión), el índice se reconstruye UNA vez por versión de dataset —las
+    // mutaciones continuas coalescen— y la query vuelve a la ruta GPU. Antes
+    // la clave quedaba vieja para siempre y cada query posterior caía al
+    // batch worker (backend null, ventana de 2 ms: p50 after-mutation 2× la
+    // base). Ante un fallo explícito de GPU (sin CUDA / upload fallido) la
+    // ruta rápida se desactiva y la query va al batch worker.
     #[cfg(feature = "cuda")]
-    if let Some(gpu) = &state.gpu {
-        if !rescore_gaussian {
-            if let Some(mut per_query) = gpu.topk_search(&embedding, 1, k, "l2") {
-                if let Some((idxs, dists)) = per_query.pop() {
-                    let mut pairs: Vec<(usize, f32)> = idxs.into_iter().zip(dists).collect();
-                    pairs
-                        .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                    let mut results = pairs
-                        .into_iter()
-                        .map(|(i, d)| SearchResult {
-                            index: i,
-                            score: d,
-                            metadata: None,
-                            confidence: None,
-                            topic: None,
-                        })
-                        .collect::<Vec<_>>();
-                    enrich_topics(&state, &mut results, true);
-                    return Ok(Json(SearchResponse {
-                        results,
-                        backend: Some("gpu".into()),
-                    }));
+    if !rescore_gaussian {
+        let fast = match state.gpu.as_ref() {
+            // Hit: the resident index is exactly the dataset this request
+            // read — no lock on the store, no upload.
+            Some(gpu) => match gpu.current_index(data_version, n_active) {
+                Some(fast) => Some(fast),
+                None => {
+                    // Miss: rebuild off the runtime thread; concurrent stale
+                    // requests coalesce on the single rebuild.
+                    let (gpu, store) = (gpu.clone(), state.store.clone());
+                    tokio::task::spawn_blocking(move || {
+                        gpu.index_for_request(&store, data_version, n_active)
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("[splatsdb] /search: GPU rebuild task failed: {e}");
+                        None
+                    })
                 }
+            },
+            None => None,
+        };
+        if let Some(fast) = fast {
+            if let Some(mut results) = gpu_fast_path_results(&fast, &embedding, k) {
+                enrich_topics(&state, &mut results, Some(true));
+                return Ok(Json(SearchResponse {
+                    results,
+                    backend: Some("gpu".into()),
+                }));
             }
-            eprintln!("[splatsdb] GPU topk devolvió None; query cae a CPU");
         }
     }
 
@@ -569,7 +1300,7 @@ async fn search_memories(
     // 87d5d91, gpu_batch_path desde el fix 17-nov): squared=true para que
     // confidence use d=√score. Con false la confidence quedaba inflada
     // (1−d²/R en vez de 1−√d²/R) en el batch (17-nov EGM audit).
-    enrich_topics(&state, &mut results, true);
+    enrich_topics(&state, &mut results, (!rescore_gaussian).then_some(true));
 
     Ok(Json(SearchResponse {
         results,
@@ -579,24 +1310,27 @@ async fn search_memories(
 
 /// Enriquece resultados con tópico (splat) y confianza espacial
 /// (1 − d/R del tópico). Solo llamado con scores de distancia L2 reales
-/// (no con gaussian rescore ni texto-hash). `squared` = score es d² (GPU).
-fn enrich_topics(state: &AppState, results: &mut [SearchResult], squared: bool) {
+/// (no con texto-hash). `squared`: `Some(true)` cuando el score es d² (filas
+/// L2 de cualquier ruta); `None` para `rescore=gaussian`, cuyo score es
+/// alpha·exp(−kappa·d²) y no es una distancia — esas filas llevan tópico y
+/// ninguna confianza.
+///
+/// Los ids de `/search` son SIEMPRE ids de splat —el espacio de la referencia
+/// CPU (`find_neighbors_fused`), del batch worker y de `/store`—, nunca ids
+/// de chunk de `field.raw` (ese es el contrato de `/field-search`). Antes el
+/// espacio se infería de `corpus_n`, que con field/ era siempre el del corpus
+/// de chunks: un id de splat se buscaba en `chunk_cluster` como si fuera un
+/// chunk y el tópico (y el radio de la confianza) eran los de OTRO splat.
+fn enrich_topics(state: &AppState, results: &mut [SearchResult], squared: Option<bool>) {
     let Some(field) = &state.field else {
         return;
     };
-    // Si el corpus activo ES field.raw, los ids del índice son chunks:
-    // topic = splat al que pertenece el chunk. Si el corpus son los splats
-    // (μ), el id ya es un tópico y la confianza mide qué tan cerca del
-    // centro de ese tópico cayó la query.
-    let ids_are_chunks = field.raw.nrows() == state.corpus_n;
     for r in results.iter_mut() {
-        let (c, radius) = if ids_are_chunks && r.index < field.chunk_cluster.len() {
-            let c = field.chunk_cluster[r.index] as usize;
-            (c, field.radii[c])
-        } else {
-            (r.index, field.radii.get(r.index).copied().unwrap_or(0.0))
+        let radius = field.radii.get(r.index).copied().unwrap_or(0.0);
+        r.topic = Some(r.index as u32);
+        let Some(squared) = squared else {
+            continue;
         };
-        r.topic = Some(c as u32);
         if radius > 0.0 {
             let dist = if squared {
                 r.score.max(0.0).sqrt()
@@ -786,11 +1520,7 @@ fn field_sweep(field: &FieldData, q: &[f32], kq: usize) -> serde_json::Value {
         .map(|c| (d_mu[c] - field.radii[c]).max(0.0))
         .collect();
     let mut order: Vec<usize> = (0..k).collect();
-    order.sort_by(|a, b| {
-        d_mu[*a]
-            .partial_cmp(&d_mu[*b])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    order.sort_by(|a, b| d_mu[*a].total_cmp(&d_mu[*b]));
 
     let mut top: Vec<(f32, u32)> = Vec::with_capacity(kq + 8);
     let mut kth = f32::INFINITY;
@@ -814,7 +1544,7 @@ fn field_sweep(field: &FieldData, q: &[f32], kq: usize) -> serde_json::Value {
             let d2 = diff.dot(&diff);
             if top.len() < kq || d2 < kth {
                 top.push((d2, id));
-                top.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                top.sort_by(|a, b| a.0.total_cmp(&b.0));
                 if top.len() > kq {
                     top.truncate(kq);
                 }
@@ -866,11 +1596,7 @@ fn field_two_phase(
         d.dot(&d).max(0.0).sqrt()
     });
     let mut order: Vec<usize> = (0..k).collect();
-    order.sort_by(|a, b| {
-        d_mu[*a]
-            .partial_cmp(&d_mu[*b])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    order.sort_by(|a, b| d_mu[*a].total_cmp(&d_mu[*b]));
     let winners = &order[..nprobe];
     let phase1_us = t1.elapsed().as_micros() as u64;
 
@@ -890,7 +1616,7 @@ fn field_two_phase(
             (diff.dot(&diff), id)
         })
         .collect();
-    top.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    top.sort_by(|a, b| a.0.total_cmp(&b.0));
     top.truncate(kq);
     let phase2_us = t2.elapsed().as_micros() as u64;
 
@@ -1289,16 +2015,8 @@ fn select_recall_tiers(
         .filter(|h| !h.kind.starts_with("repo"))
         .collect();
     let mut code: Vec<&JoinedHit> = hits.iter().filter(|h| h.kind.starts_with("repo")).collect();
-    sess.sort_by(|a, b| {
-        a.dist
-            .partial_cmp(&b.dist)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    code.sort_by(|a, b| {
-        a.dist
-            .partial_cmp(&b.dist)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    sess.sort_by(|a, b| a.dist.total_cmp(&b.dist));
+    code.sort_by(|a, b| a.dist.total_cmp(&b.dist));
     let sess_json = sess.iter().filter(|h| is_json_leading(&h.text)).count();
     let code_json = code.iter().filter(|h| is_json_leading(&h.text)).count();
     // anti-JSON pre-gate BEFORE the gate itself (hook order: filter, then
@@ -1735,9 +2453,15 @@ fn refresh_dataset_snapshot(
     if n == 0 {
         *snapshot = None;
     } else if stale {
-        if let Some(mu) = s.get_mu() {
-            let dim = mu.ncols();
-            let data = mu.iter().copied().collect::<Vec<f32>>();
+        // F06a: ONE owned copy, taken from a view of the active rows, and the
+        // previous snapshot is dropped BEFORE the new one is allocated.
+        // Before, `get_mu()` copied the dataset and the collect copied it
+        // again, on top of the old snapshot: up to 3× ~30 MB resident at
+        // 10000×768.
+        if let Some(view) = s.mu_view() {
+            let dim = view.ncols();
+            *snapshot = None;
+            let data = view.iter().copied().collect::<Vec<f32>>();
             // get_alpha/get_kappa solo devuelven None con n_active==0 (caso
             // ya descartado arriba): los defaults son inalcanzables hoy.
             // Alineados a la init real del store (kappa: Array1::ones) para
@@ -1817,6 +2541,8 @@ fn split_and_run_gpu_kernels(
         .map_err(|e| format!("snapshot reshape failed: {e}"))?;
 
     let gauss_out = if n_gauss > 0 {
+        // F02e1: one pair beyond the largest k, so every query can prove
+        // its k-set against a tie at the boundary (see `canonicalize_gpu_rows`).
         let kmax_g = gauss_ks.iter().copied().max().unwrap_or(1).min(snap.n);
         crate::gpu::gaussian_topk_scores_cached(
             snap.version,
@@ -1825,7 +2551,7 @@ fn split_and_run_gpu_kernels(
             &snap.alpha,
             &snap.kappa,
             n_gauss,
-            kmax_g,
+            gpu_window(kmax_g, snap.n),
         )
         .ok_or_else(|| "gaussian_topk_scores failed".to_string())?
     } else {
@@ -1834,7 +2560,14 @@ fn split_and_run_gpu_kernels(
 
     let l2_out = if n_l2 > 0 {
         let kmax_l = l2_ks.iter().copied().max().unwrap_or(1).min(snap.n);
-        crate::gpu::batch_search_cached(snap.version, &l2_flat, n_l2, &data_view, kmax_l, "l2")
+        crate::gpu::batch_search_cached(
+            snap.version,
+            &l2_flat,
+            n_l2,
+            &data_view,
+            gpu_window(kmax_l, snap.n),
+            "l2",
+        )
     } else {
         Vec::new()
     };
@@ -1858,20 +2591,220 @@ fn gpu_batch_path(
         .as_ref()
         .ok_or_else(|| "store is empty".to_string())?;
 
-    let n_queries = queries.len();
+    let (mut gauss_out, mut l2_out) = split_and_run_gpu_kernels(snap, queries, ks, rescore)?;
 
-    let (gauss_out, l2_out) = split_and_run_gpu_kernels(snap, queries, ks, rescore)?;
+    // ── F02e1: contractual (score, id) rows — ties at the k-th score are
+    // proven against the kernel's window and resolved by id.
+    canonicalize_gpu_rows(snap, queries, ks, rescore, &mut gauss_out, &mut l2_out);
 
-    // ── Reassemble rows in original request order.
-    let mut per_query = Vec::with_capacity(n_queries);
+    // ── Reassemble rows in original request order (shape-validated).
+    let per_query = reassemble_gpu_rows(snap.n, ks, rescore, gauss_out, l2_out)?;
+
+    // Feed access frequencies for tiering under a second brief lock.
+    let touched: Vec<usize> = per_query
+        .iter()
+        .flat_map(|r| r.iter().map(|s| s.index))
+        .collect();
+    store.blocking_lock().touch(&touched);
+
+    Ok(per_query)
+}
+
+/// Kernel K requested for a batch whose largest k is `kmax` (F02e1): `kmax+1`
+/// — the extra pair lets every query prove its k-set against a tie at the
+/// boundary — within what the kernel takes; `kmax` itself when it cannot
+/// take one more (then its host fallback answers) or the dataset is smaller.
+fn gpu_window(kmax: usize, n: usize) -> usize {
+    if kmax < crate::splats::GPU_TOPK_MAX_K {
+        (kmax + 1).min(n)
+    } else {
+        kmax
+    }
+}
+
+/// Host-exact L2 top-k over a flat row-major dataset: `(id, d²)` in
+/// contractual order (d² ascending, then id). The same f32 arithmetic as
+/// `SplatStore::find_neighbors`.
+fn host_exact_l2(data: &[f32], n: usize, dim: usize, q: &[f32], k: usize) -> Vec<(usize, f32)> {
+    if q.len() != dim || data.len() < n.saturating_mul(dim) {
+        return Vec::new();
+    }
+    let mut all: Vec<(usize, f32)> = (0..n)
+        .map(|i| {
+            let row = &data[i * dim..(i + 1) * dim];
+            let d2: f32 = row
+                .iter()
+                .zip(q)
+                .map(|(a, b)| {
+                    let d = a - b;
+                    d * d
+                })
+                .sum();
+            (i, d2)
+        })
+        .collect();
+    crate::splats::sort_score_then_id(&mut all, false);
+    all.truncate(k);
+    all
+}
+
+/// F02e1: contractual rows on the GPU batch route.
+///
+/// The kernels answered `gpu_window(kmax)` pairs per query in their own
+/// order. Each query's row is reduced to its contractual top-k with
+/// [`crate::splats::contractual_topk`]: canonical (score, id) order, and a
+/// tie at the k-th score proven against the extra pair — escalated, for that
+/// query alone, to the kernel's largest window. A tie the kernel cannot
+/// resolve is computed on the host from the same snapshot (`host_exact_l2` /
+/// `gpu::cpu_gaussian_topk`): exact and canonical, O(n·dim), only for queries
+/// whose k-th score ties with everything up to the window's end. Rows of a
+/// malformed shape are left untouched for [`reassemble_gpu_rows`] to reject.
+fn canonicalize_gpu_rows(
+    snap: &DatasetSnapshot,
+    queries: &[Vec<f32>],
+    ks: &[usize],
+    rescore: &[bool],
+    gauss_out: &mut [Vec<(usize, f32)>],
+    l2_out: &mut [(Vec<usize>, Vec<f32>)],
+) {
+    if ks.len() != rescore.len() || queries.len() < ks.len() {
+        return;
+    }
+    let Ok(view) = ndarray::ArrayView2::from_shape((snap.n, snap.dim), &snap.data) else {
+        return;
+    };
+    let (mut g, mut l) = (0usize, 0usize);
+    for (i, (&k, &gaussian)) in ks.iter().zip(rescore.iter()).enumerate() {
+        let q: &[f32] = &queries[i];
+        if gaussian {
+            let Some(slot) = gauss_out.get_mut(g) else {
+                break;
+            };
+            g += 1;
+            let fetched = slot.clone();
+            let fetch = |window: usize| -> Option<Vec<(usize, f32)>> {
+                if window <= fetched.len() {
+                    return Some(fetched[..window].to_vec());
+                }
+                crate::gpu::gaussian_topk_scores_cached(
+                    snap.version,
+                    q,
+                    &view,
+                    &snap.alpha,
+                    &snap.kappa,
+                    1,
+                    window,
+                )?
+                .into_iter()
+                .next()
+            };
+            *slot = match crate::splats::contractual_topk(snap.n, k, true, fetch) {
+                crate::splats::Contract::Exact(row) => row,
+                _ => crate::gpu::cpu_gaussian_topk(
+                    q,
+                    &snap.data,
+                    &snap.alpha,
+                    &snap.kappa,
+                    snap.n,
+                    snap.dim,
+                    1,
+                    k,
+                )
+                .pop()
+                .unwrap_or_default(),
+            };
+        } else {
+            let Some(slot) = l2_out.get_mut(l) else {
+                break;
+            };
+            l += 1;
+            if slot.0.len() != slot.1.len() {
+                continue;
+            }
+            let fetched: Vec<(usize, f32)> = slot
+                .0
+                .iter()
+                .zip(&slot.1)
+                .map(|(&ix, &d)| (ix, d))
+                .collect();
+            let fetch = |window: usize| -> Option<Vec<(usize, f32)>> {
+                if window <= fetched.len() {
+                    return Some(fetched[..window].to_vec());
+                }
+                let (idxs, dists) =
+                    crate::gpu::batch_search_cached(snap.version, q, 1, &view, window, "l2")
+                        .pop()?;
+                Some(idxs.into_iter().zip(dists).collect())
+            };
+            let row = match crate::splats::contractual_topk(snap.n, k, false, fetch) {
+                crate::splats::Contract::Exact(row) => row,
+                _ => host_exact_l2(&snap.data, snap.n, snap.dim, q, k),
+            };
+            *slot = (
+                row.iter().map(|p| p.0).collect(),
+                row.iter().map(|p| p.1).collect(),
+            );
+        }
+    }
+}
+
+/// Validate the GPU kernel outputs against the batch they were requested
+/// for and reassemble one row per query, in request order.
+///
+/// `gpu::batch_search_cached` answers an empty `Vec` when it declines the
+/// shape, and a kernel may return fewer — or shorter — rows than requested.
+/// Indexing `l2_out[l]` on such an answer panicked inside the batch worker
+/// (JoinError → 500 for the whole batch; an abort under `panic=abort`), and
+/// `zip` over mismatched idx/dist arrays silently truncated a row. Any shape
+/// violation is a controlled `Err`: never 200 with truncated or fabricated
+/// results. Valid rows keep exactly the previous mapping.
+fn reassemble_gpu_rows(
+    n: usize,
+    ks: &[usize],
+    rescore: &[bool],
+    gauss_out: Vec<Vec<(usize, f32)>>,
+    l2_out: Vec<(Vec<usize>, Vec<f32>)>,
+) -> Result<Vec<Vec<SearchResult>>, String> {
+    let n_gauss = rescore.iter().filter(|&&r| r).count();
+    let n_l2 = rescore.len() - n_gauss;
+    if ks.len() != rescore.len() {
+        return Err(format!(
+            "gpu batch: {} k values for {} queries",
+            ks.len(),
+            rescore.len()
+        ));
+    }
+    if gauss_out.len() != n_gauss {
+        return Err(format!(
+            "gpu batch: gaussian kernel returned {} rows for {n_gauss} queries",
+            gauss_out.len()
+        ));
+    }
+    if l2_out.len() != n_l2 {
+        return Err(format!(
+            "gpu batch: l2 kernel returned {} rows for {n_l2} queries",
+            l2_out.len()
+        ));
+    }
+    for (q, (idxs, dists)) in l2_out.iter().enumerate() {
+        if idxs.len() != dists.len() {
+            return Err(format!(
+                "gpu batch: l2 row {q} has {} indices for {} distances",
+                idxs.len(),
+                dists.len()
+            ));
+        }
+    }
+
+    let mut per_query = Vec::with_capacity(ks.len());
     let mut g = 0usize; // cursor into gauss_out
     let mut l = 0usize; // cursor into l2_out
-    for (i, (&k, &want_rescore)) in ks.iter().zip(rescore.iter()).enumerate() {
+    for (&k, &want_rescore) in ks.iter().zip(rescore.iter()) {
         let row: Vec<SearchResult> = if want_rescore {
             let src = &gauss_out[g];
             g += 1;
             src.iter()
-                .filter(|&&(ix, _)| ix < snap.n)
+                .filter(|&&(ix, _)| ix < n)
                 .take(k)
                 .map(|&(ix, score)| SearchResult {
                     index: ix,
@@ -1887,7 +2820,7 @@ fn gpu_batch_path(
             l += 1;
             idxs.iter()
                 .zip(dists.iter())
-                .filter(|(&ix, _)| ix < snap.n)
+                .filter(|(&ix, _)| ix < n)
                 .take(k)
                 .map(|(&ix, &d)| SearchResult {
                     index: ix,
@@ -1905,16 +2838,7 @@ fn gpu_batch_path(
                 .collect()
         };
         per_query.push(row);
-        let _ = i; // index kept for clarity in debug
     }
-
-    // Feed access frequencies for tiering under a second brief lock.
-    let touched: Vec<usize> = per_query
-        .iter()
-        .flat_map(|r| r.iter().map(|s| s.index))
-        .collect();
-    store.blocking_lock().touch(&touched);
-
     Ok(per_query)
 }
 
@@ -1957,7 +2881,91 @@ fn simple_hash_embedding(text: &str, dim: usize) -> Vec<f32> {
 }
 
 // ─── API Key Authentication Middleware ────────────────────
+
+/// Authentication of a `serve` process, resolved ONCE at startup from
+/// `SPLATSDB_API_KEY` (A05-F10) and carried in [`AppState::auth`]. The
+/// middleware never re-reads the environment, so a request can never be
+/// judged against a different key than the one the server booted with.
+#[derive(Clone, PartialEq, Eq)]
+pub enum AuthConfig {
+    /// `SPLATSDB_API_KEY` is absent: loopback dev mode, requests pass
+    /// through (a non-loopback bind in this mode needs the explicit opt-in,
+    /// see [`check_bind_policy`]).
+    Unauthenticated,
+    /// A non-empty, non-blank UTF-8 key: every request except `GET /health`
+    /// and CORS preflight must carry `Authorization: Bearer <key>`.
+    Required(String),
+}
+
+/// Never print the key: `Debug` is needed by tests/assertions only.
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthConfig::Unauthenticated => f.write_str("Unauthenticated"),
+            AuthConfig::Required(_) => f.write_str("Required(<redacted>)"),
+        }
+    }
+}
+
+/// Environment variable holding the API key.
+pub const API_KEY_ENV: &str = "SPLATSDB_API_KEY";
+
+/// Explicit operator opt-in that allows a non-loopback bind WITHOUT an API
+/// key. Only the exact value `1` opts in — `true`, `yes`, `0`, a typo or a
+/// padded value do NOT (fail-closed).
+pub const ALLOW_UNAUTHENTICATED_ENV: &str = "SPLATSDB_ALLOW_UNAUTHENTICATED";
+
+/// Resolve `SPLATSDB_API_KEY` from the raw environment value (read with
+/// `var_os`, so a non-UTF-8 value is observable instead of collapsing into
+/// "absent").
+///
+/// Fail-closed (A05-F10): the variable PRESENT but empty, blank or not
+/// UTF-8 is a misconfiguration → `Err`, and the caller must abort startup.
+/// Before this, `env::var` mapped non-UTF-8 to "no key" (authentication
+/// silently off) and an empty key authenticated every `Authorization:
+/// Bearer ` header (`"" == ""`).
+pub(crate) fn resolve_api_key(value: Option<std::ffi::OsString>) -> Result<AuthConfig, String> {
+    let Some(raw) = value else {
+        return Ok(AuthConfig::Unauthenticated);
+    };
+    match raw.into_string() {
+        Ok(key) if key.trim().is_empty() => Err(format!(
+            "{API_KEY_ENV} is set but EMPTY/blank: an empty key authenticates every \
+             `Authorization: Bearer ` request (authentication effectively disabled). Unset it \
+             to serve without authentication on loopback, or set a non-empty key."
+        )),
+        Ok(key) => Ok(AuthConfig::Required(key)),
+        Err(_) => Err(format!(
+            "{API_KEY_ENV} is set but is not valid UTF-8: it cannot be compared with a Bearer \
+             token, and treating it as absent would silently disable authentication. Set a \
+             UTF-8 key or unset the variable."
+        )),
+    }
+}
+
+/// Whether the operator opted in explicitly (value exactly `1`).
+pub(crate) fn unauthenticated_opt_in(value: Option<std::ffi::OsString>) -> bool {
+    value.as_deref() == Some(std::ffi::OsStr::new("1"))
+}
+
+/// Bind policy (A05-F10), fail-closed: a bind address that is NOT loopback
+/// without an API key is refused unless the operator opted in explicitly
+/// (`SPLATSDB_ALLOW_UNAUTHENTICATED=1`). Loopback without a key keeps
+/// serving (localhost dev mode) and any bind WITH a key is allowed.
+pub(crate) fn check_bind_policy(addr: &str, auth: &AuthConfig, opt_in: bool) -> anyhow::Result<()> {
+    if is_loopback_addr(addr) || matches!(auth, AuthConfig::Required(_)) || opt_in {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to serve on {addr:?} without authentication: {API_KEY_ENV} is not set, so \
+         anyone who can reach this address could read and write the entire store. Bind to \
+         loopback (127.0.0.1 / ::1 / localhost), set {API_KEY_ENV}, or opt in explicitly with \
+         {ALLOW_UNAUTHENTICATED_ENV}=1. Nothing was bound."
+    );
+}
+
 async fn api_key_auth(
+    State(state): State<AppState>,
     headers: HeaderMap,
     request: Request,
     next: Next,
@@ -1974,95 +2982,195 @@ async fn api_key_auth(
         return Ok(next.run(request).await);
     }
 
-    // If no SPLATSDB_API_KEY env var set, skip auth (localhost dev mode)
-    let Ok(expected_key) = std::env::var("SPLATSDB_API_KEY") else {
-        return Ok(next.run(request).await);
-    };
-
-    let provided = headers
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-
-    match provided {
-        Some(key) if constant_time_eq(key, &expected_key) => Ok(next.run(request).await),
-        _ => Err(StatusCode::UNAUTHORIZED),
+    // The key was resolved once at startup — fail-closed on empty/non-UTF-8
+    // (A05-F10). An absent key is the ONLY way to pass without a credential;
+    // a wrong, empty or malformed bearer NEVER authenticates.
+    match &state.auth {
+        AuthConfig::Unauthenticated => Ok(next.run(request).await),
+        AuthConfig::Required(expected) => match bearer_token(&headers) {
+            Some(provided) if constant_time_eq(provided.as_bytes(), expected.as_bytes()) => {
+                Ok(next.run(request).await)
+            }
+            _ => Err(StatusCode::UNAUTHORIZED),
+        },
     }
 }
 
-/// Constant-time string comparison to prevent timing attacks on API keys.
-fn constant_time_eq(a: &str, b: &str) -> bool {
+/// Token of an `Authorization: Bearer <token>` header, parsed strictly:
+/// nothing is trimmed or normalised, so a malformed header can never be
+/// massaged into a match.
+///
+/// `None` for a missing/non-ASCII header, any other scheme (also a
+/// lowercase `bearer`), a missing token (`Bearer `) and a token with
+/// surrounding or inner whitespace (`Bearer  k`, `Bearer k `, `Bearer k x`).
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let token = value.strip_prefix("Bearer ")?;
+    (!token.is_empty() && !token.bytes().any(|b| b.is_ascii_whitespace())).then_some(token)
+}
+
+/// Constant-time byte comparison to prevent timing attacks on API keys.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
     let mut result: u8 = 0;
-    for (x, y) in a.as_bytes().iter().zip(b.as_bytes().iter()) {
+    for (x, y) in a.iter().zip(b.iter()) {
         result |= x ^ y;
     }
     result == 0
 }
 
-/// Load vectors from the `default` shard of `data_dir` into `store`.
+/// Load vectors from the `default` shard of `data_dir` into `store`, with the
+/// persisted energy state (F02e1).
 ///
 /// Returns the number of vectors loaded. Mirrors the CLI's
 /// `load_or_create_store` behaviour (src/cli/helpers.rs), keeping `serve`
 /// consistent with `status`/`search` over the same data-dir.
+///
+/// Energy state — `energy/landscape.bin`, the alpha/kappa per splat that
+/// `ingest`, `save` and `verbatim store` write next to the shard. Before
+/// F02e1 `serve` loaded only mu (`add_splat` → init alpha/kappa = 1.0), so
+/// after every restart the splats answered with fabricated values and
+/// `?rescore=gaussian` ranked with them. Policies, in order:
+/// * absent → mu only (a data-dir written by a route without energy state);
+/// * corrupt — truncated, hostile header, counts that do not match,
+///   non-finite or negative values → `Err`, fail-closed like an unreadable
+///   shard (A03-F06 / D4): nothing is modified on disk;
+/// * foreign or stale — its mu is not a prefix of the shard's rows →
+///   ignored with a LOUD warning, the server behaves exactly as before;
+/// * otherwise the alpha/kappa of the `m` leading rows the landscape shares
+///   with the shard are loaded. A prefix is the normal case after a `serve`
+///   session: its compact rewrites the shard with the rows `/store`
+///   appended and leaves the landscape alone; those rows keep the init
+///   alpha/kappa they had in memory.
 fn load_default_shard(store: &mut SplatStore, data_dir: &str) -> anyhow::Result<usize> {
-    let persist = crate::storage::persistence::SplatsDBPersistence::with_backend(
-        data_dir,
-        crate::storage::persistence::StorageBackend::Sqlite,
-        false,
-    )
-    .map_err(|e| anyhow::anyhow!("persistence init failed: {e}"))?;
+    use crate::storage::persistence::{SplatsDBPersistence, StorageBackend};
+
+    let persist = SplatsDBPersistence::with_backend(data_dir, StorageBackend::Sqlite, false)
+        .map_err(|e| anyhow::anyhow!("persistence init failed: {e}"))?;
     match persist.load_vectors("default")? {
-        Some(vectors) => {
-            if !store.add_splat(&vectors) {
-                anyhow::bail!(
-                    "store capacity exceeded or dimension mismatch while loading {} vectors \
-                     (max_splats={}) — check --dim against the shard's dim",
-                    vectors.nrows(),
-                    store.max_splats()
-                );
-            }
-            Ok(vectors.nrows())
-        }
+        Some(vectors) => load_shard_with_energy(store, data_dir, &vectors),
         None => Ok(0),
     }
 }
 
-/// Loopback bind check for the no-API-key warning: `localhost`, `::1` and
-/// any `127.x.x.x` address are private; everything else (including
-/// `0.0.0.0`/`::`) is treated as externally reachable.
+/// [`load_default_shard`] with the shard already read: adds the vectors, then
+/// applies the energy-state policy.
+fn load_shard_with_energy(
+    store: &mut SplatStore,
+    data_dir: &str,
+    vectors: &ndarray::Array2<f32>,
+) -> anyhow::Result<usize> {
+    if !store.add_splat(vectors) {
+        anyhow::bail!(
+            "store capacity exceeded or dimension mismatch while loading {} vectors \
+             (max_splats={}) — check --dim against the shard's dim",
+            vectors.nrows(),
+            store.max_splats()
+        );
+    }
+    let n = vectors.nrows();
+    let path = crate::loaders::EnergyLandscape::path_in(std::path::Path::new(data_dir));
+    if !path.exists() {
+        eprintln!(
+            "[splatsdb] serve: {data_dir} has no energy state ({}): alpha/kappa stay at the init values",
+            path.display()
+        );
+        return Ok(n);
+    }
+    let landscape = crate::loaders::load_energy_landscape(path.to_str().unwrap_or_default())
+        .map_err(anyhow::Error::msg)?;
+    let m = landscape.matching_prefix(vectors);
+    if m == 0 {
+        eprintln!(
+            "[splatsdb] serve: WARNING {} does not describe the 'default' shard ({}x{} vs {}x{}): \
+             it is IGNORED and alpha/kappa stay at the init values — ?rescore=gaussian \
+             rescores with them",
+            path.display(),
+            landscape.mu.nrows(),
+            landscape.mu.ncols(),
+            n,
+            vectors.ncols()
+        );
+        return Ok(n);
+    }
+    let loaded = store
+        .load_energy(&landscape.alpha[..m], &landscape.kappa[..m])
+        .map_err(anyhow::Error::msg)?;
+    eprintln!(
+        "[splatsdb] serve: energy state cargado (alpha/kappa de {loaded}/{n} splats desde {}): \
+         alpha={} kappa={}",
+        path.display(),
+        preview(&landscape.alpha[..loaded]),
+        preview(&landscape.kappa[..loaded])
+    );
+    Ok(n)
+}
+
+/// First values of a loaded vector for the startup log (4 decimals, at most 8).
+fn preview(v: &[f32]) -> String {
+    let head: Vec<String> = v.iter().take(8).map(|x| format!("{x:.4}")).collect();
+    format!(
+        "[{}{}]",
+        head.join(", "),
+        if v.len() > 8 { ", …" } else { "" }
+    )
+}
+
+/// Loopback bind check for the bind policy ([`check_bind_policy`]):
+/// `localhost`, `::1` and any `127.x.x.x` address are private; everything
+/// else (including `0.0.0.0`/`::`) is treated as externally reachable.
 fn is_loopback_addr(addr: &str) -> bool {
     let a = addr.trim().to_ascii_lowercase();
-    matches!(a.as_str(), "localhost" | "::1" | "[::1]") || a.starts_with("127.")
+    // Bracketed IPv6 literal (`[::1]`) → parse the inner literal.
+    let literal = a
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(&a);
+    match literal.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        // Only the literal name `localhost` counts. Any other hostname —
+        // even one that resolves to 127.0.0.1, or `127.0.0.1.example.com`,
+        // which passed the old `starts_with("127.")` prefix test — is
+        // treated as externally reachable (fail-closed).
+        Err(_) => a == "localhost",
+    }
 }
 
 /// Auto-load the on-disk inputs for `serve`: the `default` shard from
 /// `data_dir` (if present) into `store`, so `serve` boots with the vectors
 /// indexed by the CLI instead of an empty store and honours the CLI --dim
 /// flag instead of SplatsDBConfig::default() (issue #3); then the `field/`
-/// corpus for /search — si hay field/, el índice busca el corpus completo
-/// (field.raw — exacto sobre TODOS los chunks); si no, el shard cargado
-/// (splats/μ — en stores planos son los propios vectores).
+/// corpus for /field-search and for the topic/confidence of /search —
+/// /search itself always searches the shard's splats (F02d: `serve_corpus`).
 ///
 /// Extracted from `run_server` (repowise plan `refac4_829dc22e97478fcffcab`);
 /// messages and behavior identical. Returns the field corpus, if any.
-fn load_serve_inputs(data_dir: &str, store: &mut SplatStore) -> Option<FieldData> {
+fn load_serve_inputs(data_dir: &str, store: &mut SplatStore) -> anyhow::Result<Option<FieldData>> {
     match load_default_shard(store, data_dir) {
         Ok(n) if n > 0 => eprintln!(
             "[splatsdb] serve: loaded {n} vectors (dim {}) from {data_dir}",
             store.get_statistics().embedding_dim
         ),
         Ok(_) => eprintln!("[splatsdb] serve: no existing data in {data_dir}, starting empty"),
-        Err(e) => eprintln!("[splatsdb] serve: failed to load {data_dir}: {e}"),
+        // Fail-closed (A03-F06): seguir con un store vacío haría que el
+        // compact del shutdown reemplazara el shard existente por un
+        // subconjunto (sólo lo que traje el WAL) o por un default.bin vacío.
+        Err(e) => anyhow::bail!(
+            "serve: fail-closed, el shard 'default' de {data_dir} no se puede cargar \
+             (nada se modificó en disco): {e}"
+        ),
     }
 
     let field_data = load_field(data_dir);
     if field_data.is_some() {
         eprintln!("[splatsdb] serve: campo splat cargado (/field-search disponible)");
     }
-    field_data
+    Ok(field_data)
 }
 
 pub async fn run_server(
@@ -2072,93 +3180,86 @@ pub async fn run_server(
     data_dir: &str,
     gpu_enabled: bool,
 ) -> anyhow::Result<()> {
+    run_server_with_mode(
+        addr,
+        port,
+        config,
+        data_dir,
+        gpu_enabled,
+        WalDurability::ProcessCrash,
+    )
+    .await
+}
+
+pub async fn run_server_with_mode(
+    addr: &str,
+    port: u16,
+    config: SplatsDBConfig,
+    data_dir: &str,
+    gpu_enabled: bool,
+    wal_mode: WalDurability,
+) -> anyhow::Result<()> {
+    // Auth is resolved BEFORE anything is created on disk or bound (A05-F10):
+    // a misconfigured key (empty / non-UTF-8) or an unauthenticated
+    // non-loopback bind without the explicit opt-in aborts the startup with
+    // a diagnosis and no listener.
+    let auth = resolve_api_key(std::env::var_os(API_KEY_ENV)).map_err(anyhow::Error::msg)?;
+    check_bind_policy(
+        addr,
+        &auth,
+        unauthenticated_opt_in(std::env::var_os(ALLOW_UNAUTHENTICATED_ENV)),
+    )?;
     let config = server_config(config);
     let hnsw_on = config.enable_hnsw;
     let mut store = SplatStore::new(config);
 
-    let field_data = load_serve_inputs(data_dir, &mut store);
-    let corpus: Option<(Vec<f32>, usize, usize)> = if let Some(f) = &field_data {
-        let (n, d) = f.raw.dim();
-        let slice = f
-            .raw
-            .as_slice()
-            .map(<[f32]>::to_vec)
-            .unwrap_or_else(|| f.raw.iter().copied().collect());
-        Some((slice, n, d))
-    } else {
-        store.get_mu().and_then(|mu| {
-            if mu.nrows() == 0 || mu.ncols() == 0 {
-                return None;
-            }
-            let (n, d) = (mu.nrows(), mu.ncols());
-            let slice = mu
-                .as_slice()
-                .map(<[f32]>::to_vec)
-                .unwrap_or_else(|| mu.iter().copied().collect());
-            Some((slice, n, d))
-        })
-    };
-    let corpus_n = corpus.as_ref().map(|c| c.1).unwrap_or(0);
-
-    // ── Índice exacto en GPU (--gpu, feature cuda): kernel PTX l2+topk sobre
-    // el corpus. Fallback silencioso a CPU si no hay GPU.
-    #[cfg(feature = "cuda")]
-    let gpu_index: Option<Arc<crate::gpu::cuda_kernel::GpuIndex>> = if gpu_enabled {
-        match crate::gpu::cuda_kernel::GpuIndex::new() {
-            Some(mut g) => match corpus {
-                Some((slice, n, d)) => {
-                    if g.upload_dataset(&slice, n, d) {
-                        eprintln!(
-                            "[splatsdb] serve: GPU exact index listo ({n} vectores, dim {d})"
-                        );
-                        Some(Arc::new(g))
-                    } else {
-                        eprintln!("[splatsdb] serve: upload GPU falló; búsqueda en CPU");
-                        None
-                    }
-                }
-                None => {
-                    eprintln!("[splatsdb] serve: store vacío, GPU sin dataset");
-                    None
-                }
-            },
-            None => {
-                eprintln!("[splatsdb] serve: GPU no disponible (--gpu ignorado); búsqueda en CPU");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // Fail-closed (A03-F12): lock exclusivo del data-dir por toda la vida del
+    // serve, para que dos `serve` no reescriban el shard uno encima del otro.
+    // Es un flock del kernel: muere con el proceso, así que un lockfile viejo
+    // nunca bloquea.
+    std::fs::create_dir_all(data_dir)?;
+    let _data_dir_lock = DataDirLock::acquire(std::path::Path::new(data_dir))?;
+    let field_data = load_serve_inputs(data_dir, &mut store)?;
     #[cfg(not(feature = "cuda"))]
-    drop(corpus);
+    let corpus_n = store.n_active();
 
     // ── Durabilidad: el shard "default" ya lo cargó load_serve_inputs. Se
     // abre el WAL, se re-aplica lo no compactado y queda listo para
     // persistir por chunks (COMPACT_EVERY) y en el shutdown.
-    let durability = match Durability::open(data_dir) {
+    //
+    // Fail-closed (A03-F01): con --data-dir un WAL que no se puede abrir ni
+    // replayear ABORTA el arranque. Arrancar "sin durabilidad" devolvería
+    // 200 `stored` sobre un store que se pierde al salir.
+    let (durability, next_id_seed) = match Durability::open_with_mode(data_dir, wal_mode) {
         Ok(d) => match replay_wal(&mut store, &d) {
             Ok((n, max_auto)) => {
                 if n > 0 {
                     eprintln!("[splatsdb] WAL replay: {n} stores re-aplicados desde el WAL");
                 }
-                Some((Arc::new(d), max_auto))
+                (Some(Arc::new(d)), max_auto)
             }
-            Err(e) => {
-                eprintln!("[splatsdb] WAL replay falló (arrancando sin replay): {e}");
-                None
-            }
+            Err(e) => anyhow::bail!(
+                "serve: fail-closed, el WAL de {data_dir} no se pudo replayear (nada se acepta): {e}"
+            ),
         },
-        Err(e) => {
-            eprintln!("[splatsdb] durabilidad desactivada: {e}");
-            None
-        }
+        Err(e) => anyhow::bail!(
+            "serve: fail-closed, la durabilidad de {data_dir} no está disponible; no se arranca un \
+             server efímero sobre un data-dir: {e}"
+        ),
     };
-    let next_id_seed = durability
-        .as_ref()
-        .map(|(_, max_auto)| *max_auto)
-        .unwrap_or(0);
-    let durability = durability.map(|(d, _)| d);
+
+    // ── Índice exacto en GPU (--gpu, feature cuda): kernel PTX l2+topk sobre
+    // el corpus vigente DESPUÉS del replay del WAL. Fallback silencioso a CPU
+    // si no hay GPU. La clave (data_version, n) es la del dataset subido: el
+    // handler sólo lo usa mientras siga vigente (A03-F05).
+    #[cfg(feature = "cuda")]
+    let (gpu_index, corpus_n) = if gpu_enabled {
+        // The corpus the fast path serves is the store's mu (splats/μ — never
+        // the field/ chunks, F02d), uploaded straight from the store buffer.
+        GpuExactIndex::startup(&store)
+    } else {
+        (None, store.n_active())
+    };
 
     let store = Arc::new(Mutex::new(store));
     let (batch_tx, batch_rx) = mpsc::channel(BATCH_CHANNEL_CAP);
@@ -2181,6 +3282,7 @@ pub async fn run_server(
         corpus_n,
         data_dir: Some(data_dir.to_string()),
         durability: durability.clone(),
+        auth: auth.clone(),
     };
 
     let app = build_router(state);
@@ -2188,10 +3290,15 @@ pub async fn run_server(
     let bind_addr = format!("{addr}:{port}");
     // Loud warning: bound beyond loopback with no API key → everything (store,
     // search, field-search) is open to anyone who can reach this address.
-    if !is_loopback_addr(addr) && std::env::var("SPLATSDB_API_KEY").is_err() {
+    // The policy above already refused this configuration unless the
+    // operator opted in explicitly; the opt-in stays loud.
+    if !is_loopback_addr(addr) && auth == AuthConfig::Unauthenticated {
         eprintln!(
-            "[splatsdb] ⚠  WARNING: serving on {bind_addr} with NO SPLATSDB_API_KEY set.\n\
-             ⚠  Authentication is DISABLED — anyone who can reach this address can read\n\
+            "[splatsdb] ⚠  WARNING: serving on {bind_addr} with NO SPLATSDB_API_KEY set \
+             (explicit opt-in: {ALLOW_UNAUTHENTICATED_ENV}=1).
+\
+             ⚠  Authentication is DISABLED — anyone who can reach this address can read
+\
              ⚠  and write the entire store. Set SPLATSDB_API_KEY to require Bearer auth."
         );
     }
@@ -2207,20 +3314,41 @@ pub async fn run_server(
     // dataset entero desde disco.
     let shutdown_store = store.clone();
     let shutdown_durability = durability.clone();
-    Ok(axum::serve(listener, app)
+    let shutdown_result: Arc<std::sync::Mutex<Option<Result<usize, String>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let shutdown_slot = shutdown_result.clone();
+    axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             wait_shutdown_signal().await;
-            if let Some(d) = shutdown_durability.as_ref() {
+            let outcome = if let Some(d) = shutdown_durability.as_ref() {
                 let store = shutdown_store.lock().await;
-                match d.compact(&store) {
-                    Ok(n) => eprintln!(
-                        "[splatsdb] shutdown: shard 'default' persistido ({n} splats), WAL truncado"
-                    ),
-                    Err(e) => eprintln!("[splatsdb] shutdown: compact falló: {e}"),
-                }
+                Some(d.compact(&store).map_err(|e| e.to_string()))
+            } else {
+                None
+            };
+            if let Ok(mut slot) = shutdown_slot.lock() {
+                *slot = outcome;
             }
         })
-        .await?)
+        .await?;
+    match shutdown_result.lock().ok().and_then(|g| g.clone()) {
+        Some(Ok(n)) => {
+            eprintln!("[splatsdb] shutdown: shard 'default' persistido ({n} splats), WAL truncado")
+        }
+        Some(Err(e)) => {
+            // Lo aceptado sigue en el WAL (fsync abajo): no se pierde, pero el
+            // shard NO se actualizó → el proceso no termina con exit 0.
+            if let Some(d) = durability.as_ref() {
+                let _ = d.checkpoint_now();
+            }
+            anyhow::bail!(
+                "shutdown: compact falló, el shard 'default' NO se actualizó (los stores aceptados \
+                 quedan en wal/store.wal): {e}"
+            );
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 /// Bloquea hasta SIGINT o SIGTERM (shutdown graceful del serve).
@@ -2255,7 +3383,9 @@ fn replay_wal(store: &mut SplatStore, d: &Durability) -> anyhow::Result<(usize, 
     let shard_n = store.n_active();
     let mut applied = 0usize;
     let mut max_auto = 0usize;
-    for e in entries {
+    let mut unapplied = Vec::new();
+    let mut seen_idx = std::collections::HashMap::new();
+    for e in &entries {
         if e.operation != "store" {
             continue;
         }
@@ -2268,8 +3398,19 @@ fn replay_wal(store: &mut SplatStore, d: &Durability) -> anyhow::Result<(usize, 
         if idx < shard_n {
             continue; // ya está dentro del shard persistido
         }
+        if let Some(previous) = seen_idx.insert(idx, e) {
+            if previous.data.get("id") != e.data.get("id")
+                || previous.data.get("vector") != e.data.get("vector")
+            {
+                unapplied.push(e.lsn);
+            } else {
+                eprintln!("[splatsdb] WAL: duplicate idx {idx} (ambiguous retry) skipped");
+            }
+            continue;
+        }
         let Some(vals) = e.data.get("vector").and_then(|v| v.as_array()) else {
             eprintln!("[splatsdb] WAL: entrada {} sin vector, salteada", e.lsn);
+            unapplied.push(e.lsn);
             continue;
         };
         let vec: Vec<f32> = vals
@@ -2283,18 +3424,31 @@ fn replay_wal(store: &mut SplatStore, d: &Durability) -> anyhow::Result<(usize, 
                 e.lsn,
                 vec.len()
             );
+            unapplied.push(e.lsn);
             continue;
         }
         let Ok(arr) = Array2::from_shape_vec((1, dim), vec) else {
+            unapplied.push(e.lsn);
             continue;
         };
         if store.add_splat(&arr) {
             store.hnsw_sync_incremental();
             applied += 1;
+        } else {
+            eprintln!(
+                "[splatsdb] WAL: entrada {} no entra al store (capacidad), salteada",
+                e.lsn
+            );
+            unapplied.push(e.lsn);
         }
         if let Some(a) = e.data.get("auto_id").and_then(|v| v.as_u64()) {
             max_auto = max_auto.max(a as usize + 1);
         }
+    }
+    // Las entradas no aplicadas son la única copia de esos datos: `compact`
+    // no trunca el WAL mientras existan (extiende A03-F09 a n_active > 0).
+    if let Ok(mut slot) = d.unapplied.lock() {
+        slot.extend(unapplied);
     }
     Ok((applied, max_auto))
 }
@@ -2343,7 +3497,7 @@ fn build_router(state: AppState) -> Router {
         // so the LAST layer is the OUTERMOST. cors must be outermost so a
         // preflight OPTIONS is answered (with CORS headers) without going
         // through auth; auth then guards the actual requests inside.
-        .layer(middleware::from_fn(api_key_auth))
+        .layer(middleware::from_fn_with_state(state.clone(), api_key_auth))
         .layer(cors)
         .with_state(state)
 }
@@ -2394,6 +3548,7 @@ mod tests {
             corpus_n: 0,
             data_dir: None,
             durability: None,
+            auth: AuthConfig::Unauthenticated,
         };
         (build_router(state), batches_served)
     }
@@ -2466,6 +3621,7 @@ mod tests {
             corpus_n: 0,
             data_dir: Some(dir.to_string_lossy().into_owned()),
             durability: Some(d.clone()),
+            auth: AuthConfig::Unauthenticated,
         };
         (build_router(state), d)
     }
@@ -2578,6 +3734,82 @@ mod tests {
         let hits = store.find_neighbors(&ndarray::ArrayView1::from(&query_vec), 1);
         assert_eq!(hits[0].index, 3);
         assert!(hits[0].distance < 1e-3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A03-F09 — compact() con el store vacío NO debe truncar un WAL que
+    /// todavía contiene stores no recuperados (p.ej. un replay que salteó
+    /// todo por --dim incorrecto): es la única copia duradera.
+    #[test]
+    fn compact_with_empty_store_keeps_unrecovered_wal_entries() {
+        let dir = temp_wal_dir("compact-empty");
+        let d = Durability::open(dir.to_str().unwrap()).expect("durability");
+        for axis in 0..5 {
+            d.log_store(
+                &format!("mem_{axis}"),
+                Some(axis),
+                axis,
+                &unit_vec(32, axis),
+            )
+            .expect("wal log");
+        }
+        d.flush().expect("wal flush");
+        let mut store = SplatStore::new(test_config());
+        assert_eq!(store.n_active(), 0);
+        let _ = d.compact(&store);
+
+        let store_entries = d
+            .wal
+            .recover()
+            .expect("recover")
+            .iter()
+            .filter(|e| e.operation == "store")
+            .count();
+        assert_eq!(
+            store_entries, 5,
+            "compact truncó el WAL sin haber persistido nada"
+        );
+        // The entries are still replayable on the next start.
+        let (applied, _) = replay_wal(&mut store, &d).expect("replay");
+        assert_eq!(applied, 5);
+        assert_eq!(store.n_active(), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A03-F09 — the other side of the guard: an empty store with nothing
+    /// at stake in the WAL keeps the old, harmless behaviour (Ok(0)).
+    #[test]
+    fn compact_with_empty_store_and_no_store_entries_is_a_noop() {
+        let dir = temp_wal_dir("compact-empty-noop");
+        let d = Durability::open(dir.to_str().unwrap()).expect("durability");
+        d.flush().expect("wal checkpoint");
+        let store = SplatStore::new(test_config());
+        let n = d.compact(&store).expect("compact without stores");
+        assert_eq!(n, 0);
+        assert!(!dir.join("data/vectors/default.bin").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A03-F02 — traced at integration time with the LD_PRELOAD fsync
+    /// tracer: compact() must fsync the shard temp file, rename, fsync
+    /// `data/vectors`, and only THEN rewrite the WAL and fsync `wal/`.
+    #[test]
+    fn fsync_probe_compact_persists_shard_before_touching_the_wal() {
+        let dir = temp_wal_dir("fsync-probe");
+        let config = test_config();
+        let d = Durability::open(dir.to_str().unwrap()).expect("durability");
+        let mut store = SplatStore::new(config);
+        for axis in 0..2 {
+            let arr = Array2::from_shape_vec((1, 32), unit_vec(32, axis)).unwrap();
+            assert!(store.add_splat(&arr));
+            store.hnsw_sync_incremental();
+            let idx = store.n_active() - 1;
+            d.log_store(&format!("mem_{axis}"), Some(axis), idx, &unit_vec(32, axis))
+                .expect("wal log");
+        }
+        assert_eq!(d.compact(&store).expect("compact"), 2);
+        assert!(dir.join("data/vectors/default.bin").is_file());
+        assert_eq!(d.wal.recover().expect("recover").len(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3145,6 +4377,7 @@ mod tests {
             corpus_n: 2,
             data_dir: None,
             durability: None,
+            auth: AuthConfig::Unauthenticated,
         };
         let app = build_router(state);
 
@@ -3271,6 +4504,542 @@ mod tests {
         for a in ["0.0.0.0", "192.168.1.10", "::", "10.0.0.1", "", "127"] {
             assert!(!is_loopback_addr(a), "{a:?} must NOT be loopback");
         }
+    }
+
+    // ─── GPU dataset lifecycle (A03-F05) ──────────────────────────────────
+
+    #[test]
+    fn gpu_index_key_is_current_only_for_the_exact_dataset_version() {
+        let key = GpuIndexKey { version: 7, n: 16 };
+        assert!(key.is_current(7, 16));
+        assert!(
+            !key.is_current(8, 16),
+            "a /store (or replay/compact) bumps data_version: stale"
+        );
+        assert!(
+            !key.is_current(7, 17),
+            "same version but another row count: stale"
+        );
+    }
+
+    /// F06a: after a `/store` the exact GPU index is rebuilt for the new
+    /// dataset version and `/search` is served by the GPU fast path again.
+    /// Before: the startup key went stale on the first mutation and every
+    /// later query took the batch worker (`backend: null`, ~2 ms window).
+    #[cfg(feature = "cuda")]
+    #[tokio::test]
+    async fn f06a_gpu_fast_path_rebuilds_once_per_dataset_version_after_a_store() {
+        if !crate::gpu::is_cuda_available() {
+            eprintln!("[f06a] CUDA not available at runtime: GPU rebuild test skipped");
+            return;
+        }
+        let dim = 32;
+        let n0 = 400;
+        let mut store = SplatStore::new(test_config());
+        let data: Vec<f32> = (0..n0 * dim)
+            .map(|i| ((i * 7919) % 1009) as f32 / 1009.0)
+            .collect();
+        store.add_splat(&Array2::from_shape_vec((n0, dim), data.clone()).unwrap());
+        let store = Arc::new(Mutex::new(store));
+        let (gpu, n) = GpuExactIndex::startup(&*store.lock().await);
+        let gpu = gpu.expect("CUDA index at startup");
+        assert_eq!(n, n0);
+        assert_eq!(gpu.rebuilds(), 0, "the startup upload is not a rebuild");
+        let (batch_tx, batch_rx) = mpsc::channel(BATCH_CHANNEL_CAP);
+        let batches_served = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(batch_worker(
+            batch_rx,
+            store.clone(),
+            batches_served.clone(),
+            true,
+        ));
+        let state = AppState {
+            store,
+            next_id: Arc::new(AtomicUsize::new(0)),
+            batch_tx,
+            batches_served,
+            #[cfg(feature = "cuda")]
+            gpu: Some(gpu.clone()),
+            field: None,
+            corpus_n: n,
+            data_dir: None,
+            durability: None,
+            auth: AuthConfig::Unauthenticated,
+        };
+        let app = build_router(state);
+        let old_row: Vec<f32> = data[7 * dim..8 * dim].to_vec();
+        let new_row: Vec<f32> = unit_vec(dim, 3).into_iter().map(|v| v * 60.0).collect();
+
+        let (code, body) = send(
+            app.clone(),
+            "POST",
+            "/search",
+            Some(json!({ "query": "warm", "embedding": old_row, "top_k": 5 })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["backend"], "gpu",
+            "warm query on the GPU fast path: {body}"
+        );
+
+        let (code, body) = send(
+            app.clone(),
+            "POST",
+            "/store",
+            Some(json!({ "text": "new", "embedding": new_row })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "/store: {body}");
+
+        // After the mutation: back on the GPU, new vector is its own top-1.
+        for i in 0..8 {
+            let (code, body) = send(
+                app.clone(),
+                "POST",
+                "/search",
+                Some(json!({ "query": "after", "embedding": new_row, "top_k": 5 })),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK, "{body}");
+            assert_eq!(
+                body["backend"], "gpu",
+                "after /store, query #{i} must be served by the GPU fast path: {body}"
+            );
+            assert_eq!(
+                body["results"][0]["index"].as_u64(),
+                Some(n0 as u64),
+                "{body}"
+            );
+            assert_eq!(body["results"][0]["score"].as_f64(), Some(0.0), "{body}");
+        }
+        // Old rows are still exact on the rebuilt index.
+        let (code, body) = send(
+            app.clone(),
+            "POST",
+            "/search",
+            Some(json!({ "query": "old", "embedding": old_row, "top_k": 5 })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert_eq!(body["backend"], "gpu", "{body}");
+        assert_eq!(body["results"][0]["index"].as_u64(), Some(7), "{body}");
+        assert_eq!(body["results"][0]["score"].as_f64(), Some(0.0), "{body}");
+        // 9 queries after ONE mutation -> exactly one rebuild.
+        assert_eq!(
+            gpu.rebuilds(),
+            1,
+            "one rebuild per dataset version, not per query"
+        );
+
+        // A second mutation -> one more rebuild; again none per query.
+        let mut again = unit_vec(dim, 9);
+        again[0] = 0.25;
+        let (code, body) = send(
+            app.clone(),
+            "POST",
+            "/store",
+            Some(json!({ "text": "again", "embedding": again.clone() })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "/store #2: {body}");
+        for _ in 0..5 {
+            let (code, body) = send(
+                app.clone(),
+                "POST",
+                "/search",
+                Some(json!({ "query": "after2", "embedding": again.clone(), "top_k": 5 })),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK, "{body}");
+            assert_eq!(body["backend"], "gpu", "{body}");
+            assert_eq!(
+                body["results"][0]["index"].as_u64(),
+                Some(n0 as u64 + 1),
+                "{body}"
+            );
+            assert_eq!(body["results"][0]["score"].as_f64(), Some(0.0), "{body}");
+        }
+        assert_eq!(
+            gpu.rebuilds(),
+            2,
+            "one rebuild per dataset version, not per query"
+        );
+    }
+
+    /// Mutate then search, never restarting: every stored vector must be the
+    /// top-1 for its own embedding right away (the batch path refreshes its
+    /// snapshot by `data_version`; CPU builds take it for every request).
+    #[tokio::test]
+    async fn search_sees_every_stored_vector_without_a_restart() {
+        let (app, _) = test_app().await;
+        let (code, body) = send(app.clone(), "POST", "/status", Some(json!({}))).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        let n0 = body["n_active"].as_u64().unwrap();
+
+        for i in 0..5usize {
+            let axis = (i * 7) % 32;
+            let emb: Vec<f32> = unit_vec(32, axis).into_iter().map(|v| v * 40.0).collect();
+            let (code, body) = send(
+                app.clone(),
+                "POST",
+                "/store",
+                Some(json!({ "text": format!("live-{i}"), "embedding": emb })),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK, "/store #{i}: {body}");
+            let (code, body) = send(
+                app.clone(),
+                "POST",
+                "/search",
+                Some(json!({ "query": "live", "embedding": emb, "top_k": 1 })),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK, "{body}");
+            assert_eq!(
+                body["results"][0]["index"].as_u64(),
+                Some(n0 + i as u64),
+                "store #{i} is invisible to /search (stale snapshot): {body}"
+            );
+        }
+    }
+
+    // ─── GPU batch shape contract (F03a/F02b borders) ─────────────────────
+
+    fn row_key(row: &[SearchResult]) -> Vec<(usize, f32)> {
+        row.iter().map(|r| (r.index, r.score)).collect()
+    }
+
+    fn err_of(r: Result<Vec<Vec<SearchResult>>, String>) -> String {
+        match r {
+            Ok(rows) => panic!("expected a shape error, got {} rows", rows.len()),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn gpu_batch_reassembly_returns_every_query_in_request_order() {
+        let rows = reassemble_gpu_rows(
+            4,
+            &[2, 1, 3],
+            &[false, true, false],
+            vec![vec![(1, 0.9), (0, 0.5)]],
+            vec![
+                (vec![2, 0], vec![0.1, 0.4]),
+                (vec![3, 9, 1], vec![0.0, 0.0, 0.2]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(row_key(&rows[0]), vec![(2, 0.1), (0, 0.4)]); // take(k=2)
+        assert_eq!(row_key(&rows[1]), vec![(1, 0.9)]); // take(k=1)
+        assert_eq!(row_key(&rows[2]), vec![(3, 0.0), (1, 0.2)]); // index 9 >= n dropped
+    }
+
+    #[test]
+    fn gpu_batch_reassembly_rejects_a_declined_l2_kernel_instead_of_panicking() {
+        // batch_search_cached answered Vec::new() for 2 l2 queries.
+        let err = err_of(reassemble_gpu_rows(
+            4,
+            &[2, 2],
+            &[false, false],
+            vec![],
+            vec![],
+        ));
+        assert_eq!(err, "gpu batch: l2 kernel returned 0 rows for 2 queries");
+        // ... and a partial answer (1 row for 2 queries).
+        let err = err_of(reassemble_gpu_rows(
+            4,
+            &[2, 2],
+            &[false, false],
+            vec![],
+            vec![(vec![1], vec![0.5])],
+        ));
+        assert_eq!(err, "gpu batch: l2 kernel returned 1 rows for 2 queries");
+    }
+
+    #[test]
+    fn gpu_batch_reassembly_rejects_a_declined_gaussian_kernel() {
+        let err = err_of(reassemble_gpu_rows(
+            4,
+            &[1, 1],
+            &[false, true],
+            vec![],
+            vec![(vec![1], vec![0.5])],
+        ));
+        assert_eq!(
+            err,
+            "gpu batch: gaussian kernel returned 0 rows for 1 queries"
+        );
+    }
+
+    #[test]
+    fn gpu_batch_reassembly_rejects_mismatched_idx_and_dist_lengths() {
+        let err = err_of(reassemble_gpu_rows(
+            4,
+            &[2],
+            &[false],
+            vec![],
+            vec![(vec![1, 2], vec![0.5])],
+        ));
+        assert_eq!(err, "gpu batch: l2 row 0 has 2 indices for 1 distances");
+    }
+
+    #[test]
+    fn gpu_batch_reassembly_rejects_k_and_query_counts_that_disagree() {
+        let err = err_of(reassemble_gpu_rows(
+            4,
+            &[2],
+            &[false, false],
+            vec![],
+            vec![],
+        ));
+        assert_eq!(err, "gpu batch: 1 k values for 2 queries");
+    }
+
+    // ─── Auth (A05-F10) ───────────────────────────────────────────────────
+
+    #[test]
+    fn api_key_absent_is_unauthenticated_and_a_real_key_is_required() {
+        assert_eq!(resolve_api_key(None), Ok(AuthConfig::Unauthenticated));
+        assert_eq!(
+            resolve_api_key(Some("k".into())),
+            Ok(AuthConfig::Required("k".into()))
+        );
+        // Debug never leaks the key
+        assert_eq!(
+            format!("{:?}", AuthConfig::Required("secret".into())),
+            "Required(<redacted>)"
+        );
+    }
+
+    #[test]
+    fn api_key_present_but_empty_or_blank_is_an_error_not_auth_off() {
+        for blank in ["", " ", "\t", "  \n"] {
+            let err = resolve_api_key(Some(blank.into())).expect_err("blank key must be rejected");
+            assert!(err.contains("SPLATSDB_API_KEY"), "{err}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_key_present_but_not_utf8_is_an_error_not_auth_off() {
+        use std::os::unix::ffi::OsStringExt;
+        let err = resolve_api_key(Some(std::ffi::OsString::from_vec(vec![0xC3, 0x28, 0x41])))
+            .expect_err("non-UTF-8 key must be rejected");
+        assert!(err.contains("UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn bind_policy_is_fail_closed_off_loopback_without_a_key() {
+        let unauth = AuthConfig::Unauthenticated;
+        let key = AuthConfig::Required("k".into());
+        // loopback without a key: dev mode preserved
+        for a in ["127.0.0.1", "localhost", "::1", "[::1]"] {
+            assert!(check_bind_policy(a, &unauth, false).is_ok(), "{a}");
+        }
+        // non-loopback without a key and without opt-in: refused
+        for a in ["0.0.0.0", "::", "192.168.1.10", "127.0.0.1.example.com"] {
+            let err = check_bind_policy(a, &unauth, false).expect_err(a);
+            assert!(
+                err.to_string().contains("SPLATSDB_ALLOW_UNAUTHENTICATED"),
+                "{err}"
+            );
+        }
+        // explicit opt-in, or a key: allowed
+        assert!(check_bind_policy("0.0.0.0", &unauth, true).is_ok());
+        assert!(check_bind_policy("0.0.0.0", &key, false).is_ok());
+    }
+
+    #[test]
+    fn unauthenticated_opt_in_requires_exactly_one() {
+        assert!(unauthenticated_opt_in(Some("1".into())));
+        for v in ["0", "true", "yes", " 1", "1 ", ""] {
+            assert!(
+                !unauthenticated_opt_in(Some(v.into())),
+                "{v:?} must NOT opt in"
+            );
+        }
+        assert!(!unauthenticated_opt_in(None));
+    }
+
+    #[test]
+    fn loopback_check_parses_addresses_instead_of_matching_a_prefix() {
+        assert!(is_loopback_addr("127.0.0.1"));
+        assert!(is_loopback_addr("[::1]"));
+        // a hostname that merely starts with "127." is not loopback
+        assert!(!is_loopback_addr("127.0.0.1.example.com"));
+        assert!(!is_loopback_addr("127.0.0.1:8080"));
+    }
+
+    fn bearer_headers(value: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(v) = value {
+            h.insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn bearer_token_is_parsed_strictly() {
+        assert_eq!(bearer_token(&bearer_headers(Some("Bearer k"))), Some("k"));
+        for bad in [
+            None,
+            Some("Bearer"),
+            Some("Bearer "),
+            Some("Bearer  "),
+            Some("Bearer  k"),
+            Some("Bearer k "),
+            Some("Bearer k x"),
+            Some("bearer k"),
+            Some("BEARER k"),
+            Some("Basic k"),
+            Some("Bearerk"),
+        ] {
+            assert_eq!(
+                bearer_token(&bearer_headers(bad)),
+                None,
+                "{bad:?} must not yield a token"
+            );
+        }
+    }
+
+    #[test]
+    fn constant_time_eq_compares_bytes() {
+        assert!(constant_time_eq(b"k", b"k"));
+        assert!(!constant_time_eq(b"", b"k"));
+        assert!(!constant_time_eq(b"K", b"k"));
+        assert!(!constant_time_eq(b"kk", b"k"));
+    }
+
+    /// App whose auth is `auth` (everything else as in `test_app`).
+    async fn test_app_with_auth(auth: AuthConfig) -> Router {
+        let store = Arc::new(Mutex::new(SplatStore::new(test_config())));
+        let (batch_tx, batch_rx) = mpsc::channel(BATCH_CHANNEL_CAP);
+        let batches_served = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(batch_worker(
+            batch_rx,
+            store.clone(),
+            batches_served.clone(),
+            false,
+        ));
+        let state = AppState {
+            store,
+            next_id: Arc::new(AtomicUsize::new(0)),
+            batch_tx,
+            batches_served,
+            #[cfg(feature = "cuda")]
+            gpu: None,
+            field: None,
+            corpus_n: 0,
+            data_dir: None,
+            durability: None,
+            auth,
+        };
+        build_router(state)
+    }
+
+    async fn send_auth(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Value,
+        authorization: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut req = HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        if let Some(v) = authorization {
+            req.headers_mut().insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        let resp = app
+            .clone()
+            .oneshot(req)
+            .await
+            .expect("oneshot request failed");
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body failed");
+        let json: Value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
+        };
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn with_a_key_configured_wrong_or_malformed_authorization_never_authenticates() {
+        let app = test_app_with_auth(AuthConfig::Required("k".into())).await;
+        for bad in [
+            None,
+            Some("Bearer "),
+            Some("Bearer  "),
+            Some("Bearer  k"),
+            Some("Bearer k "),
+            Some("bearer k"),
+            Some("Bearer K"),
+            Some("Bearer wrong"),
+            Some("Bearer k extra"),
+            Some("Basic k"),
+        ] {
+            let (status, body) = send_auth(&app, "POST", "/status", json!({}), bad).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "authorization {bad:?} must be rejected ({body})"
+            );
+        }
+        let (status, _) = send_auth(&app, "POST", "/status", json!({}), Some("Bearer k")).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // A rejected /store does not mutate the store.
+        let (status, _) = send_auth(
+            &app,
+            "POST",
+            "/store",
+            json!({"text": "x"}),
+            Some("Bearer nope"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, body) = send_auth(&app, "POST", "/status", json!({}), Some("Bearer k")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["n_active"], 0, "{body}");
+
+        // /health stays open (liveness probe).
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn without_a_key_loopback_dev_mode_passes_through() {
+        let app = test_app_with_auth(AuthConfig::Unauthenticated).await;
+        let (status, _) = send_auth(&app, "POST", "/status", json!({}), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) =
+            send_auth(&app, "POST", "/status", json!({}), Some("Bearer anything")).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     // ─── /recall ──────────────────────────────────────────────────────────
@@ -3457,5 +5226,560 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    // ── F02b: ciclo de vida storage ───────────────────────────
+
+    /// Data-dir scratch único (TMPDIR).
+    fn f02b_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "splatdb-f02b-unit-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn f02b_compact_refuses_to_overwrite_a_shard_changed_outside_the_server() {
+        let dir = f02b_dir("guard");
+        let persist = SplatsDBPersistence::new(dir.to_str().unwrap(), false).unwrap();
+        let original = Array2::from_shape_fn((3, 32), |(i, j)| (i * 32 + j) as f32);
+        persist.save_vectors(&original, "default").unwrap();
+        // mismo orden que run_server: shard -> WAL -> replay
+        let mut store = SplatStore::new(test_config());
+        load_default_shard(&mut store, dir.to_str().unwrap()).unwrap();
+        let d = Durability::open(dir.to_str().unwrap()).unwrap();
+        replay_wal(&mut store, &d).unwrap();
+
+        // mutación externa válida del shard mientras el server corre
+        let external = Array2::from_shape_fn((5, 32), |(i, j)| 100.0 + (i * 32 + j) as f32);
+        persist.save_vectors(&external, "default").unwrap();
+        let shard = dir.join("data").join("vectors").join("default.bin");
+        let external_bytes = std::fs::read(&shard).unwrap();
+
+        // un store aceptado y el compact del shutdown
+        d.log_store("mem_0", Some(0), 3, &[0.5f32; 32]).unwrap();
+        let err = d.compact(&store).expect_err("compact must refuse");
+        assert!(err.to_string().contains("cambió en disco"), "{err}");
+        assert_eq!(
+            std::fs::read(&shard).unwrap(),
+            external_bytes,
+            "the external shard must survive byte for byte"
+        );
+        assert_eq!(
+            d.wal
+                .recover()
+                .unwrap()
+                .iter()
+                .filter(|e| e.operation == "store")
+                .count(),
+            1,
+            "the accepted store must stay in the WAL"
+        );
+
+        // reapertura sobre ese data-dir: fail-closed, no se adivina por idx
+        let err = Durability::open(dir.to_str().unwrap())
+            .err()
+            .expect("reopen must fail closed");
+        assert!(err.to_string().contains("cambió en disco"), "{err}");
+        assert_eq!(std::fs::read(&shard).unwrap(), external_bytes);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn f02b_compact_keeps_the_wal_while_entries_could_not_be_applied() {
+        let dir = f02b_dir("unapplied");
+        let d = Durability::open(dir.to_str().unwrap()).unwrap();
+        // una entrada cuya dimensión no coincide con el store no se puede aplicar
+        d.log_store("wide", None, 0, &[0.25f32; 64]).unwrap();
+        let mut store = SplatStore::new(test_config());
+        let (applied, _) = replay_wal(&mut store, &d).unwrap();
+        assert_eq!(applied, 0);
+        // una entrada aplicable posterior y un store no vacío
+        d.log_store("ok", None, 0, &[0.75f32; 32]).unwrap();
+        assert!(store.add_splat(&Array2::from_shape_fn((1, 32), |(_, j)| j as f32)));
+        let err = d
+            .compact(&store)
+            .expect_err("compact must not truncate the WAL");
+        assert!(err.to_string().contains("no se aplicaron"), "{err}");
+        let ops: Vec<String> = d
+            .wal
+            .recover()
+            .unwrap()
+            .iter()
+            .map(|e| e.operation.clone())
+            .collect();
+        assert_eq!(
+            ops.iter().filter(|o| *o == "store").count(),
+            2,
+            "WAL untouched, operations: {ops:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── F02b: contrato durable explícito de /store y /status ───
+
+    async fn f02b_call(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, String) {
+        let req = HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Router con un WAL real sobre `dir` (sin batch worker: /store y
+    /// /status no lo usan).
+    fn app_with_wal(dir: &std::path::Path) -> (Router, Arc<Durability>) {
+        let d = Arc::new(Durability::open(dir.to_str().unwrap()).expect("durability open"));
+        let mut store = SplatStore::new(test_config());
+        let _ = load_default_shard(&mut store, dir.to_str().unwrap());
+        replay_wal(&mut store, &d).expect("wal replay");
+        let (batch_tx, _batch_rx) = mpsc::channel(BATCH_CHANNEL_CAP);
+        let app = build_router(AppState {
+            store: Arc::new(Mutex::new(store)),
+            next_id: Arc::new(AtomicUsize::new(0)),
+            batch_tx,
+            batches_served: Arc::new(AtomicUsize::new(0)),
+            #[cfg(feature = "cuda")]
+            gpu: None,
+            field: None,
+            corpus_n: 0,
+            data_dir: Some(dir.to_str().unwrap().to_string()),
+            durability: Some(d.clone()),
+            auth: AuthConfig::Unauthenticated,
+        });
+        (app, d)
+    }
+
+    #[tokio::test]
+    async fn f02b_store_reports_process_crash_mode_and_group_commit() {
+        let dir = f02b_dir("durable-flag");
+        let (app, _d) = app_with_wal(&dir);
+        let (status, body) = f02b_call(&app, "POST", "/status", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["persistence"], "wal", "{body}");
+        assert_eq!(v["durable"], true, "nothing accepted yet: {body}");
+        // group commit: las primeras 31 están aceptadas en el WAL pero sin fsync
+        for i in 1..32 {
+            let (status, body) = f02b_call(
+                &app,
+                "POST",
+                "/store",
+                Some(json!({"text": format!("doc {i}")})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let v: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(v["status"], "stored", "{body}");
+            assert_eq!(v["durable"], true, "store #{i} reached the WAL: {body}");
+            assert_eq!(v["crash_durable"], true, "{body}");
+            assert_eq!(v["power_loss_durable"], false, "{body}");
+            assert_eq!(v["durability_mode"], "process-crash", "{body}");
+        }
+        let (_, body) = f02b_call(&app, "POST", "/status", None).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["durable"], true, "{body}");
+        assert_eq!(v["crash_durable"], true, "{body}");
+        assert_eq!(v["power_loss_durable"], false, "{body}");
+        assert_eq!(v["wal_pending"], 31, "{body}");
+        // la 32ª dispara el checkpoint: sync_all terminó ANTES de este 200
+        let (status, body) =
+            f02b_call(&app, "POST", "/store", Some(json!({"text": "doc 32"}))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["durable"], true, "{body}");
+        let (_, body) = f02b_call(&app, "POST", "/status", None).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["durable"], true, "{body}");
+        assert_eq!(v["wal_pending"], 0, "{body}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn f02b_store_is_503_when_the_wal_write_fails() {
+        let dir = f02b_dir("wal-fail");
+        let (app, d) = app_with_wal(&dir);
+        let (status, body) = f02b_call(&app, "POST", "/store", Some(json!({"text": "ok"}))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // fallo real en el fd: la próxima entrada se corta a los 0 bytes y se
+        // reporta como write fallido (mismo inyector que los tests del WAL).
+        d.wal.debug_fail_next_entry_after(0);
+        let (status, body) =
+            f02b_call(&app, "POST", "/store", Some(json!({"text": "fails"}))).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(body.contains("WAL write failed"), "{body}");
+        assert!(!body.contains("\"stored\""), "{body}");
+        // el WAL sigue terminando en la última entrada completa y acepta la siguiente
+        let (status, body) =
+            f02b_call(&app, "POST", "/store", Some(json!({"text": "after"}))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            d.wal
+                .recover()
+                .unwrap()
+                .iter()
+                .filter(|e| e.operation == "store")
+                .count(),
+            2,
+            "only the two accepted entries"
+        );
+        let (_, body) = f02b_call(&app, "POST", "/status", None).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["persistence"], "wal", "{body}");
+        assert_eq!(v["durable"], true, "{body}");
+        assert_eq!(v["crash_durable"], true, "{body}");
+        assert_eq!(v["power_loss_durable"], false, "{body}");
+        assert_eq!(v["wal_pending"], 2, "{body}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn f02b_ephemeral_mode_is_visible_and_never_durable() {
+        // `durability: None` es el modo efímero explícito (tests / lib);
+        // `serve` con --data-dir nunca llega acá (arranque fail-closed).
+        let (app, _batches) = test_app().await;
+        let (status, body) =
+            f02b_call(&app, "POST", "/store", Some(json!({"text": "ephemeral"}))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["status"], "stored", "{body}");
+        assert_eq!(v["persistence"], "ephemeral", "{body}");
+        assert_eq!(v["durable"], false, "{body}");
+        let (_, body) = f02b_call(&app, "POST", "/status", None).await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["persistence"], "ephemeral", "{body}");
+        assert_eq!(v["durable"], false, "{body}");
+        assert_eq!(v["wal_pending"], 0, "{body}");
+    }
+}
+
+#[cfg(test)]
+mod f02e1_energy_reload_tests {
+    use super::*;
+    use ndarray::Array2;
+
+    fn dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir()
+            .join("F02e1-unit")
+            .join(format!("{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn new_store() -> SplatStore {
+        SplatStore::new(SplatsDBConfig {
+            latent_dim: 4,
+            max_splats: 16,
+            ..Default::default()
+        })
+    }
+
+    fn mu_of(rows: usize) -> Array2<f32> {
+        Array2::from_shape_fn((rows, 4), |(i, j)| (i * 4 + j) as f32 - 2.0)
+    }
+
+    /// The layout `persistence::save_energy_state` writes — through the real
+    /// persistence layer.
+    fn write_energy(data_dir: &std::path::Path, mu: &Array2<f32>) -> (Vec<f32>, Vec<f32>) {
+        let alpha: Vec<f32> = (0..mu.nrows()).map(|i| 0.5 + 0.1 * i as f32).collect();
+        let kappa: Vec<f32> = (0..mu.nrows()).map(|i| 1.0 + 2.0 * i as f32).collect();
+        let persist = crate::storage::persistence::SplatsDBPersistence::with_backend(
+            data_dir.to_str().unwrap(),
+            crate::storage::persistence::StorageBackend::Sqlite,
+            false,
+        )
+        .unwrap();
+        persist.save_energy_state(mu, &alpha, &kappa).unwrap();
+        (alpha, kappa)
+    }
+
+    fn assert_init(store: &SplatStore, n: usize) {
+        let (init_alpha, init_kappa) = (
+            SplatsDBConfig::default().init_alpha as f32,
+            SplatsDBConfig::default().init_kappa as f32,
+        );
+        assert!(store
+            .get_alpha()
+            .unwrap()
+            .iter()
+            .take(n)
+            .all(|a| *a == init_alpha));
+        assert!(store
+            .get_kappa()
+            .unwrap()
+            .iter()
+            .take(n)
+            .all(|k| *k == init_kappa));
+    }
+
+    #[test]
+    fn serve_loads_the_energy_state_with_the_shard() {
+        let d = dir("full");
+        let mu = mu_of(3);
+        let (alpha, kappa) = write_energy(&d, &mu);
+        let mut store = new_store();
+        assert_eq!(
+            load_shard_with_energy(&mut store, d.to_str().unwrap(), &mu).unwrap(),
+            3
+        );
+        assert_eq!(store.get_alpha().unwrap().as_slice().unwrap(), &alpha[..]);
+        assert_eq!(store.get_kappa().unwrap().as_slice().unwrap(), &kappa[..]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn serve_loads_a_prefix_and_keeps_the_init_for_appended_rows() {
+        let d = dir("prefix");
+        let mu = mu_of(5);
+        let (alpha, kappa) = write_energy(&d, &mu.slice(ndarray::s![..3, ..]).to_owned());
+        let mut store = new_store();
+        assert_eq!(
+            load_shard_with_energy(&mut store, d.to_str().unwrap(), &mu).unwrap(),
+            5
+        );
+        assert_eq!(
+            &store.get_alpha().unwrap().as_slice().unwrap()[..3],
+            &alpha[..]
+        );
+        assert_eq!(
+            &store.get_kappa().unwrap().as_slice().unwrap()[..3],
+            &kappa[..]
+        );
+        let (init_alpha, init_kappa) = (
+            SplatsDBConfig::default().init_alpha as f32,
+            SplatsDBConfig::default().init_kappa as f32,
+        );
+        assert!(store
+            .get_alpha()
+            .unwrap()
+            .iter()
+            .skip(3)
+            .all(|a| *a == init_alpha));
+        assert!(store
+            .get_kappa()
+            .unwrap()
+            .iter()
+            .skip(3)
+            .all(|k| *k == init_kappa));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn serve_ignores_a_foreign_energy_state() {
+        let d = dir("foreign");
+        let mu = mu_of(3);
+        write_energy(&d, &mu_of(3).mapv(|x| x + 100.0));
+        let mut store = new_store();
+        assert_eq!(
+            load_shard_with_energy(&mut store, d.to_str().unwrap(), &mu).unwrap(),
+            3
+        );
+        assert_init(&store, 3);
+        // a landscape of another dimension
+        let d2 = dir("foreign-dim");
+        write_energy(&d2, &Array2::zeros((3, 5)));
+        let mut store = new_store();
+        assert_eq!(
+            load_shard_with_energy(&mut store, d2.to_str().unwrap(), &mu).unwrap(),
+            3
+        );
+        assert_init(&store, 3);
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    #[test]
+    fn serve_fails_closed_on_a_corrupt_energy_state() {
+        let d = dir("corrupt");
+        let mu = mu_of(3);
+        write_energy(&d, &mu);
+        let path = crate::loaders::EnergyLandscape::path_in(&d);
+        let mut store = new_store();
+        let bytes = std::fs::read(&path).unwrap();
+        // truncated
+        std::fs::write(&path, &bytes[..bytes.len() - 4]).unwrap();
+        let err = load_shard_with_energy(&mut store, d.to_str().unwrap(), &mu)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bytes"), "{err}");
+        // trailing garbage
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        std::fs::write(&path, &trailing).unwrap();
+        let mut store = new_store();
+        assert!(load_shard_with_energy(&mut store, d.to_str().unwrap(), &mu).is_err());
+        // hostile header (rows = u64::MAX)
+        let mut bomb = bytes.clone();
+        bomb[0..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&path, &bomb).unwrap();
+        let mut store = new_store();
+        let err = load_shard_with_energy(&mut store, d.to_str().unwrap(), &mu)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Allocation too large"), "{err}");
+        // NaN alpha
+        let mut nan = bytes.clone();
+        let o = 16 + 3 * 4 * 4 + 8;
+        nan[o..o + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        std::fs::write(&path, &nan).unwrap();
+        let mut store = new_store();
+        let err = load_shard_with_energy(&mut store, d.to_str().unwrap(), &mu)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-finite"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn serve_without_energy_state_loads_mu_only() {
+        let d = dir("absent");
+        let mu = mu_of(3);
+        let mut store = new_store();
+        assert_eq!(
+            load_shard_with_energy(&mut store, d.to_str().unwrap(), &mu).unwrap(),
+            3
+        );
+        assert_init(&store, 3);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn tie_snapshot() -> (DatasetSnapshot, Vec<f32>) {
+        let n = 300;
+        let row = |i: usize| -> Vec<f32> {
+            let mut v = vec![0.0f32; 32];
+            match i {
+                0 => v[3] = 1.0,
+                1 => v[0] = 2.0,
+                2 => v[0] = -2.0,
+                3 => v[1] = 2.0,
+                256 => v[1] = -2.0,
+                257 => v[2] = 2.0,
+                258 => v[2] = -2.0,
+                _ => v[7 + i % 24] = 4.0 + 0.03125 * i as f32,
+            }
+            v
+        };
+        let mut alpha = vec![1.0f32; n];
+        alpha[257] = 1000.0;
+        (
+            DatasetSnapshot {
+                version: 0,
+                n,
+                dim: 32,
+                data: (0..n).flat_map(row).collect(),
+                alpha,
+                kappa: vec![1.0f32; n],
+            },
+            {
+                let mut q = vec![0.0f32; 32];
+                q[31] = 0.5;
+                q
+            },
+        )
+    }
+
+    /// The kernel's thread-major order over the tie corpus.
+    fn kernel_row(scores: &[f32], descending: bool, w: usize) -> Vec<(usize, f32)> {
+        let mut all: Vec<(usize, f32)> = scores.iter().copied().enumerate().collect();
+        all.sort_by(|a, b| {
+            let s = a.1.total_cmp(&b.1);
+            let s = if descending { s.reverse() } else { s };
+            s.then((a.0 % 256).cmp(&(b.0 % 256))).then(a.0.cmp(&b.0))
+        });
+        all.truncate(w);
+        all
+    }
+
+    #[test]
+    fn gpu_batch_rows_become_contractual() {
+        let (snap, q) = tie_snapshot();
+        let scores: Vec<f32> = (0..snap.n)
+            .map(|i| {
+                let r = &snap.data[i * 32..(i + 1) * 32];
+                r.iter()
+                    .zip(&q)
+                    .map(|(a, b)| {
+                        let d = a - b;
+                        d * d
+                    })
+                    .sum()
+            })
+            .collect();
+        // what the kernels return for the batch window (k=5 → 6 pairs)
+        let mut gauss_out = vec![kernel_row(
+            &scores
+                .iter()
+                .zip(&snap.alpha)
+                .map(|(d, a)| a * (-d).exp())
+                .collect::<Vec<_>>(),
+            true,
+            6,
+        )];
+        let mut l2_out = vec![(
+            kernel_row(&scores, false, 6)
+                .iter()
+                .map(|p| p.0)
+                .collect::<Vec<_>>(),
+            kernel_row(&scores, false, 6)
+                .iter()
+                .map(|p| p.1)
+                .collect::<Vec<_>>(),
+        )];
+        canonicalize_gpu_rows(
+            &snap,
+            &[q.clone(), q.clone()],
+            &[5, 5],
+            &[true, false],
+            &mut gauss_out,
+            &mut l2_out,
+        );
+        assert_eq!(
+            gauss_out[0].iter().map(|p| p.0).collect::<Vec<_>>(),
+            vec![257, 0, 1, 2, 3]
+        );
+        assert_eq!(l2_out[0].0.clone(), vec![0, 1, 2, 3, 256]);
+        assert!((l2_out[0].1[1] - 4.25).abs() < 1e-5, "{:?}", l2_out[0].1);
+        // malformed shapes are left for reassemble_gpu_rows to reject
+        let mut bad = vec![(vec![0usize, 1], vec![1.0f32])];
+        canonicalize_gpu_rows(
+            &snap,
+            std::slice::from_ref(&q),
+            &[5],
+            &[false],
+            &mut [],
+            &mut bad,
+        );
+        assert_eq!(bad[0].0.len(), 2);
+        assert_eq!(bad[0].1.len(), 1);
+        // host fallbacks are contractual on their own
+        let exact = host_exact_l2(&snap.data, snap.n, 32, &q, 5);
+        assert_eq!(
+            exact.iter().map(|p| p.0).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 256]
+        );
+        assert_eq!(gpu_window(5, 300), 6);
+        assert_eq!(gpu_window(5, 6), 6);
+        assert_eq!(gpu_window(5, 4), 4);
+        assert_eq!(gpu_window(32, 300), 32);
+        assert_eq!(gpu_window(40, 300), 40);
     }
 }

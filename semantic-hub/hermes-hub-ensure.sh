@@ -8,7 +8,13 @@ set -u
 LOG_DIR="/mnt/d/WSL/orch"
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/hermes-hub.log"
-BIN="/mnt/d/splatdb/target/release/splatsdb"
+BIN="${SPLATSDB_BIN:-/mnt/d/splatdb/target/release/splatsdb}"
+# v2.11: usar el perfil Hermes cuando el binario instalado lo soporta. La
+# detección evita romper ensure con un binario anterior al flag --profile.
+PROFILE_ARGS=()
+if "$BIN" serve --help 2>/dev/null | grep -q -- '--profile'; then
+    PROFILE_ARGS=(--profile hermes)
+fi
 
 # Exclusión mutua (17-nov: el ensure */10 podía solaparse con el ensure del
 # ciclo 9:15; dos lanzadores en carrera envenenaban hub.pid con el pid perdedor).
@@ -33,7 +39,7 @@ ensure_hub() { # puerto, data-dir, etiqueta
     # v2.9.0: /recall nativo — el motor loggea sus fires al log canónico del
     # digest (schema idéntico al del hook legacy; en modo nativo el hook no
     # duplica la línea).
-    SPLATSDB_RECALL_LOG="$LOG_DIR/hermes-recalls.jsonl" nohup "$BIN" --dim 768 serve --port "$PORT" --host 127.0.0.1 --data-dir "$HUB" --gpu --trainer emeans >> "$LOG" 2>&1 &
+    SPLATSDB_RECALL_LOG="$LOG_DIR/hermes-recalls.jsonl" nohup "$BIN" --dim 768 serve "${PROFILE_ARGS[@]}" --port "$PORT" --host 127.0.0.1 --data-dir "$HUB" --gpu --trainer emeans >> "$LOG" 2>&1 &
     # Solo confiar en el pid si el proceso sigue vivo tras 1s: un proceso que
     # pierde la carrera del puerto muere y hub.pid quedaría envenenado
     # (17-nov: el cycle mataría un pid inexistente para siempre).

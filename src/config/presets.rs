@@ -176,6 +176,33 @@ impl SplatsDBConfig {
         config
     }
 
+    /// Configuration for the local Hermes memory hub (`serve --profile hermes`).
+    ///
+    /// The hub's hot path is HNSW candidate generation with exact GPU L2
+    /// re-rank over 768-d session/code embeddings. Keep that contract explicit:
+    /// the server preset owns HNSW tuning, while graph, map-reduce, training,
+    /// and quality-reflection machinery stay off because those paths are unused.
+    /// Device detection is explicit (`auto` => CUDA when available, else CPU).
+    pub fn hermes(device: Option<&str>) -> Self {
+        let mut config = Self {
+            device: device.unwrap_or("auto").to_string(),
+            cluster_trainer: crate::clustering::TrainerKind::Emeans,
+            enable_quantization: false,
+            enable_graph: false,
+            enable_hnsw: true,
+            enable_lsh: false,
+            enable_mapreduce: false,
+            enable_auto_scaling: false,
+            enable_quality_reflection: false,
+            enable_training: false,
+            enable_data_lake: false,
+            enable_entity_extraction: false,
+            ..Self::default()
+        };
+        config.finalize();
+        config
+    }
+
     /// Creates a 'GPU' configuration for CUDA-accelerated search.
     ///
     /// Enables GPU search backends, auto-tuning, and large batch operations.
@@ -219,5 +246,50 @@ impl SplatsDBConfig {
         config.hrm2_n_probe = 16;
 
         config
+    }
+}
+
+#[cfg(test)]
+mod hermes_profile_tests {
+    use super::*;
+
+    #[test]
+    fn hermes_profile_is_lean_and_serializable() {
+        let config = SplatsDBConfig::hermes(Some("cpu"));
+        assert!(!config.enable_cuda);
+        assert!(!config.enable_quantization);
+        assert!(!config.enable_graph);
+        assert!(config.enable_hnsw);
+        assert!(!config.enable_lsh);
+        assert!(!config.enable_mapreduce);
+        assert!(!config.enable_quality_reflection);
+        assert_eq!(
+            config.cluster_trainer,
+            crate::clustering::TrainerKind::Emeans
+        );
+        let json = serde_json::to_string(&config).expect("serialize hermes profile");
+        let restored: SplatsDBConfig =
+            serde_json::from_str(&json).expect("deserialize hermes profile");
+        assert_eq!(restored.cluster_trainer, config.cluster_trainer);
+        assert!(!restored.enable_quantization);
+    }
+
+    #[test]
+    fn hermes_profile_honors_cuda_device() {
+        let config = SplatsDBConfig::hermes(Some("cuda"));
+        assert!(config.enable_cuda);
+        assert!(!config.enable_vulkan);
+    }
+
+    #[test]
+    fn default_profile_remains_unchanged() {
+        let config = SplatsDBConfig::default();
+        assert!(config.enable_quantization);
+        assert!(config.enable_graph);
+        assert!(!config.enable_hnsw);
+        assert_eq!(
+            config.cluster_trainer,
+            crate::clustering::TrainerKind::Lloyd
+        );
     }
 }

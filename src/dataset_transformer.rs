@@ -592,7 +592,7 @@ impl DatasetTransformer {
                 (i, score)
             })
             .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         let hot_end = (n as f64 * 0.2).ceil() as usize;
         let warm_end = (n as f64 * 0.5).ceil() as usize;
@@ -686,7 +686,7 @@ fn simple_kmeans(
             let best_c = row
                 .iter()
                 .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .max_by(|a, b| a.1.total_cmp(b.1))
                 .map(|(c, _)| c)
                 .unwrap_or(0);
             if labels[i] != best_c {
