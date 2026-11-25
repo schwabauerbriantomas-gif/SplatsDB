@@ -457,11 +457,11 @@ On synthetic data HNSW delivers **~875× speedup** over linear scan at 10K. Real
 - Benchmark script: `bench-data/longmemeval_full.py`
 - Previous keyword baseline: `bench-data/longmemeval_baseline_results.json`
 
-#### Adapted M3 context-reduction evaluation
+#### Adapted M3 context-reduction evaluation — independent rerun
 
-<p align="center"><img src="assets/splatsdb-m3-context.png" alt="Adapted M3 context reduction and accuracy" width="900"/></p>
+<p align="center"><img src="assets/splatsdb-m3-context-rerun.png" alt="Adapted M3 independent rerun: context reduction, accuracy and GO verdict" width="900"/></p>
 
-A separate local adaptation of `m3-glm-protocol` @ `15795ca` was evaluated with GLM-5.4 and GLM-5.3-Flash using crossed judges and a full-context baseline. On completed calls, median prompt usage fell **93.77%** (70,241 to 4,376.5/4,378.5 tokens); symmetric accuracy was **81.46% vs 79.56%**. The formal verdict is **NO_GO by the predeclared coverage rule**: 498/500 complete token pairs and one M3 question blocked by the provider's content filter. The numerical reduction and observed non-regression pass, but complete coverage does not; no values were imputed. See [methodology, results and limitations](docs/validation/m3-adaptation.md).
+A separate local adaptation of `m3-glm-protocol` @ `15795ca` was evaluated with GLM-5.4 and GLM-5.3-Flash using crossed judges and a new full-context baseline. A **[predeclared independent rerun](docs/validation/m3-adaptation-rerun-protocol.md)** (protocol SHA `c6973edb93af`) returned **GO**: median prompt usage fell **93.76%** (70,241 to 4,384.5/4,383.5 tokens), with 498/500 complete token pairs; symmetric accuracy was **81.46% vs 80.16%** (+1.30 pp, McNemar p=0.2624), and the intent-to-treat sensitivity also passed. One question per stage was filtered in both models, within the predeclared budget; there were zero non-filter errors and no imputation. See [methodology, results and limitations](docs/validation/m3-adaptation-rerun.md). The [earlier run](docs/validation/m3-adaptation.md) remains **NO_GO** under its stricter 500/500 rule; this rerun does not reinterpret it.
 
 ### GPU Top-K Search (Custom CUDA Kernels)
 
