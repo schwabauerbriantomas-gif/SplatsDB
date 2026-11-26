@@ -13,9 +13,9 @@ import numpy as np
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy.spatial.distance import pairwise_distances
+from sklearn.metrics import pairwise_distances
 from sklearn.decomposition import PCA
-from sklearn.manifold import trustworthiness, continuity
+from sklearn.manifold import trustworthiness
 
 import ivf_atlas_common as common
 
@@ -37,7 +37,7 @@ def projection_metrics(corpus: np.ndarray, coordinates: np.ndarray, eval_indices
     for k in (10, 50):
         result[f"knn_{k}"] = common.knn_overlap(x, z, k)
         result[f"trustworthiness_{k}"] = float(trustworthiness(x, z, n_neighbors=k, metric="euclidean"))
-        result[f"continuity_{k}"] = float(continuity(x, z, n_neighbors=k, metric="euclidean"))
+        result[f"continuity_{k}"] = float(trustworthiness(z, x, n_neighbors=k, metric="euclidean"))
     return result
 
 

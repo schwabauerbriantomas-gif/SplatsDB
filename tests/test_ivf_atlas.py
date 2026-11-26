@@ -101,6 +101,15 @@ class AtlasTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
+    def test_runners_import_without_starting_measurement(self):
+        import benchmark_ivf
+        import build_embedding_atlas
+        import report_ivf_atlas
+
+        self.assertTrue(callable(benchmark_ivf.main))
+        self.assertTrue(callable(build_embedding_atlas.main))
+        self.assertTrue(callable(report_ivf_atlas.main))
+
     def test_pending_receipts_cannot_derive_metrics(self):
         import report_ivf_atlas as report
 

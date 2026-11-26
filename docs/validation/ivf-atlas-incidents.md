@@ -21,3 +21,10 @@
 - **Invalid artifact preserved:** `ivf_policy_results.INVALID_parity_parser.json`, SHA-256 `1410dec5e21993deb0bb0abf5b880fa92c157e4bd85476ee3d4459af195d7eed`. Its `NO_GO_IMPLEMENTATION_PARITY` is not a valid product verdict.
 - **Fix:** swap the return assignment and add a synthetic end-to-end Faiss/mirror score-parity regression test. Re-run the identical frozen protocol; do not reinterpret the invalid JSON as a NO_GO.
 
+## 2026-11-26 — atlas runner stopped on a wrong import
+
+- **Observed:** `ImportError` before any projection, metric or image was produced: `pairwise_distances` was imported from SciPy instead of scikit-learn.
+- **Fix:** import it from `sklearn.metrics`, compute continuity as reversed-role trustworthiness because scikit-learn does not export a `continuity` function, and add a runner-import test so CI catches missing symbols before measurement.
+- **Protocol change:** none; the valid IVF receipt from commit `6b0c10f` is unaffected.
+
+
