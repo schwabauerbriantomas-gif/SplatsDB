@@ -1,6 +1,6 @@
 # Integrity audit: benchmark claims, result files and benchmark code
 
-**Date:** 2026-11-26 · **Branch:** `fix/integrity-audit` · **Status:** corrections applied on the branch; the items still open are listed at the end.
+**Date:** 2026-11-26 · **Branch:** `fix/integrity-audit` · **Status:** applied and merged to `main` on 2026-11-26; finding 11 was closed the same day by a follow-up change. The items still open are listed at the end.
 
 ## Why this audit
 
@@ -126,13 +126,14 @@ like with like.
 
 ### 11. HTTP ingest stores a hash as if it were an embedding, and says `stored` — MEDIUM (product)
 
-- **Evidence:** in `src/api_server.rs`, a `/ingest` request without an `embedding` vector stores the text under
+- **Evidence:** in `src/api_server.rs`, a `POST /store` request without an `embedding` vector stores the text under
   `simple_hash_embedding`: one hash of the text seeds a PRNG that fills the dimensions. It has no semantic content.
   The response is `status: "stored"` with no flag. The README did warn about it, but described the method of the
   CLI's verbatim commands (`simcos_embed`, trigram hashing) instead of the one the HTTP server uses.
 - **Corrected:** README now describes the method that the server applies.
-- **Still open (needs the maintainer's decision, it changes the API's response):** flag the response, or refuse to
-  store text without an embedding.
+- **Resolved (2026-11-26, non-breaking):** `POST /store` without a vector now answers with `"embedding_source": "text_hash"` and a plain-language
+  `warning`. `status` stays `"stored"`, so a client that only reads `status` is unaffected; a request that carries a vector
+  gets neither key. Two unit tests cover both storage paths (with WAL and ephemeral).
 
 ### 12. References to files that are not in the repository — LOW
 
@@ -189,7 +190,6 @@ left alone. Two result files have no writer in the repository (`benchmarks/resul
 - The HNSW tables (finding 8) were not re-measured.
 - The scope of the 63.1% context recall reported for the Hermes hook (`docs/hermes-memory.md` does not say whether
   it is per-question or global).
-- Whether `/ingest` should flag or refuse text without an embedding (finding 11).
 - Whether keyword search (54.6%) or chunk-max (43.0%) lead to better answers than head embeddings (33.4%) over one
   global memory: only retrieval was measured, not answers.
 
