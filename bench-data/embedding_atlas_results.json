@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "status": "COMPLETE",
+  "generated_at": "2026-11-26T05:52:02.581589+00:00",
+  "representation": "Topo-GS-inspired isotropic splat-density prototype; not a Topo-GS reproduction",
+  "viewer_recommendation": "DEFER_USER_TASK",
+  "structural_metrics": {
+    "pca": {
+      "spearman": 0.47084289607474167,
+      "scale_invariant_stress": 0.427023236906525,
+      "knn_10": 0.07405,
+      "trustworthiness_10": 0.8062672965482489,
+      "continuity_10": 0.893860544217687,
+      "knn_50": 0.18968000000000002,
+      "trustworthiness_50": 0.8061662717588984,
+      "continuity_50": 0.8661684957131722
+    },
+    "umap": {
+      "spearman": 0.4206286605814663,
+      "scale_invariant_stress": 0.6186558225500641,
+      "knn_10": 0.28345,
+      "trustworthiness_10": 0.9342441672965482,
+      "continuity_10": 0.9313684555303603,
+      "knn_50": 0.34338,
+      "trustworthiness_50": 0.894162790335152,
+      "continuity_50": 0.8839711353598337
+    }
+  },
+  "projection_seconds": {
+    "pca": 0.10934214701410383,
+    "umap": 45.69977679499425
+  },
+  "volumes": {
+    "pca": {
+      "grid": 128,
+      "sigma": 1.0,
+      "clipped_fraction": 0.03035504562291083,
+      "volume_bytes": 8388608,
+      "volume_sha256": "789a1429734c76d439cd4247ae286e25751a58a7406d6d1d92ed3915dfffc376",
+      "mip_sha256": "7c6389fe88001bdcd148db3398a31876b8f288b45530af55fb209eb38fe9b2a5"
+    },
+    "umap": {
+      "grid": 128,
+      "sigma": 1.0,
+      "clipped_fraction": 0.029993676032161895,
+      "volume_bytes": 8388608,
+      "volume_sha256": "12997470d3ebc7df2b6df4cc81e717f444c0a1eb2e5ff10ec85d98aadaa7d848",
+      "mip_sha256": "1c91919762acfde73354692ff8b4a413e397cb62d28472e6f77985e6e45a9001"
+    }
+  },
+  "render": {
+    "render_seconds": 0.5838524999853689,
+    "png_bytes": 577895,
+    "png_sha256": "03249670068853ef2650be4a11e514f6d9ea020465c2b87ba559b9732e59bc2d",
+    "width": 1800,
+    "height": 1400
+  },
+  "scope": {
+    "corpus_shape": [
+      11069,
+      384
+    ],
+    "eval_points": 2000,
+    "sampled_pairs": 100000,
+    "class_separation": "not_applicable_no_labels",
+    "umap_compatibility_layout": true,
+    "user_task_accuracy": "not_measured",
+    "splat_changes_structural_metrics": false,
+    "ann_quality_measured": false,
+    "interactive_viewer_benefit_claimed": false
+  },
+  "packages": {
+    "numpy": "2.5.5",
+    "scipy": "1.18.1",
+    "scikit-learn": "1.9.1",
+    "umap-learn": "0.6.0",
+    "matplotlib": "3.11.2"
+  },
+  "receipts": {
+    "protocol_sha256": "00f339c84425bb96733ef8362a396dc242f40d0115dcb9a2064ee26f60d87667",
+    "common_script_sha256": "3f03e5628d6818e8e6af4aeb5a863aa291131ff26f87796400d503dd54d789b5",
+    "runner_sha256": "d5edd3291afcfbfaae1c7b93231542f79a740d84411fccd69a9de0ebd8195447",
+    "corpus_bin_sha256": "cdf977ee2db99a2b3825914a7bbff39042642f35fafb647eaf1d6d17ec0c7532",
+    "source": {
+      "head": "84583a35c32a533d434334f6d7a9b944708afa3e",
+      "dirty_lines": 0,
+      "platform": "Linux-6.18.58.1-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+      "python": "3.12.3",
+      "processor": "x86_64",
+      "files": {
+        "docs/validation/ivf-atlas-protocol.md": "00f339c84425bb96733ef8362a396dc242f40d0115dcb9a2064ee26f60d87667",
+        "benchmarks/ivf_atlas_common.py": "3f03e5628d6818e8e6af4aeb5a863aa291131ff26f87796400d503dd54d789b5",
+        "benchmarks/build_embedding_atlas.py": "d5edd3291afcfbfaae1c7b93231542f79a740d84411fccd69a9de0ebd8195447"
+      }
+    }
+  }
+}

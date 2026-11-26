@@ -4,6 +4,7 @@
 
 ### Added
 - **validation**: frozen H1/H2 splat-routing protocol, independent HTTP mirror, aggregate JSON results, raw-receipt hashes, report generator and extended 35-source primary-source SOTA, 3DGS and alternative-representation review. The learned `k=100` codebook beats a random control at the frozen endpoints; only the +8.1 pp low-scan effect clears the conservative 5-point small-sample floor. Exact top-10 distance parity is 100/100, with no material pruning at 11k×384.
+- **validation**: frozen matched Faiss IVF policy gate and embedding-atlas harness. Faiss and the NumPy mirror agree on 800/800 recall, distance and scan comparisons; ratio, doubling and learned probing are all **NO_GO** under the predeclared rule. The PCA/UMAP atlas publishes structural metrics and density-render costs without claiming user-task or ANN quality. Harness incidents and invalid artifacts are preserved in the incident register.
 - **docs**: README repositioned around learned splat-cell routing, exact raw-vector re-scoring and explicit non-claims; MCP/graph/GPU integration is separated from splat-specific evidence.
 
 ### Changed

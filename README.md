@@ -41,9 +41,15 @@ For the external technical position, see the [primary-source SOTA review](docs/v
 | Exact triangle-bound field search | **Correctness validated** | No material pruning observed at 11k×384 |
 | α/κ as a ranking improvement | **Falsified in A5** | Do not use energy as the default relevance score |
 | `topic` / `confidence` | **Diagnostic only** | Distance-to-centroid membership; not calibrated correctness probability |
+| Adaptive IVF probing: ratio / doubling / learned | **NO_GO in the matched gate** | None of the three families meets the predeclared scan/recall rule; synthetic self-queries only |
+| Embedding splat atlas | **Structural prototype only** | PCA/UMAP and density measured; no user-task or ANN-quality claim |
 | Compression / smaller memory | **Not validated by the routing gate** | Raw member vectors are retained for exact re-scoring |
 | Agent task success / hallucination prevention | **Not established** | MCP integration and verbatim sources do not prove better answers |
 | GPU / HNSW / graph / M3 | **Separate components** | Not attributable to Gaussian splats without an isolating experiment |
+
+**Matched adaptive-probing gate (2026-11-26):** Faiss and the independent NumPy mirror agree on **800/800** recall, distance and scan comparisons. Ratio, doubling and learned probing all remain **NO_GO** under the frozen rule; the learned 98% configuration reduces scan by **3.89%**, below the 5% floor with a CI crossing zero. This tests synthetic perturbed self-queries, not semantic quality. [Protocol, full fixed/policy tables and receipts](docs/validation/ivf-policy.md).
+
+**Embedding atlas:** UMAP preserves more exact local neighbors than PCA (**kNN@10 0.283 vs 0.074**), but PCA retains higher distance-rank correlation (**Spearman 0.471 vs 0.421**) and lower stress. The splat density layer is a structural visualization, not evidence of retrieval or viewer utility; user-task evaluation is deferred. [Metrics, limits and receipts](docs/validation/embedding-atlas.md) · [PNG](assets/atlas/embedding_atlas.png).
 
 ### Comparison
 
