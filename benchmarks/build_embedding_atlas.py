@@ -46,24 +46,28 @@ def render_atlas(pca: np.ndarray, umap: np.ndarray, mips: dict, metrics: dict, o
     panels = [(axes[0, 0], "pca", pca, "PCA — scatter", metrics["pca"]), (axes[0, 1], "pca", pca, "PCA — isotropic splat density", metrics["pca"]), (axes[1, 0], "umap", umap, "UMAP — scatter", metrics["umap"]), (axes[1, 1], "umap", umap, "UMAP — isotropic splat density", metrics["umap"])]
     start = time.perf_counter()
     for ax, name, coordinates, title, row in panels:
-        bounds = np.percentile(coordinates, [0.5, 99.5], axis=0)
+        scaled, _ = common.grid_scale(coordinates, GRID)
         if "density" in title:
             mip = mips[name]
-            ax.imshow(mip, origin="lower", cmap="magma", extent=(0, GRID - 1, 0, GRID - 1), vmax=float(np.percentile(mip, 99.8)), interpolation="nearest")
-            ax.set_xlabel("projection 1")
-            ax.set_ylabel("projection 2")
+            image = ax.imshow(mip, origin="lower", cmap="magma", extent=(0, GRID - 1, 0, GRID - 1), vmax=float(np.percentile(mip, 99.8)), interpolation="bilinear")
+            colorbar = figure.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+            colorbar.set_label("MIP density (a.u.)", fontsize=8)
+            colorbar.ax.tick_params(labelsize=7)
+            ax.set_xlabel("grid projection 1")
+            ax.set_ylabel("grid projection 2")
         else:
-            ax.scatter(coordinates[:, 0], coordinates[:, 1], s=0.55, alpha=0.20, linewidths=0, rasterized=True)
-            ax.set_xlim(bounds[:, 0])
-            ax.set_ylim(bounds[:, 1])
-            ax.set_xlabel("projection 1")
-            ax.set_ylabel("projection 2")
+            ax.scatter(scaled[:, 0], scaled[:, 1], s=0.75, alpha=0.32, linewidths=0, rasterized=True)
+            ax.set_xlim(0, GRID - 1)
+            ax.set_ylim(0, GRID - 1)
+            ax.set_aspect("equal")
+            ax.set_xlabel("grid projection 1")
+            ax.set_ylabel("grid projection 2")
         ax.set_title(f"{title}\nkNN@10={row['knn_10']:.3f} | trust@10={row['trustworthiness_10']:.3f} | stress={row['scale_invariant_stress']:.3f}", fontsize=9)
         ax.tick_params(labelsize=7)
     figure.suptitle("Embedding atlas — projection metrics, not retrieval quality", fontsize=15, fontweight="bold")
-    figure.text(0.5, 0.035, f"Structural eval: {EVAL_N:,} points + {PAIR_N:,} pairs • no labels or user task • MIP over z • grid={GRID}³ • sigma={SIGMA:g}", ha="center", fontsize=9)
-    figure.text(0.5, 0.012, "The splat layer shares coordinates with its scatter panel: it changes density inspection, not kNN/trust/stress.", ha="center", fontsize=9)
-    figure.subplots_adjust(left=0.065, right=0.985, top=0.86, bottom=0.13, hspace=0.38, wspace=0.23)
+    figure.text(0.5, 0.045, f"Structural eval: {EVAL_N:,} points + {PAIR_N:,} pairs • no labels or user task • MIP over z • grid={GRID}³ • sigma={SIGMA:g} • bilinear display", ha="center", fontsize=9)
+    figure.text(0.5, 0.018, "Scatter and density share grid coordinates and aspect. The splat layer changes density inspection, not kNN/trust/stress.", ha="center", fontsize=9)
+    figure.subplots_adjust(left=0.065, right=0.985, top=0.86, bottom=0.15, hspace=0.38, wspace=0.35)
     output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output, facecolor="white")
     plt.close(figure)
@@ -88,7 +92,7 @@ def main() -> None:
     import umap
 
     start = time.perf_counter()
-    reducer = umap.UMAP(n_neighbors=30, min_dist=0.1, spread=1.0, metric="euclidean", n_components=3, random_state=20261203, n_jobs=1)
+    reducer = umap.UMAP(n_neighbors=30, min_dist=0.1, spread=1.0, metric="euclidean", n_components=3, random_state=20261203, n_jobs=1, compatibility_layout=True)
     umap_coordinates = reducer.fit_transform(corpus).astype(np.float32)
     umap_seconds = time.perf_counter() - start
 
@@ -114,6 +118,7 @@ def main() -> None:
             "eval_points": EVAL_N,
             "sampled_pairs": PAIR_N,
             "class_separation": "not_applicable_no_labels",
+            "umap_compatibility_layout": True,
             "user_task_accuracy": "not_measured",
             "splat_changes_structural_metrics": False,
             "ann_quality_measured": False,

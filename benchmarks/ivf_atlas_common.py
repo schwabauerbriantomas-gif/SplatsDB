@@ -334,16 +334,21 @@ def pair_metrics(d_hi: np.ndarray, d_lo: np.ndarray) -> dict:
     return {"spearman": float(spearmanr(hi, lo).statistic), "scale_invariant_stress": stress}
 
 
-def splat_volume(coordinates: np.ndarray, grid: int = 128, sigma: float = 1.0) -> tuple[np.ndarray, dict]:
-    from scipy.ndimage import gaussian_filter
-
-    values = np.asarray(coordinates, dtype=np.float32)
+def grid_scale(values: np.ndarray, grid: int) -> tuple[np.ndarray, dict]:
+    values = np.asarray(values, dtype=np.float32)
     lower = np.percentile(values, 0.5, axis=0)
     upper = np.percentile(values, 99.5, axis=0)
     span = np.maximum(upper - lower, 1e-9)
     scaled = (values - lower) / span * (grid - 1)
     clipped = float(np.mean(np.any((scaled < 0) | (scaled > grid - 1), axis=1)))
     cells = np.clip(np.rint(scaled).astype(np.int32), 0, grid - 1)
+    return cells, {"clipped_fraction": clipped}
+
+
+def splat_volume(coordinates: np.ndarray, grid: int = 128, sigma: float = 1.0) -> tuple[np.ndarray, dict]:
+    from scipy.ndimage import gaussian_filter
+
+    cells, metadata = grid_scale(coordinates, grid)
     flat = (cells[:, 0] * grid + cells[:, 1]) * grid + cells[:, 2]
     volume = np.bincount(flat, minlength=grid**3).reshape(grid, grid, grid).astype(np.float32)
     smoothed = gaussian_filter(volume, sigma=sigma, mode="constant")
@@ -351,7 +356,7 @@ def splat_volume(coordinates: np.ndarray, grid: int = 128, sigma: float = 1.0) -
     return mip, {
         "grid": grid,
         "sigma": sigma,
-        "clipped_fraction": clipped,
+        "clipped_fraction": metadata["clipped_fraction"],
         "volume_bytes": int(smoothed.nbytes),
         "volume_sha256": sha256_array(smoothed),
         "mip_sha256": sha256_array(mip),

@@ -27,4 +27,12 @@
 - **Fix:** import it from `sklearn.metrics`, compute continuity as reversed-role trustworthiness because scikit-learn does not export a `continuity` function, and add a runner-import test so CI catches missing symbols before measurement.
 - **Protocol change:** none; the valid IVF receipt from commit `6b0c10f` is unaffected.
 
+## 2026-11-26 — visual QA required an atlas rendering rerun
+
+- **Observed:** the first complete atlas had no text clipping, but visual QA found mismatched scatter/splat coordinates and aspect, low-contrast PCA points, no density scale, tight footer spacing and blocky nearest-neighbor display. UMAP also emitted a `compatibility_layout` future-warning.
+- **Preserved initial artifacts:** JSON SHA-256 `8b893669f08a1a14cecd2cc27331d005cf565340984848b3cc7b9397e2d8eb2d`; PNG SHA-256 `3767236d6749adf65d462964f2573b1101069d925afc354d55b9d22be514daa6`.
+- **Fix:** use the same robust grid coordinates and equal aspect in both panel types, add density colorbars and footer spacing, use bilinear display resampling of the unchanged 128³ volume, increase scatter contrast, and pin `compatibility_layout=True`.
+- **Protocol change:** none; structural metrics and volume construction are unchanged. The full atlas is rerun after the runner update.
+
+
 
