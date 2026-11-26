@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **validation**: frozen H1/H2 splat-routing protocol, independent HTTP mirror, aggregate JSON results, raw-receipt hashes, report generator and primary-source SOTA review. The learned `k=100` codebook beats a random control at the frozen endpoints; only the +8.1 pp low-scan effect clears the conservative 5-point small-sample floor. Exact top-10 distance parity is 100/100, with no material pruning at 11k×384.
+- **docs**: README repositioned around learned splat-cell routing, exact raw-vector re-scoring and explicit non-claims; MCP/graph/GPU integration is separated from splat-specific evidence.
+
+### Changed
+- **MCP/verbatim**: HIGH/MEDIUM/LOW outputs are described as heuristic vector-distance bands, not calibrated correctness probabilities or hallucination prevention. Additive `close_or_moderate` and `diagnostic_only` fields clarify the summary; legacy `reliable` remains only for compatibility.
+
 ## [v2.11.0] - 2026-11-22
 
 ### Added
