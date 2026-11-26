@@ -139,25 +139,25 @@ def longmemeval(css: str) -> tuple[str, str, str]:
     baseline = load(ROOT / "bench-data/longmemeval_baseline_results.json")
     recall = ref["recall"]
     body = header(
-        "Two memory pipelines. Two different results.",
-        f"{ref['n_questions']} questions · {num(native['n_sessions'])} sessions · MiniLM 384d · RTX 3090 embeddings",
+        "One retrieval approach, two search scopes.",
+        f"{ref['n_questions']} questions · {num(native['n_sessions'])} sessions · MiniLM 384d · embeddings hardware as typed in the April script, not detected",
         f"RETRIEVAL ONLY · {ref['date']}",
     )
     body += '<section class="panels equal" style="flex:0 0 460px"><div class="panel">'
-    body += panel_head("NumPy brute-force reference", "Embeddings + normalized cosine; not SplatsDB's engine.", "96.6% @10")
+    body += panel_head("NumPy brute-force reference", "Embeddings + normalized cosine; not SplatsDB's engine. Ranked inside each question's own sessions.", "96.6% @10")
     for key, label in (("recall@1", "Top-1"), ("recall@3", "Top-3"), ("recall@5", "Top-5"), ("recall@10", "Top-10")):
         body += bar(label, recall[key], 1, pct(recall[key], 1), "answer session in top-k")
     body += '</div><div class="panel">'
-    body += panel_head("SplatsDB native pipeline", "HNSW M=32 · efS=100 · over-fetch 3× + re-rank · L2.", "30.4% @10")
+    body += panel_head("SplatsDB native pipeline", "HNSW M=32 · efS=100 · over-fetch 3× + re-rank · L2. Searched all sessions, no filter.", "30.4% @10")
     body += '<div class="split-metrics">'
     body += metric(pct(native["recall"]["hnsw_overfetch_rerank"]["@10"], 1), "Recall@10 · over-fetch + re-rank")
     body += metric(num(native["splatdb_rust"]["qps"], 2), "QPS · measured native run")
     body += metric(f'{num(native["splatdb_rust"]["p50_us"] / 1000, 3)} ms', "p50 latency · over-fetch + re-rank")
     body += metric(f'{num(native["splatdb_rust"]["build_ms"] / 1000, 2)} s', "Index build")
     body += '</div>'
-    body += callout('<strong>Do not read 96.6% as native-engine recall.</strong> The native gap is real under this methodology; no end-to-end paper comparison is claimed.')
+    body += callout("<strong>Two different candidate sets.</strong> 96.6% ranks inside each question's sessions, 30.4% searched all. No end-to-end comparison is claimed.")
     body += '</div></section><section class="panel" style="flex:1;min-height:0">'
-    body += panel_head("Recall@10 by question type", "Same 500 questions; two pipelines shown together.", "NumPy vs native")
+    body += panel_head("Recall@10 by question type", "Same 500 questions; different search scopes.", "NumPy vs native")
     for name, values in ref["per_type"].items():
         n = baseline["per_type"][name]["total"]
         a = values["recall@10"]
@@ -168,7 +168,7 @@ def longmemeval(css: str) -> tuple[str, str, str]:
         body += f'<div class="type-bar"><div class="type-bar-top"><span>Native</span><strong>{pct(b, 1)}</strong></div><div class="track"><div class="fill deep" style="width:{100*b:.4f}%"></div></div></div></div></div>'
     body += '<div class="legend"><span class="legend-item"><i class="dot"></i>NumPy brute force</span><span class="legend-item"><i class="dot deep"></i>SplatsDB native</span><span>Raw HNSW recall@10: 30.8% · re-ranked: 30.4%</span></div></section>'
     source = 'Sources: <a href="../../bench-data/longmemeval_full_results.json">NumPy JSON</a> · <a href="../../bench-data/longmemeval_splatdb_native.json">native JSON</a> · <a href="../../bench-data/longmemeval_baseline_results.json">question counts</a> · <a href="longmemeval.html">standalone HTML chart</a>'
-    body += footer(source, "NumPy latency p50/p95/p99: 0.056 / 0.080 / 0.105 ms; no NumPy QPS was recorded. Native figures come from the native JSON, not mixed with the reference.")
+    body += footer(source, "NumPy latency p50/p95/p99: 0.056 / 0.080 / 0.105 ms; no NumPy QPS was recorded. Native figures come from the native JSON, not mixed with the reference. Search scope re-measured 2026-11-26: docs/validation/longmemeval-scope.md.")
     title = "LongMemEval — NumPy reference and SplatsDB native"
     return "longmemeval", document(title, title, css, body), source
 
