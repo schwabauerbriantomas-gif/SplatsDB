@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Added
-- **validation**: frozen H1/H2 splat-routing protocol, independent HTTP mirror, aggregate JSON results, raw-receipt hashes, report generator and extended 30-source primary-source SOTA and 3DGS review. The learned `k=100` codebook beats a random control at the frozen endpoints; only the +8.1 pp low-scan effect clears the conservative 5-point small-sample floor. Exact top-10 distance parity is 100/100, with no material pruning at 11k×384.
+- **validation**: frozen H1/H2 splat-routing protocol, independent HTTP mirror, aggregate JSON results, raw-receipt hashes, report generator and extended 35-source primary-source SOTA, 3DGS and alternative-representation review. The learned `k=100` codebook beats a random control at the frozen endpoints; only the +8.1 pp low-scan effect clears the conservative 5-point small-sample floor. Exact top-10 distance parity is 100/100, with no material pruning at 11k×384.
 - **docs**: README repositioned around learned splat-cell routing, exact raw-vector re-scoring and explicit non-claims; MCP/graph/GPU integration is separated from splat-specific evidence.
 
 ### Changed

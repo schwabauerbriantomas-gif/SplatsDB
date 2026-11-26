@@ -8,7 +8,7 @@
 
 SplatsDB has a **narrow, reproducible routing result**, not a demonstrated state-of-the-art ANN or probabilistic-retrieval system. The local gate shows that learned KMeans centroids beat a random codebook at low scan budgets before exact re-scoring; the 10%-budget effect is +8.1 pp, while the smaller effects remain exploratory under the small-sample rule. Exact top-10 distances matched brute force, but exact search scanned essentially the whole 11,069-vector corpus. [Local receipts](splat-routing.md).
 
-The broader literature establishes five boundaries:
+The broader literature establishes six boundaries:
 
 1. Partitioning, learned codebooks, quantization and refinement are mature ANN components[1][2]. ScaNN explicitly separates reducing the number of scored items from improving the scoring rate, and contributes anisotropic quantization for that second task[1]. SPANN uses an inverted index with balanced posting lists and query-aware pruning in a memory-disk system[2]. Faiss provides established IVF, PQ and HNSW implementations[4]. **KMeans routing plus exact re-scoring is therefore not a novel algorithmic category.**[1][2]
 2. Probabilistic embeddings are a representation-learning method, not a label obtained by attaching Gaussian parameters to a cluster[5]. PCME++ addresses ambiguous image-text correspondence with learned probabilistic embeddings and a closed-form probabilistic distance[5]. SplatsDB's current `α/κ` fields do not reproduce that training problem or establish calibrated uncertainty[5].
@@ -17,6 +17,8 @@ The broader literature establishes five boundaries:
 4. Closer prior art narrows the remaining gap. GARLIC learns anisotropic Gaussian cells[13]. LIRA/DARTH/QASP cover learned or adaptive probing[14][15][16]. CalibRAG calibrates against decision correctness rather than retrieval scores[18]. The open question is narrower and empirical, not a new retrieval category.
 
 5. 3DGS contributes useful design patterns: LOD hierarchies, anchors and scale-aware filtering[22][23][25]. MCMC and compression add further capacity-management ideas[24][27]. They are hypotheses to test with retrieval metrics, not evidence that a vector index inherits rendering quality.
+
+6. Alternative data representations are a separate legitimate track. Topo-GS maps high-dimensional data to continuous volumes[31], GraphSplatting turns graphs into continuous fields[33], and VEG separates scalar data from appearance[34]. Their proper target is visualization and structural fidelity, not ANN recall.
 
 **Recommended positioning:** an integrated, self-hosted retrieval runtime with learned splat-cell routing, optional exact bounds and verbatim source access. Do not claim probabilistic uncertainty, universal ANN superiority or better agent outcomes until the corresponding experiments pass.
 
@@ -109,7 +111,24 @@ SplatsDB shares the Gaussian-splat representation with 3DGS, but it does not rec
 3. **Embedding-model shift test.** Measure whether scale/bandwidth normalization improves robustness across local densities. A new embedding model requires a new index and calibration set; never query the old index with incompatible vectors[22].
 4. **Compression as a separate gate.** Measure codebook, residual, metadata and raw-vector bytes together. Do not import LightGaussian/CompGS compression ratios or claim compression from the routing result alone[27][28].
 
-## 8. Three-category product assessment
+## 8. Alternative data representations and rendering-only methods
+
+A second legitimate research track is to make data structure interpretable and interactive rather than to accelerate nearest-neighbor search[31][33]. Rendering-only methods apply directly, but the evaluation target changes from recall/QPS to structural fidelity, geometric error, visual clutter and user-task performance[32][34].
+
+| Data or representation | Primary-source prior art | Transferable idea | Correct evaluation target |
+|---|---|---|---|
+| High-dimensional embeddings and manifolds | Topo-GS recasts multidimensional projection as meshless volumetric reconstruction, uses local geometric constraints instead of photometric loss and reports local-topology fidelity comparable to discrete baselines[31] | Continuous splat volumes may expose density, overlap and projection distortion hidden by scatterplots | Neighborhood/topology preservation, distance correlation and projection stress versus scatter/t-SNE/UMAP baselines; never ANN recall inferred from a picture |
+| Multivariate scattered or scientific data | Rapp et al. summarize clusters with low-dimensional GMMs and splat anisotropic 3D Gaussians; VEG decouples scalar data from appearance for transfer-function-agnostic volume rendering[32][34] | Probabilistic summaries, LOD, outlier views and reusable data fields rather than baked RGB | Reconstruction and interactive-task error, transfer-function coverage, memory, frame time and outlier visibility |
+| Knowledge/code/memory graphs | GraphSplatting transforms a graph into a continuous scalar density field using vertex contributions[33] | Continuous density fields may make repositories, modules and chat/memory relationships navigable without node-link clutter | Relationship-finding accuracy/time, clutter and graph-task error against node-link and matrix views |
+| Spatial data with semantic features | Quantile Rendering samples dominant-influence Gaussians for high-dimensional feature maps in 3D scenes; 2DGS targets view-consistent surfaces[29][35] | Open-vocabulary/GIS queries can combine spatial splats with semantic features | Held-out spatial segmentation/retrieval plus geometric error; do not infer semantic-index quality from rendering speed |
+
+### Proposed alternative-representation experiments — not implemented
+
+1. **Embedding atlas, local and privacy-preserving.** Export only the existing 11,069 × 384 numeric corpus and approved aggregate labels; keep text and identifiers private. Compare scatter/PCA/t-SNE/UMAP against a Topo-GS-style continuous-volume variant[31]. Predeclare kNN preservation, trustworthiness/continuity, pairwise-distance correlation, projection stress, memory and frame time[31]. Add a small user task only after numerical baselines are complete; a visually attractive render is not evidence of better retrieval.
+2. **Spatial CampoGrato/GIS track.** For genuine drone/point-cloud/surface data, compare 3DGS, 2DGS and mesh/LOD baselines with point-to-point/point-to-surface error, normal consistency where applicable, map/task error and resource use[29][35]. This is a separate spatial-rendering project, not a SplatsDB recall benchmark.
+3. **Graph-density track.** Build a GraphSplatting-style density field from an approved aggregate knowledge/code/memory graph and test whether users find cross-module or cross-session relationships faster and more accurately than with node-link or matrix views[33]. Preserve the original graph for verification; a density image cannot replace provenance.
+
+## 9. Three-category product assessment
 
 ### Validated locally
 
@@ -134,10 +153,11 @@ SplatsDB shares the Gaussian-splat representation with 3DGS, but it does not rec
 | Calibrated selective retrieval | Lower selective error at controlled coverage | Medium: labels, calibration and drift handling | Start with downstream calibration; no new index until signal exists |
 | Learned probabilistic codebooks | Task-specific ambiguity modelling | High: training data, objectives and capacity-matched controls | Test learned variance against deterministic `μ` on a task with real ambiguity |
 | 3DGS-inspired cell management | Better recall per byte or scan at fixed capacity | Medium-high: held-out error attribution and stochastic controls | Compare error-driven split/merge/relocation against fixed KMeans at matched memory before adding MCMC or anchors |
+| Alternative data visualization | Better inspection of embeddings, graphs, spatial/scientific data | Medium: projection, rendering and user-task evaluation | Compare against scatter/UMAP or node-link baselines using topology, geometry and task metrics before investing in a viewer |
 | Integrated agent-memory runtime | Operational simplicity and reproducible ablations | Medium-high: systems and evaluation work | Hold generator/pipeline fixed and compare full-context, vanilla RAG and Faiss-based variants |
 | Exact-bound pruning at scale | Exactness with less compute on favorable geometry | Medium: corpus/hardware matrix | Beat an exact SIMD scan at recall 1.0 before claiming speed; PDX shows layout can invalidate pruning gains[20] |
 
-## 9. Recommended sequence
+## 10. Recommended sequence
 
 1. **Run the matched IVF and probe-policy baselines before any new algorithm.** Use the same k-means cells and SIMD kernels, then add the SPANN ratio, productive-cluster doubling and a small learned regressor. This is the highest-information, lowest-cost next step and can falsify the remaining differentiator.
 2. **Expand independent semantic queries.** Use human-intent queries rather than lexical paraphrases, increase the query count and report paired deltas with intervals and the noise floor.
@@ -145,10 +165,11 @@ SplatsDB shares the Gaussian-splat representation with 3DGS, but it does not rec
 4. **Evaluate adaptive probing and angular cells as controlled experiments.** Do not add complexity unless a policy beats fixed-`nprobe`, ratio/doubling and learned controls, or an angular variant beats isotropic routing at matched scan and memory.
 5. **Test error-driven cell management before adding hierarchy.** Use held-out retrieval errors at fixed memory and compare against fixed KMeans; only then evaluate recall-driven LOD or MCMC-style relocation.
 6. **Run an end-to-end memory ablation.** Only then make an agent-memory utility claim.
+7. **Treat alternative data visualization as a separate track.** Start with a numeric-embedding atlas or a real spatial dataset and predeclared topology/geometry/task metrics; do not fold its results into the routing claim.
 
 No new routing algorithm is justified by this review alone. The necessary new code for the current step was the reproducible analyzer, independent HTTP mirror, raw receipts and report generator—not a novelty feature introduced before the missing baselines exist.
 
-## 10. Source quality and research limits
+## 11. Source quality and research limits
 
 | Source | Status | Reading depth used here |
 |---|---|---|
@@ -176,13 +197,18 @@ No new routing algorithm is justified by this review alone. The necessary new co
 | Hierarchical 3DGS [25] / Octree-GS [26] | CVPR 2024 / arXiv v2 | Abstracts; LOD design and multi-resolution anchors |
 | LightGaussian [27] / CompGS [28] | NeurIPS 2024 / ECCV 2024 | Abstracts; significance pruning and VQ for rendering parameters |
 | 2DGS [29] / Revising Densification [30] | SIGGRAPH 2024 / ECCV 2024 | Abstracts; surface representation and error-driven density control |
+| Topo-GS [31] | arXiv preprint, 2026 | Abstract/introduction; high-dimensional projection as continuous volumes, not independently reproduced |
+| Rapp et al. [32] | IEEE TVCG 2020 | Abstract; probabilistic multivariate summaries and splatting |
+| GraphSplatting [33] | Eurographics/IEEE VGTC 2001 | Primary paper; graph-to-continuous-field visualization |
+| VEG [34] | arXiv v2, 2026 | Abstract; scalar-data/transfer-function separation for scientific volumes |
+| Quantile Rendering [35] | arXiv preprint, 2025 | Abstract; high-dimensional feature rendering in 3D scenes |
 | ANN-Benchmarks [3] / Faiss [4] | Official benchmark / official documentation | Live result structure and implementation scope |
 
 - This is a targeted technical review, not an exhaustive systematic literature review or an independent reproduction of cited benchmark scores.
 - Recent preprints and vendor-authored evaluations require extra caution; no cited result is treated as a SplatsDB measurement. GARLIC and QASP are especially recent, and their regimes are kept explicit.
 - The attempted LongMemEval-V2 page was rate-limited (HTTP 429) and is excluded from the findings.
 - No source found supports the claim that a KMeans-derived `α/κ` or `1 − d/R` is calibrated correctness uncertainty.
-- 3DGS sources are used as design-pattern evidence only. No rendering metric is compared with vector recall, and no PSNR/SSIM/FPS result is claimed as a database result.
+- 3DGS sources are used as design-pattern evidence only. Alternative-representation work is evaluated separately by topology, geometry, visualization and user-task metrics; no PSNR/SSIM/FPS result is claimed as a database result.
 - Local conclusions remain limited to one 11,069×384 corpus, deterministic perturbation queries and 100 queries per gate run.
 
 ## Sources
@@ -250,3 +276,16 @@ No new routing algorithm is justified by this review alone. The necessary new co
     > "Our key idea is to collapse the 3D volume into a set of 2D oriented planar Gaussian disks."
 [30] https://arxiv.org/abs/2404.06109
     > "Our main contribution is a more principled, pixel-error driven formulation for density control in 3DGS, leveraging an auxiliary, per-pixel error function as the criterion for densification."
+[31] https://arxiv.org/html/2605.17011
+    > "we introduce Topo-GS, a framework that repurposes 3D Gaussian Splatting (3DGS) to cast multidimensional projection as a meshless volumetric reconstruction process."
+    > "Instead of standard photometric losses, Topo-GS is driven by local geometric constraints."
+    > "Quantitative and visual evaluations demonstrate that Topo-GS successfully transforms discrete scatter plots into continuous volumetric representations, where inherent projection distortions explicitly manifest as observable geometric variations, while preserving local topological fidelity comparable to discrete baselines."
+[32] https://arxiv.org/abs/2008.09544
+    > "we represent high-dimensional distributions by combinations of low-dimensional Gaussian mixture models."
+    > "Furthermore, we propose a spatial visualization by splatting anisotropic 3D Gaussians for which we derive a closed-form solution."
+[33] https://homepages.cwi.nl/~robertl/papers/2001/splat/paper.pdf
+    > "GraphSplatting is a technique that transforms a graph into a continuous field."
+[34] https://arxiv.org/abs/2504.13339
+    > "VEG decouple the visual appearance from the data representation by encoding only scalar values, enabling transfer-function-agnostic rendering of 3DGS models for interactive scientific visualization."
+[35] https://arxiv.org/abs/2512.20927
+    > "Unlike conventional volume rendering, which densely samples all 3D Gaussians intersecting each ray, Q-Render sparsely samples only those with dominant influence along the ray."
