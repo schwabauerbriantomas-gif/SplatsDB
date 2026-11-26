@@ -198,7 +198,7 @@ No new routing algorithm is justified by this review alone. The necessary new co
 | LightGaussian [27] / CompGS [28] | NeurIPS 2024 / ECCV 2024 | Abstracts; significance pruning and VQ for rendering parameters |
 | 2DGS [29] / Revising Densification [30] | SIGGRAPH 2024 / ECCV 2024 | Abstracts; surface representation and error-driven density control |
 | Topo-GS [31] | arXiv preprint, 2026 | Abstract/introduction; high-dimensional projection as continuous volumes, not independently reproduced |
-| Rapp et al. [32] | IEEE TVCG 2020 | Abstract; probabilistic multivariate summaries and splatting |
+| Rapp et al. [32] | IEEE TVCG 2021; author version 2020 | Abstract; probabilistic multivariate summaries and splatting |
 | GraphSplatting [33] | Eurographics/IEEE VGTC 2001 | Primary paper; graph-to-continuous-field visualization |
 | VEG [34] | arXiv v2, 2026 | Abstract; scalar-data/transfer-function separation for scientific volumes |
 | Quantile Rendering [35] | arXiv preprint, 2025 | Abstract; high-dimensional feature rendering in 3D scenes |
