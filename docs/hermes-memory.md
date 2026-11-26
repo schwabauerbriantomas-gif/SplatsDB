@@ -138,6 +138,16 @@ sección está medido, no asumido.
   literal sigue cubriendo).
 - top_k=0 → 0 resultados (antes coerción silenciosa a 1).
 
+### Contrato /store (26-nov-2026)
+
+- Sin `embedding` en el request, el motor embebe el texto con el MISMO
+  servicio de `/recall` (:8860, `embeddinggemma-2`) y **sin prompt** — la
+  asimetría de arriba aplicada a documentos. Responde `embedding_source: "real"`.
+- Servicio de embeddings caído → **503 y no guarda nada**. No existe
+  fallback text-hash en el hub (antes guardaba un hash del texto con `200 OK`).
+- Con `embedding` en el request el vector se guarda tal cual y la respuesta
+  no lleva `embedding_source`.
+
 ### Contrato /recap
 
 - Stateless por diseño: el lookup de sesión NO existe en el hub —

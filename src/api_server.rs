@@ -27,10 +27,12 @@
 //!     (`GpuIndexKey::is_current`); any mutation (`/store`, WAL replay,
 //!     reload, compact) bumps `data_version` and the query falls through to
 //!     the batch worker (A03-F05).
-//!   - `simple_hash_embedding` hashes the text ONCE and derives the D
-//!     dimensions from a SplitMix64 PRNG (O(1) hashes instead of O(D)).
-//!     It is used when `/store` carries no `embedding` vector; that
-//!     response says so (`embedding_source: "text_hash"` and a `warning`).
+//!   - A `/store` that carries no `embedding` vector asks the embed service
+//!     for it — the same service and model `/recall` embeds queries with
+//!     (`SPLATSDB_RECALL_EMBED_URL`, default :8860, `embeddinggemma-2`),
+//!     without a prompt — and answers `embedding_source: "real"`. With no
+//!     reachable service it answers 503 and stores nothing: the HTTP server
+//!     has no text-hash fallback (fa1e528 parity).
 //!
 //! Security:
 //!   - API key authentication via SPLATSDB_API_KEY env var (optional): the
@@ -606,7 +608,6 @@ impl Durability {
                 message: "id already belongs to a different WAL entry".into(),
                 response: Some(Box::new(StoreResponse {
                     embedding_source: None,
-                    warning: None,
                     error: Some("id already belongs to a different WAL entry".into()),
                     id: id.into(),
                     status: "conflict".into(),
@@ -659,7 +660,6 @@ impl Durability {
     fn success(&self, id: &str) -> StoreResponse {
         StoreResponse {
             embedding_source: None,
-            warning: None,
             error: None,
             id: id.into(),
             status: "stored".into(),
@@ -686,7 +686,6 @@ impl Durability {
             message: message.into(),
             response: Some(Box::new(StoreResponse {
                 embedding_source: None,
-                warning: None,
                 error: Some(message.into()),
                 id: id.into(),
                 status: if may_be_persisted {
@@ -891,18 +890,12 @@ pub struct StoreResponse {
     pub error: Option<String>,
     /// "wal" (persistente en --data-dir) o "ephemeral" (sólo memoria).
     pub persistence: String,
-    /// `"text_hash"` when the request carried no `embedding` vector and the
-    /// server stored `simple_hash_embedding(text)` instead. Absent when the
-    /// client supplied the vector.
-    ///
-    /// Same key and naming as the MCP server's labels (`real`, `simcos`,
-    /// `provided`): `text_hash` names this server's own placeholder, which
-    /// is not SimCos.
+    /// `"real"` when the request carried no `embedding` vector and the
+    /// server asked the embed service for it. Absent when the client
+    /// supplied the vector. Same key and label as the MCP server uses for
+    /// vectors that came from the embed service.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedding_source: Option<&'static str>,
-    /// Plain-language notice that accompanies `embedding_source: "text_hash"`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub warning: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -1041,12 +1034,36 @@ async fn store_memory(
             ));
         }
     }
-    // A request without a vector is stored under a hash of its text. That
-    // placeholder carries no meaning, so the response says so: it used to be
-    // indistinguishable from the response of a store of a real embedding.
-    let (embedding, text_hash) = match req.embedding {
+    // A request without a vector gets one from the embed service — the same
+    // service and model `/recall` embeds queries with, so every vector in
+    // the hub lives in one space. Documents are embedded WITHOUT a prompt
+    // (the pipeline's measured asymmetry: only queries carry
+    // `Retrieval-query`). No service → 503 and nothing stored. There is no
+    // text-hash fallback (fa1e528 parity — a hash of the text ranks noise
+    // as success).
+    let (embedding, embedded_here) = match req.embedding {
         Some(vector) => (vector, false),
-        None => (simple_hash_embedding(&req.text, dim), true),
+        None => {
+            let text = req.text.clone();
+            let vector =
+                tokio::task::spawn_blocking(move || fetch_store_embedding(&text, dim))
+                    .await
+                    .map_err(|e| {
+                        error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("embed task failed: {e}"),
+                        )
+                    })?
+                    .map_err(|e| {
+                        error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!(
+                                "no embedding service: {e}. Send an `embedding` vector or start the embedding service"
+                            ),
+                        )
+                    })?;
+            (vector, true)
+        }
     };
     let arr = Array2::from_shape_vec((1, dim), embedding.clone())
         .map_err(|e| error(StatusCode::BAD_REQUEST, format!("Bad embedding shape: {e}")))?;
@@ -1124,7 +1141,6 @@ async fn store_memory(
             Some(d) => d.success(&id),
             None => StoreResponse {
                 embedding_source: None,
-                warning: None,
                 error: None,
                 id: id.clone(),
                 status: "stored".into(),
@@ -1147,9 +1163,8 @@ async fn store_memory(
             return Err((e.status, Json(body)));
         }
     };
-    if text_hash && response.status == "stored" {
-        response.embedding_source = Some("text_hash");
-        response.warning = Some(TEXT_HASH_WARNING);
+    if embedded_here && response.status == "stored" {
+        response.embedding_source = Some("real");
     }
     Ok((
         StatusCode::OK,
@@ -1243,8 +1258,8 @@ async fn search_memories(
     let rescore_gaussian = matches!(params.rescore.as_deref(), Some("gaussian"));
 
     // ── GPU exact fast path (serve --gpu): kernel PTX fused l2+topk.
-    // Exacto, sin store mutex (índice compartido &self). Rescore gaussiano y
-    // query de texto (hash embedding) siguen por el camino CPU.
+    // Exacto, sin store mutex (índice compartido &self). El rescore gaussiano
+    // sigue por el camino CPU (una query sin embedding ya salió con 400).
     //
     // A03-F05: el índice es una foto de UNA versión del dataset, así que sólo
     // puede responder mientras el store siga siendo EXACTAMENTE el dataset que
@@ -1922,18 +1937,45 @@ fn recall_qhash(text: &str) -> String {
     out.chars().take(12).collect()
 }
 
-/// OpenAI-style embed request to the Hermes embed service (:8860) with the
-/// asymmetric Retrieval-query prompt. The vector is NOT re-normalized: the
-/// hub's d² bands were calibrated against this service's raw output.
+/// Embedding of a QUERY for `/recall`: OpenAI-style request to the Hermes
+/// embed service (:8860) with the asymmetric Retrieval-query prompt. The
+/// vector is NOT re-normalized: the hub's d² bands were calibrated against
+/// this service's raw output.
 fn fetch_recall_embedding(text: &str, dim: usize) -> Result<Vec<f32>, String> {
+    embed_via_service(
+        serde_json::json!({
+            "input": [text],
+            "model": RECALL_EMBED_MODEL,
+            "prompt_name": recall_env_str("SPLATSDB_RECALL_EMBED_PROMPT", RECALL_EMBED_PROMPT_DEFAULT),
+            "dimensions": dim,
+        }),
+        dim,
+    )
+}
+
+/// Embedding of a DOCUMENT for `/store`: same service and model as the
+/// queries, and NO prompt — the pipeline embeds documents without one
+/// (docs/hermes-memory.md, "Asimetría de prompts"). Both paths read the same
+/// `SPLATSDB_RECALL_EMBED_URL`, so documents and queries cannot be pointed
+/// at two different services by mistake.
+fn fetch_store_embedding(text: &str, dim: usize) -> Result<Vec<f32>, String> {
+    embed_via_service(
+        serde_json::json!({
+            "input": [text],
+            "model": RECALL_EMBED_MODEL,
+            "dimensions": dim,
+        }),
+        dim,
+    )
+}
+
+/// POST one OpenAI-style embed request to the embed service and return
+/// `data[0].embedding`. `dim` is the dimension the request asked for; an
+/// answer of any other length is an error. Errors name the service; there is
+/// no fallback.
+fn embed_via_service(request: serde_json::Value, dim: usize) -> Result<Vec<f32>, String> {
     let url = recall_env_str("SPLATSDB_RECALL_EMBED_URL", RECALL_EMBED_URL_DEFAULT);
-    let body = serde_json::json!({
-        "input": [text],
-        "model": RECALL_EMBED_MODEL,
-        "prompt_name": recall_env_str("SPLATSDB_RECALL_EMBED_PROMPT", RECALL_EMBED_PROMPT_DEFAULT),
-        "dimensions": dim,
-    })
-    .to_string();
+    let body = request.to_string();
     let response = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(5)))
         .build()
@@ -2872,50 +2914,6 @@ fn reassemble_gpu_rows(
     Ok(per_query)
 }
 
-// ─── Embedding ────────────────────────────────────────────
-
-/// Deterministic hash-based pseudo-embedding for text.
-/// NOT a real embedding - placeholder for structure.
-/// Replace with actual model (DINOv2, BGE, etc.) in production.
-///
-/// O(1) hashes: the text is hashed ONCE and the D dimensions are derived
-/// from a SplitMix64 PRNG seeded with that hash (previously the text was
-/// re-hashed D times — O(D) hasher passes — R9 §5.1).
-///
-/// A `/store` that falls back to it is answered with
-/// `embedding_source: "text_hash"` and this warning.
-const TEXT_HASH_WARNING: &str = "The request carried no `embedding` vector: this item was stored under a hash of its \
- text, which has no meaning and will not be found by similarity to other texts. Send `embedding` from a real model \
- for anything that must be searched by meaning.";
-fn simple_hash_embedding(text: &str, dim: usize) -> Vec<f32> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    text.hash(&mut hasher);
-    // Odd, non-zero seed so SplitMix64 output is well distributed from step 0.
-    let mut state = hasher.finish() | 1;
-
-    let mut result = Vec::with_capacity(dim);
-    for _ in 0..dim {
-        // SplitMix64 finalizer step
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        result.push((z as f32 / u64::MAX as f32) * 2.0 - 1.0);
-    }
-    // Normalize
-    let norm: f32 = result.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        for x in result.iter_mut() {
-            *x /= norm;
-        }
-    }
-    result
-}
-
 // ─── API Key Authentication Middleware ────────────────────
 
 /// Authentication of a `serve` process, resolved ONCE at startup from
@@ -3670,16 +3668,102 @@ mod tests {
         dir
     }
 
-    // ── procedencia del vector: un hash del texto nunca pasa por silencio ──
+    // ── procedencia del vector: sin vector en el request, el server le pide
+    //    uno al servicio de embeddings; nunca un hash del texto ──
+
+    /// `SPLATSDB_RECALL_EMBED_URL` is process-wide: every test that sets it
+    /// takes this lock, so two of them never observe each other's value.
+    static EMBED_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn embed_env_lock() -> &'static tokio::sync::Mutex<()> {
+        &EMBED_ENV_LOCK
+    }
+
+    /// Embed requests the mock service received, in order.
+    type EmbedRequests = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// Minimal OpenAI-style embed service for tests: answers every request
+    /// with the SAME vector — `unit_vec(dimensions, 7)`, using the dimension
+    /// that came in the request — and records the request bodies so the test
+    /// can assert exactly what the server asked for.
+    fn spawn_mock_embed_service() -> (String, EmbedRequests) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock embed service");
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let requests: EmbedRequests = Default::default();
+        let seen = requests.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let head_end = loop {
+                    let Ok(n) = stream.read(&mut chunk) else {
+                        break None;
+                    };
+                    if n == 0 {
+                        break None;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(p + 4);
+                    }
+                };
+                let Some(head_end) = head_end else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                while buf.len() < head_end + len {
+                    let Ok(n) = stream.read(&mut chunk) else {
+                        break;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let body = String::from_utf8_lossy(&buf[head_end..]).to_string();
+                seen.lock().unwrap().push(body.clone());
+                let dim = serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|v| v["dimensions"].as_u64())
+                    .unwrap_or(0) as usize;
+                let mut vector = vec![0.0f32; dim];
+                if dim > 0 {
+                    vector[7 % dim] = 1.0;
+                }
+                let reply = json!({ "data": [{ "embedding": vector }] }).to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: application/json\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n{}",
+                    reply.len(),
+                    reply
+                );
+            }
+        });
+        (base, requests)
+    }
 
     #[tokio::test]
-    async fn store_without_embedding_flags_the_text_hash() {
-        // Las dos rutas: con WAL (un server con --data-dir) y efímera.
-        let (app, d) = test_app_with_durability(&temp_wal_dir("text_hash")).await;
+    async fn store_without_embedding_uses_the_embed_service() {
+        let _env = embed_env_lock().lock().await;
+        let (base, requests) = spawn_mock_embed_service();
+        std::env::set_var("SPLATSDB_RECALL_EMBED_URL", format!("{base}/v1/embeddings"));
+        // Las dos rutas de almacenamiento: con WAL (un server con --data-dir)
+        // y efímera.
+        let (app_wal, d) = test_app_with_durability(&temp_wal_dir("server_embedded")).await;
         let (app_mem, _) = test_app().await;
-        for (name, app) in [("wal", app), ("ephemeral", app_mem)] {
+        for (name, app) in [("wal", app_wal), ("ephemeral", app_mem.clone())] {
             let (status, body) = send(
-                app,
+                app.clone(),
                 "POST",
                 "/store",
                 Some(json!({ "text": "prefiere modo oscuro" })),
@@ -3687,29 +3771,96 @@ mod tests {
             .await;
             assert_eq!(status, StatusCode::OK, "{name}: {body}");
             assert_eq!(body["status"], "stored", "{name}: {body}");
-            assert_eq!(body["embedding_source"], "text_hash", "{name}: {body}");
-            let warning = body["warning"].as_str().unwrap_or_default();
-            assert!(warning.contains("has no meaning"), "{name}: {body}");
+            assert_eq!(body["embedding_source"], "real", "{name}: {body}");
+            assert_eq!(body.get("warning"), None, "{name}: {body}");
+            // Lo guardado es el vector del servicio, no un hash del texto: una
+            // búsqueda con ese vector exacto da distancia ~0.
+            let (status, body) = send(
+                app.clone(),
+                "POST",
+                "/search",
+                Some(json!({ "query": "x", "embedding": unit_vec(32, 7), "top_k": 1 })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{name}: {body}");
+            let score = body["results"][0]["score"]
+                .as_f64()
+                .unwrap_or_else(|| panic!("score is not a number: {body}"));
+            assert!(
+                score < 1e-4,
+                "{name}: the stored vector must be the service's, got distance {score}"
+            );
         }
         d.flush().expect("wal flush");
-    }
 
-    #[tokio::test]
-    async fn store_with_real_embedding_adds_no_notice() {
-        // Con un vector del cliente la respuesta no gana claves: esa ruta
-        // queda igual que antes del cambio.
-        let (app, d) = test_app_with_durability(&temp_wal_dir("real_vector")).await;
+        // Qué le pidió al servicio: el texto, el modelo, la dimensión del
+        // store, y SIN prompt (los documentos no llevan prompt).
+        let sent = requests.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            2,
+            "one embed request per stored document: {sent:?}"
+        );
+        for raw in &sent {
+            let req: Value = serde_json::from_str(raw).expect("embed request is JSON");
+            assert_eq!(req["input"], json!(["prefiere modo oscuro"]), "{req}");
+            assert_eq!(req["model"], "embeddinggemma-2", "{req}");
+            assert_eq!(req["dimensions"], 32, "the store's dimension: {req}");
+            assert_eq!(
+                req.get("prompt_name"),
+                None,
+                "documents carry no prompt: {req}"
+            );
+        }
+
+        // Con un vector del cliente la respuesta no gana claves y el servicio
+        // no es consultado: esa ruta queda igual que antes.
         let (status, body) = send(
-            app,
+            app_mem,
             "POST",
             "/store",
-            Some(json!({ "text": "vector real", "embedding": unit_vec(32, 0) })),
+            Some(json!({ "text": "vector del cliente", "embedding": unit_vec(32, 0) })),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["status"], "stored", "{body}");
         assert_eq!(body.get("embedding_source"), None, "{body}");
-        assert_eq!(body.get("warning"), None, "{body}");
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            2,
+            "a supplied vector must not call the embed service"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_without_embedding_is_503_when_the_embed_service_is_down() {
+        let _env = embed_env_lock().lock().await;
+        // URL muerta (puerto 1 → conexión rechazada de inmediato). Sin
+        // fallback: 503 y no se guarda nada, en las dos rutas.
+        std::env::set_var(
+            "SPLATSDB_RECALL_EMBED_URL",
+            "http://127.0.0.1:1/v1/embeddings",
+        );
+        let (app_wal, d) = test_app_with_durability(&temp_wal_dir("no_embed_service")).await;
+        let (app_mem, _) = test_app().await;
+        for (name, app) in [("wal", app_wal), ("ephemeral", app_mem)] {
+            let (status, body) = send(
+                app.clone(),
+                "POST",
+                "/store",
+                Some(json!({ "text": "prefiere modo oscuro" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{name}: {body}");
+            let err = body["error"].as_str().unwrap_or_default();
+            assert!(err.starts_with("no embedding service:"), "{name}: {body}");
+            assert_ne!(body["status"], "stored", "{name}: {body}");
+            let (_, status_body) = send(app, "POST", "/status", Some(json!({}))).await;
+            assert_eq!(
+                status_body["n_active"], 0,
+                "{name}: a refused store must not reach the store"
+            );
+        }
         d.flush().expect("wal flush");
     }
 
@@ -4361,27 +4512,6 @@ mod tests {
             out.push(h.await.expect("task panicked"));
         }
         out
-    }
-
-    // ── hash embedding ──────────────────────────────────────
-
-    #[test]
-    fn test_hash_embedding_properties() {
-        let dim = 64;
-        let emb = simple_hash_embedding("hello splats", dim);
-        assert_eq!(emb.len(), dim);
-        // Deterministic
-        assert_eq!(emb, simple_hash_embedding("hello splats", dim));
-        // Unit norm
-        let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-5, "expected unit norm, got {norm}");
-        // Bounded
-        assert!(emb.iter().all(|x| x.abs() <= 1.0));
-        // Different text → different embedding
-        let other = simple_hash_embedding("hello splats!", dim);
-        assert_ne!(emb, other);
-        // O(1)-hash construction must still cover the full dim
-        assert!(emb.iter().filter(|x| **x != 0.0).count() > dim / 2);
     }
 
     // ── security: non-finite embeddings (NaN/inf) are rejected ──
@@ -5238,6 +5368,7 @@ mod tests {
         // Dead URL (port 1 → immediate connection refused): the embed unit
         // returns Err and there is NO SimCos fallback in this path
         // (fa1e528 parity — a hash-text embedding ranks noise as success).
+        let _env = embed_env_lock().blocking_lock();
         std::env::set_var(
             "SPLATSDB_RECALL_EMBED_URL",
             "http://127.0.0.1:1/v1/embeddings",
@@ -5255,6 +5386,7 @@ mod tests {
         // (test_app default — same as the /store unit_vec(32, _) tests).
         // Dead embed URL → 503 with a reason, never a silent success /
         // SimCos fallback (fa1e528 parity in /recall).
+        let _env = embed_env_lock().lock().await;
         std::env::set_var(
             "SPLATSDB_RECALL_EMBED_URL",
             "http://127.0.0.1:1/v1/embeddings",
@@ -5462,7 +5594,7 @@ mod tests {
                 &app,
                 "POST",
                 "/store",
-                Some(json!({"text": format!("doc {i}")})),
+                Some(json!({"text": format!("doc {i}"), "embedding": unit_vec(32, i % 32)})),
             )
             .await;
             assert_eq!(status, StatusCode::OK, "{body}");
@@ -5480,8 +5612,13 @@ mod tests {
         assert_eq!(v["power_loss_durable"], false, "{body}");
         assert_eq!(v["wal_pending"], 31, "{body}");
         // la 32ª dispara el checkpoint: sync_all terminó ANTES de este 200
-        let (status, body) =
-            f02b_call(&app, "POST", "/store", Some(json!({"text": "doc 32"}))).await;
+        let (status, body) = f02b_call(
+            &app,
+            "POST",
+            "/store",
+            Some(json!({"text": "doc 32", "embedding": unit_vec(32, 0)})),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["durable"], true, "{body}");
@@ -5496,19 +5633,35 @@ mod tests {
     async fn f02b_store_is_503_when_the_wal_write_fails() {
         let dir = f02b_dir("wal-fail");
         let (app, d) = app_with_wal(&dir);
-        let (status, body) = f02b_call(&app, "POST", "/store", Some(json!({"text": "ok"}))).await;
+        let (status, body) = f02b_call(
+            &app,
+            "POST",
+            "/store",
+            Some(json!({"text": "ok", "embedding": unit_vec(32, 1)})),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         // fallo real en el fd: la próxima entrada se corta a los 0 bytes y se
         // reporta como write fallido (mismo inyector que los tests del WAL).
         d.wal.debug_fail_next_entry_after(0);
-        let (status, body) =
-            f02b_call(&app, "POST", "/store", Some(json!({"text": "fails"}))).await;
+        let (status, body) = f02b_call(
+            &app,
+            "POST",
+            "/store",
+            Some(json!({"text": "fails", "embedding": unit_vec(32, 2)})),
+        )
+        .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
         assert!(body.contains("WAL write failed"), "{body}");
         assert!(!body.contains("\"stored\""), "{body}");
         // el WAL sigue terminando en la última entrada completa y acepta la siguiente
-        let (status, body) =
-            f02b_call(&app, "POST", "/store", Some(json!({"text": "after"}))).await;
+        let (status, body) = f02b_call(
+            &app,
+            "POST",
+            "/store",
+            Some(json!({"text": "after", "embedding": unit_vec(32, 3)})),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(
             d.wal
@@ -5535,8 +5688,13 @@ mod tests {
         // `durability: None` es el modo efímero explícito (tests / lib);
         // `serve` con --data-dir nunca llega acá (arranque fail-closed).
         let (app, _batches) = test_app().await;
-        let (status, body) =
-            f02b_call(&app, "POST", "/store", Some(json!({"text": "ephemeral"}))).await;
+        let (status, body) = f02b_call(
+            &app,
+            "POST",
+            "/store",
+            Some(json!({"text": "ephemeral", "embedding": unit_vec(32, 4)})),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let v: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["status"], "stored", "{body}");

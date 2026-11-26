@@ -123,7 +123,15 @@ impl Drop for Running {
 }
 
 fn spawn_serve(data_dir: &Path, port: u16) -> Child {
-    let child = Command::new(env!("CARGO_BIN_EXE_splatsdb"))
+    spawn_serve_with_env(data_dir, port, &[])
+}
+
+/// `serve` with extra environment for the child. The embed tests point
+/// `SPLATSDB_RECALL_EMBED_URL` at a port nothing listens on, so they never
+/// reach a real embedding service, whatever runs on the machine.
+fn spawn_serve_with_env(data_dir: &Path, port: u16, env: &[(&str, &str)]) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_splatsdb"));
+    command
         .arg("--data-dir")
         .arg(data_dir)
         .arg("--dim")
@@ -133,9 +141,11 @@ fn spawn_serve(data_dir: &Path, port: u16) -> Child {
         .arg(port.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn splatsdb serve");
+        .stderr(Stdio::piped());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let child = command.spawn().expect("spawn splatsdb serve");
     eprintln!("[f02b] serve pid={} port={port} started", child.id());
     child
 }
@@ -249,9 +259,56 @@ fn wait_healthy(port: u16, server: &mut Running) {
     panic!("serve on :{port} never answered /health");
 }
 
+/// `POST /store` with a client-supplied unit vector (dim = DIM). Each call
+/// uses its own axis so the stored vectors stay distinct. These tests
+/// exercise durability, not embeddings: the server here has no embed
+/// service, and a request without a vector is refused (503), never stored.
 fn store(port: u16, text: &str) -> (u16, String) {
-    let body = format!(r#"{{"text":"{text}"}}"#);
+    static NEXT_AXIS: AtomicUsize = AtomicUsize::new(0);
+    let mut embedding = vec![0.0f32; DIM];
+    embedding[NEXT_AXIS.fetch_add(1, Ordering::SeqCst) % DIM] = 1.0;
+    let body = serde_json::json!({ "text": text, "embedding": embedding }).to_string();
     http(port, "POST", "/store", Some(&body)).expect("/store answered")
+}
+
+#[test]
+fn b4_store_without_a_vector_needs_the_embed_service_and_stores_nothing_without_it() {
+    let dir = scratch("b4-no-embed");
+    let port = probe_port();
+    // The child cannot reach any embed service: dead URL in ITS environment,
+    // whatever runs on this machine (:8860 included).
+    let mut server = Running(Some(spawn_serve_with_env(
+        &dir,
+        port,
+        &[(
+            "SPLATSDB_RECALL_EMBED_URL",
+            "http://127.0.0.1:1/v1/embeddings",
+        )],
+    )));
+    wait_healthy(port, &mut server);
+
+    let body = r#"{"id":"no-vector","text":"must not be stored as a hash"}"#;
+    let (code, resp) = http(port, "POST", "/store", Some(body)).expect("/store answered");
+    assert_eq!(code, 503, "no embed service must refuse the store: {resp}");
+    assert!(!resp.contains(r#""stored""#), "{resp}");
+    let v = status_json(port);
+    assert_eq!(
+        v["n_active"], 0,
+        "a refused store must not reach the store: {v}"
+    );
+
+    terminate(&mut server);
+    let (status, _out, err) = finish(server.take(), Duration::from_secs(60));
+    assert!(
+        status.success(),
+        "clean shutdown after a refused store; stderr:\n{err}"
+    );
+    let stored = wal_entries(&wal_path(&dir))
+        .iter()
+        .filter(|e| e.contains(r#""operation":"store""#))
+        .count();
+    assert_eq!(stored, 0, "a refused store must leave no WAL entry");
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

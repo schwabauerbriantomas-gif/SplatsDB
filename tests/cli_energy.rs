@@ -150,6 +150,12 @@ fn discriminating_probe(
 }
 
 fn copy_dir(src: &Path, dst: &Path) {
+    // The destination root first. A data-dir holds loose files next to
+    // directories (`.splatsdb.lock`), and the order `read_dir` yields them
+    // depends on the filesystem: a run that sees the lock file first copied
+    // it into a directory that did not exist yet (NotFound), so the test
+    // failed on some CI runners and passed on others with the same commit.
+    std::fs::create_dir_all(dst).unwrap();
     for entry in std::fs::read_dir(src).unwrap() {
         let entry = entry.unwrap();
         let target = dst.join(entry.file_name());
