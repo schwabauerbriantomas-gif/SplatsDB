@@ -4,11 +4,17 @@
 
 ### Added
 - **validation**: frozen H1/H2 splat-routing protocol, independent HTTP mirror, aggregate JSON results, raw-receipt hashes, report generator and extended 35-source primary-source SOTA, 3DGS and alternative-representation review. The learned `k=100` codebook beats a random control at the frozen endpoints; only the +8.1 pp low-scan effect clears the conservative 5-point small-sample floor. Exact top-10 distance parity is 100/100, with no material pruning at 11k×384.
+- **validation**: LongMemEval-S scope ladder on frozen MiniLM embeddings — haystack-restricted vs one global memory — plus engine parity receipts. The current engine's haystack-restricted path returns 484/500 (reference 483/500) and its unfiltered exact path equals NumPy (167/500); chunk-max global 43.0% loses to keyword search 54.6% at hit@10. The April native 0.304 is shown to match an unfiltered search, not an engine gap. The report is generated from the receipt with a sync check.
 - **validation**: frozen matched Faiss IVF policy gate and embedding-atlas harness. Faiss and the NumPy mirror agree on 800/800 recall, distance and scan comparisons; ratio, doubling and learned probing are all **NO_GO** under the predeclared rule. The PCA/UMAP atlas publishes structural metrics and density-render costs without claiming user-task or ANN quality. Harness incidents and invalid artifacts are preserved in the incident register.
 - **docs**: README repositioned around learned splat-cell routing, exact raw-vector re-scoring and explicit non-claims; MCP/graph/GPU integration is separated from splat-specific evidence.
 
 ### Changed
 - **MCP/verbatim**: HIGH/MEDIUM/LOW outputs are described as heuristic vector-distance bands, not calibrated correctness probabilities or hallucination prevention. Additive `close_or_moderate` and `diagnostic_only` fields clarify the summary; legacy `reliable` remains only for compatibility.
+- **bench**: `bench-long-mem-eval` gains `--scope wing|global` and `--dump`. Default behaviour and legacy JSON keys are unchanged; the wing scope is documented as the benchmark shortcut it is.
+- **docs**: README and BENCHMARKS label the 96.6% LongMemEval figure as haystack-restricted and record the 2026-11-26 re-measurement next to the unchanged 2026-04-09 numbers.
+
+### Fixed
+- README documented a non-existent `bench-longmemeval` subcommand (the CLI name is `bench-long-mem-eval`), and `benchmark_reproducible.py::run_longmemeval_benchmark` returned hardcoded numbers with `code_reproducible: True` while carrying throughput figures withdrawn on 2026-10-25. It is now an explicit placeholder that reads the stored result files and measures nothing; the CLI no longer prints its integrity banner over a run in which nothing was measured.
 
 ## [v2.11.0] - 2026-11-22
 

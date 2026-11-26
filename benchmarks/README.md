@@ -72,6 +72,10 @@ export NUMEXPR_NUM_THREADS=1 RAYON_NUM_THREADS=1
 python benchmarks/benchmark_ivf.py --workdir "$SPLATSDB_WORKDIR" --output bench-data/ivf_policy_results.json
 python benchmarks/build_embedding_atlas.py --workdir "$SPLATSDB_WORKDIR" --output bench-data/embedding_atlas_results.json --png assets/atlas/embedding_atlas.png
 python benchmarks/report_ivf_atlas.py --ivf bench-data/ivf_policy_results.json --atlas bench-data/embedding_atlas_results.json --output-dir docs/validation --check
+
+# LongMemEval-S scope ladder (within-haystack vs global; NumPy + SQLite FTS5) and report sync
+python benchmarks/longmemeval_scope.py --dataset longmemeval_s_cleaned.json --cache-dir /tmp/lm_cache
+python benchmarks/report_longmemeval_scope.py --check
 ```
 
 The workdir must reproduce the frozen corpus, queries, centroids and cell files listed in [the protocol](../docs/validation/ivf-atlas-protocol.md). See [IVF results](../docs/validation/ivf-policy.md) and [atlas results](../docs/validation/embedding-atlas.md). These are CPU structural/policy experiments, not production-QPS benchmarks.

@@ -13,6 +13,7 @@
 | [validation/ivf-policy.md](validation/ivf-policy.md) | Faiss/mirror parity, fixed and adaptive probing receipts, NO_GO verdicts |
 | [validation/embedding-atlas.md](validation/embedding-atlas.md) | PCA/UMAP structural metrics, density-render limits and reproducibility |
 | [validation/ivf-atlas-incidents.md](validation/ivf-atlas-incidents.md) | Harness incidents and preserved invalid artifacts; no protocol changes |
+| [validation/longmemeval-scope.md](validation/longmemeval-scope.md) | LongMemEval-S haystack-restricted vs global scope, engine parity, April attribution corrected |
 
 ## Benchmark documentation policy
 

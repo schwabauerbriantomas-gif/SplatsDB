@@ -458,6 +458,14 @@ pub enum Commands {
         /// Over-fetch multiplier
         #[arg(long, default_value = "3")]
         over_fetch: usize,
+        /// Search scope: "wing" (default; pre-filter to the question's own
+        /// haystack — a benchmark shortcut) or "global" (whole store, no
+        /// filter — what an agent's single memory can do)
+        #[arg(long, value_parser = ["wing", "global"], default_value = "wing")]
+        scope: String,
+        /// Optional JSONL file with the per-query row indices returned by the engine
+        #[arg(long)]
+        dump: Option<PathBuf>,
     },
 }
 
@@ -745,6 +753,8 @@ pub fn dispatch(cli: Cli) {
             k,
             ef_search,
             over_fetch,
+            scope,
+            dump,
         } => bench_longmemeval::cmd_bench_longmemeval(
             sessions.to_string_lossy().to_string(),
             queries.to_string_lossy().to_string(),
@@ -752,6 +762,8 @@ pub fn dispatch(cli: Cli) {
             k,
             ef_search,
             over_fetch,
+            scope,
+            dump,
         ),
     }
 }

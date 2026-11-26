@@ -442,15 +442,15 @@ On synthetic data HNSW delivers **~875× speedup** over linear scan at 10K. Real
 
 ### LongMemEval Agent Memory Benchmark
 
-<p align="center"><img src="assets/splatsdb-longmemeval.png" alt="LongMemEval retrieval-only results: NumPy brute-force reference clearly separated from the lower-recall SplatsDB native pipeline" width="900"/></p>
+<p align="center"><img src="assets/splatsdb-longmemeval.png" alt="LongMemEval retrieval-only results (2026-04-09): NumPy brute-force reference in the haystack-restricted scope and the SplatsDB native run, overall and by question type" width="900"/></p>
 
-> Chart regenerated 2026-11-26 in HTML/CSS — [standalone source](assets/charts/longmemeval.html), [shared theme](assets/charts/theme.css). It shows the NumPy reference and native pipeline side by side, including per-question-type recall; the 96.6% figure is **not** native-engine recall.
+> Chart regenerated 2026-11-26 in HTML/CSS — [standalone source](assets/charts/longmemeval.html), [shared theme](assets/charts/theme.css). It shows the NumPy reference and native pipeline side by side, including per-question-type recall; the 96.6% figure is **not** native-engine recall. Both rows are **haystack-restricted**: each question is ranked inside its own ~48 sessions. Re-measured 2026-11-26 without that restriction, the same vectors give 33.4% hit@10 ([scope report](docs/validation/longmemeval-scope.md)).
 
 > [LongMemEval](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned) is the standard benchmark for evaluating long-term conversational memory in AI agents. Tests retrieval across 500 questions, each with ~48 sessions and ~490 turns.
 
 **Pipeline**: Embed all ~24K sessions with `all-MiniLM-L6-v2` (384d, GPU RTX 3090) → cosine similarity search → measure if answer session appears in top-k.
 
-> **Honest methodology note**: The recall numbers below were measured with **NumPy brute-force cosine similarity** (see [`longmemeval_full_results.json`](bench-data/longmemeval_full_results.json)), not SplatsDB's own HNSW. They validate the *retrieval approach* (embeddings + cosine), not SplatsDB's search engine specifically. A separate run using SplatsDB's native Rust HNSW ([`longmemeval_splatdb_native.json`](bench-data/longmemeval_splatdb_native.json)) showed recall@10 = 0.304 — see that file for details on why native HNSW recall is lower (session-grouping and ef_search tuning differ).
+> **Honest methodology note**: The recall numbers below were measured with **NumPy brute-force cosine similarity** (see [`longmemeval_full_results.json`](bench-data/longmemeval_full_results.json)), not SplatsDB's own HNSW. They validate the *retrieval approach* (embeddings + cosine), not SplatsDB's search engine specifically. A separate run using SplatsDB's native Rust HNSW ([`longmemeval_splatdb_native.json`](bench-data/longmemeval_splatdb_native.json)) showed recall@10 = 0.304. **Update 2026-11-26**: the earlier explanation (session grouping, ef_search tuning) is superseded by measurement. On the same dataset and model, the engine's haystack-restricted path returns 96.8% (reference 96.6%), and the 0.304 pattern corresponds to a search **without** the haystack restriction (33.4% with the same vectors) — see [`docs/validation/longmemeval-scope.md`](docs/validation/longmemeval-scope.md).
 
 **Session Recall** (answer session found in top-k, NumPy brute-force):
 
@@ -472,7 +472,7 @@ On synthetic data HNSW delivers **~875× speedup** over linear scan at 10K. Real
 | temporal-reasoning | 133 | 95.5% |
 | single-session-user | 70 | 88.6% |
 
-**What this validates**: With real sentence embeddings, the retrieval approach achieves **96.6% recall@10** on conversational memory retrieval. The system excels at knowledge-update (100%) and multi-session queries (99.2%). Temporal-reasoning (95.5%) and preference questions (96.7%) — where the original keyword baseline showed 30% and 0% — are dramatically improved by semantic search.
+**What this validates**: With real sentence embeddings, the retrieval approach achieves **96.6% recall@10** on conversational memory retrieval. The system excels at knowledge-update (100%) and multi-session queries (99.2%). Temporal-reasoning (95.5%) and preference questions (96.7%) — where the original keyword baseline showed 30% and 0% — are dramatically improved by semantic search. Scope: these figures rank each question inside its own ~48 sessions; over one global memory of 19,195 sessions the same vectors reach 33.4% hit@10, below keyword search (54.6%) — see [`docs/validation/longmemeval-scope.md`](docs/validation/longmemeval-scope.md).
 
 > **Comparison caveat**: the paper's best of 86.2% measures **end-to-end systems** (retrieval + reading + answer extraction); SplatsDB's 96.6% measures **retrieval only** (answer session in top-k). The two numbers are not like-for-like — retrieval-only is an easier task. We report both and do not claim a system-level win.
 
@@ -778,7 +778,7 @@ Verbatim text storage, AAAK text compression, and the remaining benchmark comman
 | `compress-bench --size small\|medium\|large` | Measure AAAK compression ratio on sample text |
 | `decompress --data <hex>` | Decompress AAAK binary data (hex-encoded) back to semantic text |
 | `bench-gaussian -n 100000 -q 100 -k 10 [-s 42] [--hnsw-m 16] [--hnsw-ef-construction 200] [--hnsw-ef-search 50] [--candidate-mult 10] [--out results.json] [--gt-out gt.bin]` | A/B benchmark: κ-weighted Gaussian ranking vs pure L2 (synthetic splats) |
-| `bench-longmemeval --sessions sessions.bin --queries queries.bin --meta meta.json [-k 10] [--ef-search 100] [--over-fetch 3]` | LongMemEval with the native pipeline (spatial filter + vector search) |
+| `bench-long-mem-eval --sessions sessions.bin --queries queries.bin --meta meta.json [-k 10] [--ef-search 100] [--over-fetch 3] [--scope wing\|global] [--dump dump.jsonl]` | LongMemEval with the native pipeline. `--scope wing` (default) restricts candidates to the question's own haystack — a benchmark shortcut; `--scope global` searches the whole store with no filter |
 
 ### Spatial Memory Commands
 
@@ -1513,7 +1513,7 @@ Spatial memory has an initial implementation. The building blocks exist:
 
 These are integration and architecture differences, not a universal ranking against other databases.
 
-1. **Spatial labels and learned splat cells** — Wing/Room/Hall/Tunnel labels, MCP and splat routing can be used in one self-hosted runtime. No universal uniqueness claim is made. The LongMemEval **96.6% recall@10** figure is a NumPy brute-force reference, not native SplatsDB recall, and is not directly comparable with scores from the original paper under another pipeline.
+1. **Spatial labels and learned splat cells** — Wing/Room/Hall/Tunnel labels, MCP and splat routing can be used in one self-hosted runtime. No universal uniqueness claim is made. The LongMemEval **96.6% recall@10** figure is a NumPy brute-force reference, not native SplatsDB recall, and is not directly comparable with scores from the original paper under another pipeline. It is also haystack-restricted: each question is ranked inside its own ~48 sessions; without that restriction the same vectors give 33.4% hit@10 ([measured 2026-11-26](docs/validation/longmemeval-scope.md)).
 2. **MCP surface** — 18 tools are available for MCP-compatible agents. Integration effort still depends on the host, embeddings and deployment.
 3. **Embedded Rust runtime** — CLI, Rust library and MCP server surfaces share the same binary; some competitors are primarily client-server, while others also offer embedded modes.
 4. **Self-hosted cost model** — no SplatsDB cloud usage fee; hardware, embedding, operations and evaluation costs remain.

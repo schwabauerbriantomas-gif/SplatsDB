@@ -207,50 +207,55 @@ def run_ann_benchmark(dataset_name: str, config: dict):
 
 def run_longmemeval_benchmark():
     """
-    Run LongMemEval with full transparency.
-    
-    Methodology:
-    1. Download LongMemEval-cleaned from HuggingFace
-    2. Generate embeddings with all-MiniLM-L6-v2
-    3. Index all session embeddings
-    4. For each question, search top-k and check if gold answer is in results
-    5. Report Recall@1, @5, @10 by category
-    
-    NO HARDCODING. NO QUESTION-SPECIFIC FIXES.
+    LongMemEval-S — PLACEHOLDER: this function measures nothing.
+
+    It runs no embedding, no index and no search. Earlier versions returned
+    stored numbers under a "NO HARDCODING" docstring, pointed to a runner in
+    benches/ that does not exist, and carried throughput figures that
+    BENCHMARKS.md withdrew on 2026-10-25.
+
+    Reproducible runners:
+      benchmarks/longmemeval_scope.py               NumPy + SQLite FTS5 scope ladder
+      splatsdb bench-long-mem-eval --scope global  engine, whole store, no filter
+    Results and receipts: docs/validation/longmemeval-scope.md
     """
+    bench = Path(__file__).resolve().parents[1] / "bench-data"
     results = {
         "benchmark": "LongMemEval-cleaned",
-        "methodology": "Standard evaluation, no hardcoding",
+        "methodology": "PLACEHOLDER: nothing is run by this function",
         "model": "all-MiniLM-L6-v2",
         "embedding_dims": 384,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "measured_by_this_function": False,
     }
-    
+
     print("\n[LongMemEval Benchmark]")
-    print("Method: Embed sessions → search with question → check gold in top-k")
-    print("NO question-specific hardcoding. NO tuned parameters after seeing results.")
-    
-    # This is a placeholder — the actual benchmark runner is in benches/
-    # Results from our published run:
-    results["published"] = {
-        "recall_at_1": 0.758,
-        "recall_at_5": 0.922,
-        "recall_at_10": 0.966,
-        "p50_ms": 0.029,
-        "qps": 3125,
-        "questions": 500,
-        "sessions": 24146,
-        "k_search": 10,
-        "categories": {
-            "knowledge-update": {"n": 78, "recall_10": 1.0},
-            "multi-session": {"n": 133, "recall_10": 0.992},
-            "single-session-assistant": {"n": 56, "recall_10": 0.982},
-            "single-session-preference": {"n": 30, "recall_10": 0.967},
-            "temporal-reasoning": {"n": 133, "recall_10": 0.955},
-            "single-session-user": {"n": 70, "recall_10": 0.886},
+    print("PLACEHOLDER: this function does not run anything.")
+    print("Runners: benchmarks/longmemeval_scope.py; splatsdb bench-long-mem-eval --scope global")
+
+    def load(name):
+        path = bench / name
+        return json.loads(path.read_text()) if path.exists() else None
+
+    # Numbers below are READ from stored result files; none is produced here.
+    stored = {}
+    reference = load("longmemeval_full_results.json")
+    if reference:
+        stored["numpy_reference_2026_04_09"] = {
+            "date": reference.get("date"),
+            "search_method": reference.get("search_method"),
+            "scope": "haystack-restricted: each question is ranked inside its own sessions",
+            "recall": {k: v for k, v in reference.get("recall", {}).items() if k in ("recall@1", "recall@5", "recall@10")},
+            "latency_ms": reference.get("latency_ms"),
         }
-    }
-    
+    scope = load("longmemeval_scope_results.json")
+    if scope:
+        stored["scope_ladder_2026_11_26"] = {
+            "scope": "within = the question's own haystack; global = all unique sessions, no filter",
+            "hit@10": {name: entry["@10"] for name, entry in scope["ladder"].items()},
+        }
+    results["stored_read_from_result_files"] = stored
+
     results["integrity_checklist"] = {
         "hardcoded_questions": False,
         "k_search_equals_pull_size": False,
@@ -259,11 +264,11 @@ def run_longmemeval_benchmark():
         "anonymous_authors": False,
         "methodology_published": True,
         "code_reproducible": True,
+        "reproducible_runner": "benchmarks/longmemeval_scope.py; splatsdb bench-long-mem-eval --scope global",
+        "measured_by_this_function": False,
     }
-    
+
     return results
-
-
 
 def run_beir_benchmark(datasets=None):
     """
@@ -1287,9 +1292,17 @@ def main():
         json.dump(all_results, f, indent=2)
 
     print(f"\nResults saved to {args.output}")
-    print("\n⚠️  INTEGRITY: These benchmarks were run with NO hardcoding,")
-    print("   NO question-specific fixes, and NO post-hoc parameter tuning.")
-    print("   Full methodology is documented in this script.")
+    placeholders = sorted(k for k, v in all_results.items() if isinstance(v, dict) and v.get("measured_by_this_function") is False)
+    meta_keys = ("tool", "version", "philosophy", "hardware", "timestamp")
+    measured = [k for k in all_results if k not in meta_keys and not k.endswith("_error") and k not in placeholders]
+    if not measured:
+        print("\n⚠️  NOTHING WAS MEASURED in this run. Placeholder suites: " + ", ".join(placeholders))
+    else:
+        print("\n⚠️  INTEGRITY: These benchmarks were run with NO hardcoding,")
+        print("   NO question-specific fixes, and NO post-hoc parameter tuning.")
+        print("   Full methodology is documented in this script.")
+        if placeholders:
+            print("   Placeholder suites that measured nothing: " + ", ".join(placeholders))
 
 
 if __name__ == "__main__":
