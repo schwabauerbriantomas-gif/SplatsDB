@@ -379,9 +379,9 @@ All numbers are measured on real hardware. Exact QPS figures are only comparable
 
 HNSW graph with persistence (save/load to `hnsw_index.bin`), exact L2 distance re-ranking of candidates.
 
-> **Measured 2026-07-05** with the built-in `bench-hnsw` CLI on synthetic SIFT-like data. Ground truth: brute-force L2 (NumPy). **Raw run output not preserved** — no result file backing this table exists on this branch (the validated JSON from commit `ab81716` lives on `main` and is not present here).
+> **No preserved artifact backs this table.** The figures below are the July 2026 built-in `bench-hnsw` numbers on synthetic SIFT-like data (ground truth: brute-force L2 in NumPy), transcribed without a result file. `bench-data/hnsw_validated_results.json` is in no commit of this repository, and an earlier version of the note below said the table was from April; both corrected in the [integrity audit](docs/validation/integrity-audit.md).
 
-> **Provenance caveat**: the figures below come from April 2026 `bench-hnsw` runs whose raw output was not preserved as a result file on this branch. The maintainer's later validated re-run (commit `ab81716` on `main`, synthetic SIFT-like data, JSON `bench-data/hnsw_validated_results.json` — not present on this branch) measured lower numbers: 789 QPS / recall@10 0.861 at 10K, 242 QPS at 100K, on synthetic uniform-random data. Treat the table below as indicative until re-run with persisted results. **Note**: [BENCHMARKS.md §3](BENCHMARKS.md#3-splatsdb-hnsw-standalone-k10) shows the April figures as its headline (1,054 QPS / 0.998 at 10K) — neither table has a preserved raw artifact on this branch; they are different runs (April real-SIFT vs July synthetic) and not comparable with each other.
+> **Provenance caveat**: the figures below are those of the July synthetic run (789 QPS / recall@10 0.861 at 10K, 242 QPS at 100K); an earlier version of this note attributed the table to April. No result file of that run is in any commit of this repository (`bench-data/hnsw_validated_results.json` does not exist in its history), and the table has not been re-run. Treat it as indicative until re-run with persisted results. **Note**: [BENCHMARKS.md §3](BENCHMARKS.md#3-splatsdb-hnsw-standalone-k10) shows the April figures as its headline (1,054 QPS / 0.998 at 10K) — neither table has a preserved raw artifact on this branch; they are different runs (April real-SIFT vs July synthetic) and not comparable with each other.
 
 | Dataset | N | Dim | Build Time | p50 Latency | p95 | p99 | QPS | Recall@10 |
 |---------|-------|-----|-----------|-------------|------|------|------|-----------|
@@ -472,13 +472,13 @@ On synthetic data HNSW delivers **~875× speedup** over linear scan at 10K. Real
 | temporal-reasoning | 133 | 95.5% |
 | single-session-user | 70 | 88.6% |
 
-**What this validates**: With real sentence embeddings, the retrieval approach achieves **96.6% recall@10** on conversational memory retrieval. The system excels at knowledge-update (100%) and multi-session queries (99.2%). Temporal-reasoning (95.5%) and preference questions (96.7%) — where the original keyword baseline showed 30% and 0% — are dramatically improved by semantic search. Scope: these figures rank each question inside its own ~48 sessions; over one global memory of 19,195 sessions the same vectors reach 33.4% hit@10, below keyword search (54.6%) — see [`docs/validation/longmemeval-scope.md`](docs/validation/longmemeval-scope.md).
+**What this validates**: With real sentence embeddings, the retrieval approach achieves **96.6% recall@10** on conversational memory retrieval. The system excels at knowledge-update (100%) and multi-session queries (99.2%). Temporal-reasoning (95.5%) and preference questions (96.7%). The sentence that used to sit here claimed these two types were "dramatically improved" over an original keyword baseline of 30% and 0%; it was withdrawn on 2026-11-26 because that baseline file contradicts itself (91.0% overall against 0 in every per-type entry; see the [integrity audit](docs/validation/integrity-audit.md)). Measured on the same data, a keyword baseline (SQLite FTS5) reaches **99.2%** inside each question's own sessions (temporal 99.2%, preference 96.7%) and **54.6%** over one global memory of 19,195 sessions, where these head vectors reach 33.4% hit@10 and turn-aligned chunk-max 43.0%. Scope: the 96.6% above ranks each question inside its own ~48 sessions; see [`docs/validation/longmemeval-scope.md`](docs/validation/longmemeval-scope.md).
 
 > **Comparison caveat**: the paper's best of 86.2% measures **end-to-end systems** (retrieval + reading + answer extraction); SplatsDB's 96.6% measures **retrieval only** (answer session in top-k). The two numbers are not like-for-like — retrieval-only is an easier task. We report both and do not claim a system-level win.
 
 - Full results: `bench-data/longmemeval_full_results.json`
-- Benchmark script: `bench-data/longmemeval_full.py`
-- Previous keyword baseline: `bench-data/longmemeval_baseline_results.json`
+- Benchmark script: the 2026-04-09 runner is not in the repository; the published runner is [`benchmarks/longmemeval_scope.py`](benchmarks/longmemeval_scope.py)
+- Previous keyword baseline: `bench-data/longmemeval_baseline_results.json` — internally inconsistent (91.0% overall against 0 in every per-type entry); not citable. The working keyword baseline is in [`bench-data/longmemeval_scope_results.json`](bench-data/longmemeval_scope_results.json)
 
 #### Adapted M3 context-reduction evaluation — independent rerun
 
@@ -540,13 +540,13 @@ All extended kernels use float4 vectorized loads, shared memory caching, and `__
 
 ### Published Benchmarks (BEIR / LOCOMO / MemoBench-style)
 
-The following benchmarks are implemented in [`benchmarks/benchmark_reproducible.py`](benchmarks/benchmark_reproducible.py) and executed with persisted results in `bench-data/` (full tables below and in [Reproducible Benchmarks](#reproducible-benchmarks)). MemoBench-style is synthetic (seed=42, deterministic) pending release of the official dataset.
+The following benchmarks are implemented in [`benchmarks/benchmark_reproducible.py`](benchmarks/benchmark_reproducible.py) and executed with persisted results in `bench-data/` (full tables below and in [Reproducible Benchmarks](#reproducible-benchmarks)). MemoBench-style is synthetic (seed=42, deterministic) pending release of the official dataset. The check marks below mean only that a result file exists for the suite: none of them is a product validation, and a number is only as meaningful as its sample (MemoBench-style has 15 questions).
 
 | Benchmark | Domain | What It Tests | Status |
 |-----------|--------|---------------|--------|
 | **BEIR** | 5 IR domains (scifact, trec-covid, fiqa, arguana, nfcorpus) | Standard information retrieval: NDCG@10, Recall@10, MAP across diverse text corpora | ✅ 0.461 NDCG@10 |
 | **LOCOMO** | Long-form conversational memory | Cross-session recall in multi-turn dialogs with temporal/counterfactual/causal reasoning | ✅ 68.2% Recall@10 |
-| **MemoBench-style** | Multi-agent dialog memory | Cross-session recall of agent preferences and facts (synthetic data — labeled accordingly) | ✅ 100% Recall@10 |
+| **MemoBench-style** | Multi-agent dialog memory | Cross-session recall of agent preferences and facts (synthetic data — labeled accordingly) | ✅ 100% Recall@10 on 15 synthetic questions — illustrative, not a validation |
 
 **BEIR** uses the standard evaluation protocol from [beir.ai](https://github.com/beir-cellar/beir) — no per-dataset tuning, no cherry-picking domains. The implementation downloads datasets, encodes with `all-MiniLM-L6-v2`, builds Faiss index, and computes NDCG@10, Recall@10, MAP using pytrec-eval.
 
@@ -554,7 +554,7 @@ The following benchmarks are implemented in [`benchmarks/benchmark_reproducible.
 
 **Source:** `bench-data/beir_results.json`
 
-| Domain | Corpus | Queries | NDCG@10 | Recall@10 | MAP@10 | QPS |
+| Domain | Corpus | Queries | NDCG@10 | Recall@10 | MAP@10 | QPS (search only) |
 |--------|--------|---------|---------|-----------|--------|------|
 | scifact | 5,183 | 300 | **0.645** | **0.783** | **0.596** | 6,990 |
 | arguana | 8,674 | 1,406 | 0.502 | **0.790** | 0.412 | 6,416 |
@@ -562,6 +562,8 @@ The following benchmarks are implemented in [`benchmarks/benchmark_reproducible.
 | fiqa | 57,638 | 648 | 0.369 | 0.441 | 0.291 | 1,031 |
 | nfcorpus | 3,633 | 323 | 0.316 | 0.155 | 0.111 | 13,683 |
 | **Average** | | | **0.461** | **0.437** | **0.284** | 5,681 |
+
+> The QPS column times only the Faiss `index.search` call. Encoding the queries, encoding the corpus and building the index are excluded.
 
 **LOCOMO** ([KimmoZZZ/locomo on HuggingFace](https://huggingface.co/datasets/KimmoZZZ/locomo)) evaluates long-form conversational memory across 19 sessions per conversation, with QA pairs spanning factoid, temporal, counterfactual, and causal categories.
 
@@ -1040,7 +1042,7 @@ Requires a data-dir with a persisted field (`field/members.idx`, `field/radii.bi
 
 Phase 1 can run on the PTX kernel (`--gpu` in the CLI): cluster winners are identical to CPU (30/30), but per-invocation context+upload overhead (~330 ms) makes it only worthwhile as a **resident** index in a long-running server with large K. At this scale the exact mode is the right default; two-phase pays off when K grows and the raw vectors can't stay in fast memory.
 
-> **Note**: The default HTTP server uses SimCos hash-based pseudo-embeddings (trigram hashing — no semantic understanding). For production use, provide real embeddings from a model (e.g. OpenAI, Cohere, MiniLM, BGE) via the `embedding` field.
+> **Note**: The default HTTP server stores hash-based pseudo-embeddings when the request carries no `embedding` vector (`simple_hash_embedding`: one hash of the text seeds a PRNG that fills the dimensions — no semantic understanding, and the `status: "stored"` response does not flag it; the CLI's verbatim commands use a different stand-in, `simcos_embed`, trigram hashing). For production use, provide real embeddings from a model (e.g. OpenAI, Cohere, MiniLM, BGE) via the `embedding` field.
 
 ---
 
@@ -1576,24 +1578,25 @@ The 8 chaos tests cover: concurrent stress (10 threads × 1 000 ops), memory pre
 
 ## Reproducible Benchmarks
 
-All benchmarks can be reproduced independently. Full code in [`benchmarks/benchmark_reproducible.py`](benchmarks/benchmark_reproducible.py).
+The script [`benchmarks/benchmark_reproducible.py`](benchmarks/benchmark_reproducible.py) runs the BEIR, LoCoMo and MemoBench-style suites and the ANN-Benchmarks baselines, and records on every result whether it was measured in that run and on which machine. Two limits: its `longmemeval` suite is a placeholder that runs nothing (the runners are listed in its docstring), and its `ann` suite measures a NumPy exact reference and Faiss indexes — it does not run SplatsDB.
 
 ```bash
-# Run full suite (ANN-Benchmarks + LongMemEval)
+# Run every suite. The longmemeval suite is a placeholder; a run that measures nothing exits with code 2.
 python benchmarks/benchmark_reproducible.py --suite all
 
-# Run single dataset
-python benchmarks/benchmark_reproducible.py --suite ann --dataset sift-128-euclidean
+# ANN baselines only: NumPy exact reference + Faiss, downloaded from ann-benchmarks.com.
+# No SplatsDB number comes out of this suite.
+python benchmarks/benchmark_reproducible.py --suite ann --dataset nytimes-256-angular
 ```
 
 ### Benchmark Suite
 
 | Benchmark | What it tests | Status |
 |-----------|--------------|--------|
-| [ANN-Benchmarks](https://ann-benchmarks.com) | Vector search quality (SIFT, GloVe, NYTimes) | ✅ Published |
+| [ANN-Benchmarks](https://ann-benchmarks.com) | Vector search (SIFT, GloVe, NYTimes) | ⚠️ Baselines only, none of SplatsDB: NYTimes = NumPy + Faiss (`bench-data/ann_nytimes_receipt.json`); SIFT and GloVe = two result files with no producing script in this repository |
 | [BEIR](https://github.com/beir-cellar/beir) | Information retrieval (5 domains) | ✅ Published |
 | [LOCOMO](https://arxiv.org/abs/2402.10790) | Long-form conversational memory | ✅ Published |
-| MemoBench (synthetic) | Multi-agent dialog memory | ✅ Published |
+| MemoBench-style (synthetic, 15 questions) | Multi-agent dialog memory | ✅ Result file published — illustrative |
 | [LongMemEval](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned) | Agent memory recall | ✅ Retrieval benchmark published |
 
 ### BEIR Information Retrieval
@@ -1640,7 +1643,7 @@ After v2, we tested 4 alternative approaches to identify what actually improves 
 | **BGE-base (larger model)** | **0.5806** | **+0.0299** | ✅ Best improvement |
 | BM25 + RRF fusion | ~0.55 | ~0 | Neutral on semantic queries |
 
-Key insight: the biggest improvement (+3% NDCG) comes from using a better embedding model, not from retrieval tricks. This confirms the bottleneck is the *semantic gap* — the embedding model's ability to match query intent with document content.
+Directional reading only, because the rows above have no preserved artifact: the largest gain (+3% NDCG) came from a larger embedding model rather than from retrieval tricks, which *suggests* that the embedding model is the bottleneck. It confirms nothing until re-run with a persisted result file.
 
 ### LOCOMO Conversational Memory
 
@@ -1657,7 +1660,7 @@ Key insight: the biggest improvement (+3% NDCG) comes from using a better embedd
 
 **Source**: v1 — `bench-data/locomo_results.json`; v2 — `bench-data/locomo_v2_results.json` (both run 2026-04-11; 1,982 questions, 10 conversations).
 
-v2 used BGE-small + session-level retrieval + BM25 hybrid via RRF (measured 2026-04-11 with modules removed in v2.7.2 — kept for provenance). The +19% improvement on temporal queries showed BM25 helps when queries contain specific keywords (dates, names).
+v2 used BGE-small + session-level retrieval + BM25 hybrid via RRF (measured 2026-04-11 with modules removed in v2.7.2 — kept for provenance). Temporal queries went from 31.8% to 50.8% (+19.0 points) between v1 and v2. The gain cannot be attributed to BM25 alone: v2 changed three things at once — model, session-level retrieval and BM25 fusion (`v2_changes` in `bench-data/locomo_v2_results.json`) — so the hybrid's own contribution is not isolated.
 
 ### HotpotQA Multi-hop Reasoning
 
@@ -1685,7 +1688,7 @@ We publish negative results because they're more valuable than positive ones. Th
 
 | Technique | Tested on | Metric Δ | Why it failed |
 |-----------|-----------|-------------|---------------|
-| Graph traversal | scifact, arguana | 0.0000 | Dense already finds relevant docs; graph expansion adds topologically-connected but irrelevant docs |
+| Graph traversal | scifact (the result file covers scifact only) | 0.0000 | NDCG@10 is 0.72 in the baseline arm and 0.72 in the graph arm (`bench-data/ab_test_results.json`): at the stored precision the metric did not change. The harness is a Python mirror of the Rust feature and applies a boost of at most 0.02 on cosine scores, so it cannot tell "the graph adds nothing" from "the boost is too small to matter"; the earlier explanation ("adds irrelevant docs") is not what the artifact shows |
 | Query expansion via entities | scifact, arguana | -0.0474 | Weighted average of query + entity embeddings dilutes original query signal |
 | Full-text cross-encoder | scifact | -0.1511 | BEIR docs > 512 tokens → model truncates → loses key evidence |
 | Title-only cross-encoder | scifact, arguana, nfcorpus | -0.4085 | BEIR titles are paper names, not content descriptions; queries match body text |

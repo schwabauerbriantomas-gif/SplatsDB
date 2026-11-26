@@ -2,22 +2,25 @@
 """
 SplatsDB Reproducible Benchmark Suite
 ======================================
-This script runs ALL benchmarks with published methodology.
-No cherry-picking. No hardcoding. Full transparency.
+This script runs the benchmark suites. The methodology is declared in this source;
+each result records its own provenance (elapsed time, completion time, machine).
 
 Requirements:
   pip install faiss-cpu sentence-transformers numpy
 
-Hardware used for published results:
+Hardware recorded in the result files stored in bench-data/ (run 2026-04-11):
   CPU: AMD Ryzen 5 3400G (4C/8T)
   GPU: NVIDIA RTX 3090 (24GB VRAM)
   RAM: 16GB DDR4
   OS: Windows 11 (GPU) / WSL2 Ubuntu (CPU)
+A run made with the current script records the machine it actually ran on, detected at run time.
 
 Usage:
   python benchmark_reproducible.py --suite [ann|beir|longmemeval|all]
 """
 
+import os
+import platform
 import json
 import time
 import argparse
@@ -30,27 +33,60 @@ from pathlib import Path
 
 ANN_DATASETS = {
     "sift-128-euclidean": {
-        "url": "https://huggingface.co/datasets/ann-benchmarks/sift-128-euclidean/resolve/main/sift-128-euclidean.hdf5",
+        "url": "https://ann-benchmarks.com/sift-128-euclidean.hdf5",
         "metric": "euclidean",
         "description": "SIFT descriptors, 1M vectors, 128 dimensions",
         "k": 10,
         "note": "Standard ANN-Benchmarks dataset"
     },
     "glove-100-angular": {
-        "url": "https://huggingface.co/datasets/ann-benchmarks/glove-100-angular/resolve/main/glove-100-angular.hdf5",
+        "url": "https://ann-benchmarks.com/glove-100-angular.hdf5",
         "metric": "angular",
         "description": "GloVe word vectors, 1.2M vectors, 100 dimensions",
         "k": 10,
         "note": "Standard text embedding benchmark"
     },
     "nytimes-256-angular": {
-        "url": "https://huggingface.co/datasets/ann-benchmarks/nytimes-256-angular/resolve/main/nytimes-256-angular.hdf5",
+        "url": "https://ann-benchmarks.com/nytimes-256-angular.hdf5",
         "metric": "angular",
         "description": "NYTimes article embeddings, 290K vectors, 256 dimensions",
         "k": 10,
         "note": "Standard document retrieval benchmark"
     },
 }
+
+
+def _unit_rows(vectors):
+    """Scale every row to unit norm; a zero row stays zero instead of becoming NaN."""
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    return vectors / np.where(norms == 0, 1.0, norms)
+
+
+def _recall_at_k(found, ground_truth):
+    """Mean fraction of the stored ground-truth neighbours recovered, per query."""
+    per_query = [len(set(map(int, row)) & set(map(int, truth))) / len(truth) for row, truth in zip(found, ground_truth)]
+    return float(np.mean(per_query))
+
+
+def exact_topk_blockwise(test, train, k, angular, block=256):
+    """Exact top-k for every query, one block of queries at a time.
+
+    Angular: rank by inner product of unit vectors. Euclidean: rank by squared
+    distance through ||a - b||^2 = ||a||^2 + ||b||^2 - 2ab, so the temporary is
+    one block of the score matrix, never test x train x dim.
+    """
+    out = np.empty((len(test), k), dtype=np.int64)
+    train_sq = None if angular else (train.astype(np.float64) ** 2).sum(axis=1)
+    for start in range(0, len(test), block):
+        chunk = test[start:start + block]
+        scores = chunk @ train.T
+        if angular:
+            out[start:start + block] = np.argpartition(-scores, k - 1, axis=1)[:, :k]
+        else:
+            query_sq = (chunk.astype(np.float64) ** 2).sum(axis=1)[:, None]
+            squared = query_sq + train_sq[None, :] - 2.0 * scores.astype(np.float64)
+            out[start:start + block] = np.argpartition(squared, k - 1, axis=1)[:, :k]
+    return out
 
 
 def run_ann_benchmark(dataset_name: str, config: dict):
@@ -60,18 +96,19 @@ def run_ann_benchmark(dataset_name: str, config: dict):
     Methodology:
     1. Download HDF5 from ann-benchmarks.com
     2. Load train/test vectors and ground truth neighbors
-    3. Build index with timing
-    4. Query with timing
-    5. Compute recall@k against ground truth
-    6. Report: build_time, p50_latency, p99_latency, QPS, recall@k
+    3. Exact search with a block-wise NumPy reference (not SplatsDB)
+    4. Build Faiss IVFFlat and HNSW indexes with the metric of the dataset
+    5. Query with timing
+    6. Compute recall@k against ground truth
+    7. Report: build time, QPS, recall@k, mean ms per query
     
-    All parameters are logged. No tuning after seeing results.
+    SplatsDB's own engine is not run by this function.
     """
     try:
         import h5py
         import faiss
-    except ImportError:
-        print("Install: pip install h5py faiss-cpu")
+    except ImportError as exc:
+        print(f"Missing dependency: {exc.name}. Install: pip install h5py faiss-cpu")
         return None
 
     results = {
@@ -108,69 +145,59 @@ def run_ann_benchmark(dataset_name: str, config: dict):
     print(f"{'='*60}")
 
     # ── SplatsDB benchmark ──
-    print("\n[SplatsDB CPU Brute Force]")
-    # We call the SplatsDB CLI for this
-    # For reproducibility, we also implement the same logic in pure Python
-    # and verify they match
+    # ann-benchmarks stores euclidean ground truth for sift and angular (cosine)
+    # ground truth for glove and nytimes. A Faiss index must use the metric of the
+    # dataset: an L2 index on raw vectors does not answer an angular query set.
+    train = train.astype(np.float32)
+    test = test.astype(np.float32)
+    dim = train.shape[1]
+    k = config["k"]
+    gt = neighbors[:, :k]
+    angular = config["metric"] == "angular"
+    if angular:
+        train = _unit_rows(train)
+        test = _unit_rows(test)
+    metric = faiss.METRIC_INNER_PRODUCT if angular else faiss.METRIC_L2
+    results["faiss_metric"] = "METRIC_INNER_PRODUCT on unit vectors" if angular else "METRIC_L2"
+    results["splatsdb_measured"] = False
+    results["note"] = ("This suite measures a NumPy exact reference and Faiss baselines. "
+                       "No SplatsDB code runs here; the engine is measured by `splatsdb bench-hnsw`.")
 
+    # ── Exact reference in NumPy ──
+    print("\n[NumPy exact reference]  (NumPy, not SplatsDB)")
     t0 = time.perf_counter()
-    if config["metric"] == "euclidean":
-        dists = np.linalg.norm(test[:, None] - train[None], axis=2)
-    else:  # angular / cosine
-        test_norm = test / np.linalg.norm(test, axis=1, keepdims=True)
-        train_norm = train / np.linalg.norm(train, axis=1, keepdims=True)
-        sims = test_norm @ train_norm.T
-        dists = 1 - sims
-
-    # Top-k for each query
-    top_k_indices = np.argpartition(dists, config["k"], axis=1)[:, :config["k"]]
+    top_k_indices = exact_topk_blockwise(test, train, k, angular)
     elapsed = time.perf_counter() - t0
-
-    # Compute recall
-    gt = neighbors[:, :config["k"]]
-    recalls = []
-    for i in range(len(test)):
-        hits = len(set(top_k_indices[i]) & set(gt[i]))
-        recalls.append(hits / config["k"])
-    recall = np.mean(recalls)
-
-    results["splatsdb_cpu"] = {
-        "method": "brute_force",
+    results["numpy_exact"] = {
+        "method": "numpy_exact_bruteforce",
+        "engine": "NumPy",
         "qps": round(len(test) / elapsed, 1),
-        "p50_ms": round(np.median(dists.shape[1] and elapsed / len(test) * 1000), 3),
-        "recall": round(recall, 4),
+        "mean_ms_per_query": round(elapsed / len(test) * 1000, 4),
+        "recall": round(_recall_at_k(top_k_indices, gt), 4),
     }
-    print(f"  QPS: {results['splatsdb_cpu']['qps']}")
-    print(f"  Recall@{config['k']}: {results['splatsdb_cpu']['recall']}")
+    print(f"  QPS: {results['numpy_exact']['qps']}")
+    print(f"  Recall@{k}: {results['numpy_exact']['recall']}")
 
-    # ── Faiss benchmarks ──
+    # ── Faiss baselines ──
     print("\n[Faiss IVFFlat]")
     nlist = int(4 * np.sqrt(len(train)))
-    quantizer = faiss.IndexFlatL2(train.shape[1])
-    index = faiss.index_cpu_to_all_gpus(quantizer) if faiss.get_num_gpus() > 0 else quantizer
-
+    quantizer = faiss.IndexFlatIP(dim) if angular else faiss.IndexFlatL2(dim)
     t0 = time.perf_counter()
-    index_ivf = faiss.IndexIVFFlat(quantizer, train.shape[1], nlist)
-    index_ivf.train(train.astype(np.float32))
-    index_ivf.add(train.astype(np.float32))
+    index_ivf = faiss.IndexIVFFlat(quantizer, dim, nlist, metric)
+    index_ivf.train(train)
+    index_ivf.add(train)
     build_time = time.perf_counter() - t0
 
     for nprobe in [1, 8, 16, 32, 64]:
         index_ivf.nprobe = nprobe
         t0 = time.perf_counter()
-        D, I = index_ivf.search(test.astype(np.float32), config["k"])
+        _, ids = index_ivf.search(test, k)
         elapsed = time.perf_counter() - t0
-
-        recalls_ivf = []
-        for i in range(len(test)):
-            hits = len(set(I[i]) & set(gt[i]))
-            recalls_ivf.append(hits / config["k"])
-
         results[f"faiss_ivf_nprobe{nprobe}"] = {
             "method": f"IVFFlat(nlist={nlist}, nprobe={nprobe})",
             "build_s": round(build_time, 2),
             "qps": round(len(test) / elapsed, 1),
-            "recall": round(np.mean(recalls_ivf), 4),
+            "recall": round(_recall_at_k(ids, gt), 4),
         }
         print(f"  nprobe={nprobe}: QPS={results[f'faiss_ivf_nprobe{nprobe}']['qps']}, "
               f"Recall={results[f'faiss_ivf_nprobe{nprobe}']['recall']}")
@@ -178,30 +205,23 @@ def run_ann_benchmark(dataset_name: str, config: dict):
     print("\n[Faiss HNSW]")
     for M in [16, 32, 48]:
         t0 = time.perf_counter()
-        index_hnsw = faiss.IndexHNSWFlat(train.shape[1], M)
-        index_hnsw.add(train.astype(np.float32))
+        index_hnsw = faiss.IndexHNSWFlat(dim, M, metric)
+        index_hnsw.add(train)
         build_time_h = time.perf_counter() - t0
 
         for ef in [50, 100, 200]:
             faiss.ParameterSpace().set_index_parameter(index_hnsw, "efSearch", ef)
             t0 = time.perf_counter()
-            D, I = index_hnsw.search(test.astype(np.float32), config["k"])
+            _, ids = index_hnsw.search(test, k)
             elapsed = time.perf_counter() - t0
-
-            recalls_h = []
-            for i in range(len(test)):
-                hits = len(set(I[i]) & set(gt[i]))
-                recalls_h.append(hits / config["k"])
-
             results[f"faiss_hnsw_M{M}_ef{ef}"] = {
                 "method": f"HNSW(M={M}, ef={ef})",
                 "build_s": round(build_time_h, 2),
                 "qps": round(len(test) / elapsed, 1),
-                "recall": round(np.mean(recalls_h), 4),
+                "recall": round(_recall_at_k(ids, gt), 4),
             }
             print(f"  M={M} ef={ef}: QPS={results[f'faiss_hnsw_M{M}_ef{ef}']['qps']}, "
                   f"Recall={results[f'faiss_hnsw_M{M}_ef{ef}']['recall']}")
-
     return results
 
 
@@ -256,17 +276,10 @@ def run_longmemeval_benchmark():
         }
     results["stored_read_from_result_files"] = stored
 
-    results["integrity_checklist"] = {
-        "hardcoded_questions": False,
-        "k_search_equals_pull_size": False,
-        "question_specific_fixes": False,
-        "git_history_squashed": False,
-        "anonymous_authors": False,
-        "methodology_published": True,
-        "code_reproducible": True,
-        "reproducible_runner": "benchmarks/longmemeval_scope.py; splatsdb bench-long-mem-eval --scope global",
-        "measured_by_this_function": False,
-    }
+    # Earlier versions printed an integrity_checklist here made of constants
+    # (code_reproducible, methodology_published, ...). A function that runs
+    # nothing cannot attest anything about the stored numbers, so it prints none.
+    results["attestations"] = "none: this function runs nothing and verifies nothing about the stored numbers"
 
     return results
 
@@ -1228,6 +1241,92 @@ def run_locomo_benchmark_v2():
     return results
 
 
+ATTESTATION_NOTE = "self-declared in this script's source; the run verifies none of these flags"
+
+
+def detect_hardware() -> dict:
+    """Describe the machine this process runs on, detected at run time.
+
+    Nothing here is typed in: a result file always carries the machine that
+    produced it, not the machine of some earlier run.
+    """
+    cpu = platform.processor() or platform.machine() or "not detected"
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if line.lower().startswith("model name"):
+                    cpu = line.split(":", 1)[1].strip()
+                    break
+    except OSError:
+        pass
+    cores = os.cpu_count()
+    if cores:
+        cpu = f"{cpu} ({cores} logical cores)"
+    ram = "not detected"
+    try:
+        ram = f"{os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE') / 2 ** 30:.1f} GiB"
+    except (ValueError, OSError, AttributeError):
+        pass
+    gpu = "not detected (torch or CUDA unavailable)"
+    try:
+        import torch
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            gpu = f"{torch.cuda.get_device_name(0)} ({props.total_memory / 2 ** 30:.0f} GiB)"
+    except Exception:  # noqa: BLE001 - detection must never break a benchmark run
+        pass
+    return {"cpu": cpu, "gpu": gpu, "ram": ram, "os": platform.platform(), "detected_at_run_time": True}
+
+
+def annotate_attestations(node) -> None:
+    """Every integrity_checklist in a result carries the note that it is self-declared."""
+    if isinstance(node, dict):
+        if "integrity_checklist" in node:
+            node.setdefault("integrity_checklist_note", ATTESTATION_NOTE)
+        for value in node.values():
+            annotate_attestations(value)
+    elif isinstance(node, list):
+        for value in node:
+            annotate_attestations(value)
+
+
+def run_and_record(all_results: dict, key: str, fn):
+    """Run one suite and record where its numbers come from and how long it took."""
+    started = time.perf_counter()
+    result = fn()
+    if not isinstance(result, dict):
+        # A suite that returns None leaves a trace: an empty result file must never look like a run.
+        all_results[key + "_not_run"] = "suite returned no result (see console: usually a missing dependency)"
+        return result
+    measured = result.get("measured_by_this_function") is not False
+    result["run_provenance"] = {
+        "measured_in_this_run": measured,
+        "result_source": "computed_by_this_function" if measured else "stored_result_files",
+    }
+    if measured:
+        result["run_provenance"]["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        result["run_provenance"]["elapsed_s"] = round(time.perf_counter() - started, 3)
+    annotate_attestations(result)
+    all_results[key] = result
+    return result
+
+
+def summarize_provenance(all_results: dict) -> list:
+    """Names of the suites whose numbers were computed by this run."""
+    placeholders = sorted(k for k, v in all_results.items() if isinstance(v, dict) and v.get("measured_by_this_function") is False)
+    meta_keys = ("tool", "version", "philosophy", "hardware", "timestamp")
+    measured = [k for k in all_results if k not in meta_keys and not k.endswith(("_error", "_not_run")) and k not in placeholders]
+    if not measured:
+        print("\n⚠️  NOTHING WAS MEASURED in this run. Placeholder suites: " + ", ".join(placeholders))
+        return measured
+    print("\nProvenance: computed by this run on the machine recorded under 'hardware'.")
+    for key in measured:
+        print(f"   {key}: {all_results[key].get('run_provenance', {}).get('elapsed_s', 'n/a')} s")
+    print("   Methodology is declared in this script's source; the run verifies none of the integrity flags.")
+    if placeholders:
+        print("   Placeholder suites that measured nothing: " + ", ".join(placeholders))
+    return measured
+
 def main():
     parser = argparse.ArgumentParser(description="SplatsDB Reproducible Benchmarks")
     parser.add_argument("--suite", choices=["ann", "beir", "beir-v2", "locomo", "locomo-v2", "memobench", "longmemeval", "all", "all-v2"], default="all")
@@ -1238,13 +1337,8 @@ def main():
     all_results = {
         "tool": "SplatsDB Benchmark Suite",
         "version": "1.0",
-        "philosophy": "No gaming. No hardcoding. No cherry-picking. Full methodology published.",
-        "hardware": {
-            "cpu": "AMD Ryzen 5 3400G (4C/8T)",
-            "gpu": "NVIDIA RTX 3090 (24GB)",
-            "ram": "16GB DDR4",
-            "os": "Windows 11 (GPU) / WSL2 Ubuntu 22.04 (CPU)",
-        },
+        "philosophy": "Methodology declared in this script; provenance recorded at run time.",
+        "hardware": detect_hardware(),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
 
@@ -1252,58 +1346,35 @@ def main():
         datasets = [args.dataset] if args.dataset else list(ANN_DATASETS.keys())
         for ds in datasets:
             try:
-                result = run_ann_benchmark(ds, ANN_DATASETS[ds])
-                if result:
-                    all_results[f"ann_{ds}"] = result
+                run_and_record(all_results, f"ann_{ds}", lambda ds=ds: run_ann_benchmark(ds, ANN_DATASETS[ds]))
             except Exception as e:
                 print(f"Error with {ds}: {e}")
                 all_results[f"ann_{ds}_error"] = str(e)
 
     if args.suite in ("longmemeval", "all"):
-        result = run_longmemeval_benchmark()
-        all_results["longmemeval"] = result
+        run_and_record(all_results, "longmemeval", run_longmemeval_benchmark)
 
     if args.suite in ("beir", "all"):
-        result = run_beir_benchmark()
-        if result:
-            all_results["beir"] = result
+        run_and_record(all_results, "beir", run_beir_benchmark)
 
     if args.suite in ("beir-v2", "all-v2"):
-        result = run_beir_benchmark_v2()
-        if result:
-            all_results["beir_v2"] = result
+        run_and_record(all_results, "beir_v2", run_beir_benchmark_v2)
 
     if args.suite in ("locomo", "all"):
-        result = run_locomo_benchmark()
-        if result:
-            all_results["locomo"] = result
+        run_and_record(all_results, "locomo", run_locomo_benchmark)
 
     if args.suite in ("locomo-v2", "all-v2"):
-        result = run_locomo_benchmark_v2()
-        if result:
-            all_results["locomo_v2"] = result
+        run_and_record(all_results, "locomo_v2", run_locomo_benchmark_v2)
 
     if args.suite in ("memobench", "all", "all-v2"):
-        result = run_memobench_benchmark()
-        if result:
-            all_results["memobench"] = result
+        run_and_record(all_results, "memobench", run_memobench_benchmark)
 
     with open(args.output, "w") as f:
         json.dump(all_results, f, indent=2)
 
     print(f"\nResults saved to {args.output}")
-    placeholders = sorted(k for k, v in all_results.items() if isinstance(v, dict) and v.get("measured_by_this_function") is False)
-    meta_keys = ("tool", "version", "philosophy", "hardware", "timestamp")
-    measured = [k for k in all_results if k not in meta_keys and not k.endswith("_error") and k not in placeholders]
-    if not measured:
-        print("\n⚠️  NOTHING WAS MEASURED in this run. Placeholder suites: " + ", ".join(placeholders))
-    else:
-        print("\n⚠️  INTEGRITY: These benchmarks were run with NO hardcoding,")
-        print("   NO question-specific fixes, and NO post-hoc parameter tuning.")
-        print("   Full methodology is documented in this script.")
-        if placeholders:
-            print("   Placeholder suites that measured nothing: " + ", ".join(placeholders))
-
+    measured = summarize_provenance(all_results)
+    raise SystemExit(0 if measured else 2)
 
 if __name__ == "__main__":
     main()

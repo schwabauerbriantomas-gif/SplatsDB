@@ -1,0 +1,17 @@
+{
+ "_note": "Numbers printed in a README.md or BENCHMARKS.md table next to a cited result file that no cited file contains at the printed precision. Every entry is a published number without a preserved artifact; review before adding one.",
+ "cells": [
+  "README.md:0.0000",
+  "README.md:0.1422",
+  "README.md:0.1582",
+  "README.md:0.3371",
+  "README.md:0.5432",
+  "README.md:0.5507",
+  "README.md:0.5806",
+  "README.md:0.5950",
+  "README.md:0.6192",
+  "README.md:0.7200",
+  "README.md:0.8452",
+  "README.md:0.8542"
+ ]
+}

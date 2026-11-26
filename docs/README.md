@@ -14,6 +14,7 @@
 | [validation/embedding-atlas.md](validation/embedding-atlas.md) | PCA/UMAP structural metrics, density-render limits and reproducibility |
 | [validation/ivf-atlas-incidents.md](validation/ivf-atlas-incidents.md) | Harness incidents and preserved invalid artifacts; no protocol changes |
 | [validation/longmemeval-scope.md](validation/longmemeval-scope.md) | LongMemEval-S haystack-restricted vs global scope, engine parity, April attribution corrected |
+| [validation/integrity-audit.md](validation/integrity-audit.md) | Integrity audit: benchmark claims without a source, the ANN suite, self-declared verification flags, with evidence and corrections |
 
 ## Benchmark documentation policy
 
