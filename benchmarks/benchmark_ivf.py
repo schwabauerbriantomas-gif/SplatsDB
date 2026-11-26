@@ -140,6 +140,7 @@ def main() -> None:
             "fixed_validation_scan": float(validation_grid[fixed_p]["scan"].mean()),
             "ratio": common.select_config(common.RATIOS, ratio_validation, target),
             "doubling": common.select_config(common.DOUBLING_THRESHOLDS, doubling_validation, target),
+            "learned": None,
         }
         if fixed_p not in faiss_latency:
             index.nprobe = fixed_p
