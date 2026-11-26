@@ -441,11 +441,18 @@ fn a5_with_a_key_wrong_or_malformed_authorization_never_authenticates() {
     assert_eq!(code, 200);
     assert_eq!(unchanged["n_active"].as_u64(), Some(n_before));
 
+    // The server has no embed service in this test, so the accepted store
+    // carries its own vector: a request without one is answered 503.
+    let body = serde_json::json!({
+        "text": "stored-with-the-right-key",
+        "embedding": (0..DIM).map(|i| if i == 0 { 1.0 } else { 0.0 }).collect::<Vec<f32>>(),
+    })
+    .to_string();
     let (code, resp) = http(
         port,
         "POST",
         "/store",
-        Some(body),
+        Some(&body),
         &[("Authorization", &right)],
     )
     .expect("/store answered");

@@ -10,13 +10,15 @@
 - **docs**: README repositioned around learned splat-cell routing, exact raw-vector re-scoring and explicit non-claims; MCP/graph/GPU integration is separated from splat-specific evidence.
 
 ### Changed
+- **api (breaking for a text-only `POST /store` without an embed service)**: a `/store` without an `embedding` vector stored a hash of the text.
+  It now asks the embed service for the vector — the same service and model `/recall` uses (`embeddinggemma-2`, `SPLATSDB_RECALL_EMBED_URL`,
+  no prompt) — and answers `embedding_source: "real"`. With no reachable service it answers `503` and stores nothing; `simple_hash_embedding`
+  is removed from the HTTP server. A request that carries a vector is unchanged.
 - **MCP/verbatim**: HIGH/MEDIUM/LOW outputs are described as heuristic vector-distance bands, not calibrated correctness probabilities or hallucination prevention. Additive `close_or_moderate` and `diagnostic_only` fields clarify the summary; legacy `reliable` remains only for compatibility.
 - **bench**: `bench-long-mem-eval` gains `--scope wing|global` and `--dump`. Default behaviour and legacy JSON keys are unchanged; the wing scope is documented as the benchmark shortcut it is.
 - **docs**: README and BENCHMARKS label the 96.6% LongMemEval figure as haystack-restricted and record the 2026-11-26 re-measurement next to the unchanged 2026-04-09 numbers.
 
 ### Fixed
-- **api**: `POST /store` without an `embedding` vector stores a hash of the text. The response now says so (`embedding_source: "text_hash"` plus a `warning`);
-  `status` stays `"stored"`. A request that carries a vector gets neither key.
 - **bench/docs**: integrity audit (2026-11-26) of every benchmark claim, result file and benchmark script (`docs/validation/integrity-audit.md`). The LongMemEval keyword baseline the README cited contradicts itself (91.0% overall, 0 in every per-type entry) and the "dramatically improved" sentence built on it was withdrawn. The ANN suite no longer reports a NumPy brute force as `splatsdb_cpu` (it never called SplatsDB), builds Faiss with the metric of each dataset and downloads from ann-benchmarks.com (the old URLs returned 401, which is all `benchmarks/results_reproducible.json` held; the file is removed). Hardware is detected at run time. The hardcoded `integrity_checklist` flags are labelled as self-declared and the placeholder's are removed. A run that measures nothing exits with code 2 and leaves a trace. The "BM25 helps" attribution, the "confirms the semantic gap" sentence, the graph-traversal explanation, the HNSW provenance notes, the MemoBench "✅ 100%" entry and the BEIR QPS label were rewritten to what the artifacts show. The LongMemEval hero chart no longer says the native gap is real under this methodology: it states that the two
   panels search different candidate sets. The summary table no longer lists ANN-Benchmarks as published for SIFT, GloVe and NYTimes.
 - README documented a non-existent `bench-longmemeval` subcommand (the CLI name is `bench-long-mem-eval`), and `benchmark_reproducible.py::run_longmemeval_benchmark` returned hardcoded numbers with `code_reproducible: True` while carrying throughput figures withdrawn on 2026-10-25. It is now an explicit placeholder that reads the stored result files and measures nothing; the CLI no longer prints its integrity banner over a run in which nothing was measured.

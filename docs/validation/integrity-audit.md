@@ -1,6 +1,6 @@
 # Integrity audit: benchmark claims, result files and benchmark code
 
-**Date:** 2026-11-26 · **Branch:** `fix/integrity-audit` · **Status:** applied and merged to `main` on 2026-11-26; finding 11 was closed the same day by a follow-up change. The items still open are listed at the end.
+**Date:** 2026-11-26 · **Branch:** `fix/integrity-audit` · **Status:** applied and merged to `main` on 2026-11-26; finding 11 was closed the same day by a follow-up change and then resolved outright (the server embeds via the service; no hash fallback). The items still open are listed at the end.
 
 ## Why this audit
 
@@ -134,6 +134,10 @@ like with like.
 - **Resolved (2026-11-26, non-breaking):** `POST /store` without a vector now answers with `"embedding_source": "text_hash"` and a plain-language
   `warning`. `status` stays `"stored"`, so a client that only reads `status` is unaffected; a request that carries a vector
   gets neither key. Two unit tests cover both storage paths (with WAL and ephemeral).
+- **Superseded (2026-11-26, owner's direction):** the notice was replaced by the real thing. `POST /store` without a vector now asks
+  the embed service for it (`embeddinggemma-2`, the same service as `/recall`, no prompt) and answers `embedding_source: "real"`; with no
+  reachable service it answers `503` and stores nothing. `simple_hash_embedding` is gone from the HTTP server. A client that stored
+  text without a vector and without an embed service now gets `503` — a deliberate breaking change.
 
 ### 12. References to files that are not in the repository — LOW
 

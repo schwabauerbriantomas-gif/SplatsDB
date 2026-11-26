@@ -954,18 +954,18 @@ curl -X POST http://localhost:8199/store \
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `text` | string | Yes | Text content (stored under a hash of the text if no `embedding`; the response then carries `embedding_source: "text_hash"`) |
-| `embedding` | float[] | No | Pre-computed embedding vector |
+| `text` | string | Yes | Text content |
+| `embedding` | float[] | No | Pre-computed embedding vector. Without it the server asks the embed service for one (`embeddinggemma-2`, the same service `/recall` uses) and stores that |
 | `category` | string | No | Category tag |
 | `id` | string | No | Custom ID (auto-generated if omitted) |
 
 Response:
 
 ```json
-{"id": "mem_42", "status": "stored", "embedding_source": "text_hash", "warning": "The request carried no `embedding` vector: this item was stored under a hash of its text, which has no meaning and will not be found by similarity to other texts. Send `embedding` from a real model for anything that must be searched by meaning."}
+{"crash_durable":true,"durability_mode":"process-crash","durable":true,"embedding_source":"real","id":"mem_42","may_be_persisted":true,"outcome":"stored","persistence":"wal","power_loss_durable":false,"status":"stored","wal_pending":1}
 ```
 
-The request above sends no `embedding`, so the server stores a hash of the text and says so. A request that carries `embedding` gets neither `embedding_source` nor `warning`.
+The request above sends no `embedding`, so the server asks the embed service for one, stores that vector and says so (`embedding_source: "real"`). A request that carries `embedding` is stored as sent and gets no `embedding_source`. The service is `SPLATSDB_RECALL_EMBED_URL` (default `http://127.0.0.1:8860/v1/embeddings`), shared with `/recall`: documents are embedded without a prompt, queries with `Retrieval-query`. With no reachable service the request is answered `503` and nothing is stored — the HTTP server has no text-hash fallback (`/search` answers `400` without a vector for the same reason).
 
 #### `POST /search` — Search Memories
 
@@ -995,7 +995,7 @@ Response:
 
 `backend` is present only when the query ran on the exact GPU kernel (`serve --gpu`); it is omitted on the CPU path.
 
-**`topic` and `confidence`** appear when the data-dir has a persisted `field/` and the query carried a real embedding (never for text-hash queries or `rescore=gaussian`): `topic` is the splat the result belongs to, and `confidence` measures how close to that splat's center the result fell — `1 − d(x, μ_topic)/R_topic`, clamped to [0,1]. A confidence near 1.0 means the result is a prototype of its topic; near 0.0 it sits on the topic's boundary.
+**`topic` and `confidence`** appear when the data-dir has a persisted `field/` and the query carried a real embedding (never for `rescore=gaussian`): `topic` is the splat the result belongs to, and `confidence` measures how close to that splat's center the result fell — `1 − d(x, μ_topic)/R_topic`, clamped to [0,1]. A confidence near 1.0 means the result is a prototype of its topic; near 0.0 it sits on the topic's boundary.
 
 With `--gpu` and a `field/` present, the exact index searches the **full chunk corpus** (`field.raw`) — so `topic`/`confidence` always refer to real chunks. On the CPU path (or stores without `field/`), `/search` searches the loaded shard: in flat stores those ids are the vectors themselves; in ingested stores they are the splats, and then `topic` equals the result id and `confidence` measures how close the *query* fell to that splat's center.
 
@@ -1044,7 +1044,7 @@ Requires a data-dir with a persisted field (`field/members.idx`, `field/radii.bi
 
 Phase 1 can run on the PTX kernel (`--gpu` in the CLI): cluster winners are identical to CPU (30/30), but per-invocation context+upload overhead (~330 ms) makes it only worthwhile as a **resident** index in a long-running server with large K. At this scale the exact mode is the right default; two-phase pays off when K grows and the raw vectors can't stay in fast memory.
 
-> **Note**: The default HTTP server stores hash-based pseudo-embeddings when the request carries no `embedding` vector (`simple_hash_embedding`: one hash of the text seeds a PRNG that fills the dimensions — no semantic understanding). The response then carries `"embedding_source": "text_hash"` and a `warning`; `status` stays `"stored"`. The CLI's verbatim commands use a different stand-in, `simcos_embed`, trigram hashing. For production use, provide real embeddings from a model (e.g. OpenAI, Cohere, MiniLM, BGE) via the `embedding` field.
+> **Note**: the HTTP server has no text-hash fallback. A `/store` without an `embedding` vector asks the embed service for one (`SPLATSDB_RECALL_EMBED_URL`, default `http://127.0.0.1:8860/v1/embeddings`, model `embeddinggemma-2`) and answers `503` when the service is unreachable. The CLI's verbatim commands use a different stand-in, `simcos_embed`, trigram hashing. Keep documents and queries on one model: a hub is only as searchable as the vector space all of its entries share.
 
 ---
 
