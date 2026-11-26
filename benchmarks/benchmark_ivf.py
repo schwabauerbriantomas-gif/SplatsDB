@@ -32,7 +32,7 @@ def faiss_recall_scan(index, quantizer, queries: np.ndarray, all_d2: np.ndarray,
     index.nprobe = p
     recalls, scans, score_rows = [], [], []
     for i, query in enumerate(queries):
-        _, scores = index.search(query[None, :], 10)
+        scores, _ = index.search(query[None, :], 10)
         scores = scores[0].astype(np.float32)
         score_rows.append(scores)
         recalls.append(common.threshold_recall(scores[None, :], gt_kth[i : i + 1])[0])

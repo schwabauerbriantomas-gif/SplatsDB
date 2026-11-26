@@ -14,3 +14,10 @@
 - **Fix:** record `learned: null` explicitly and recheck the complete target/selection flow before rerunning.
 - **Protocol change:** none.
 
+## 2026-11-26 — Faiss return-order parser produced an invalid NO_GO
+
+- **Observed:** the third run reported 800/800 distance mismatches and 795/800 recall mismatches with zero scan mismatches. A direct probe showed identical selected cells, IDs and scores to the mirror within float32 error.
+- **Root cause:** `faiss_recall_scan` assigned the second return value from `index.search` (IDs) to `scores` instead of the first return value (distances).
+- **Invalid artifact preserved:** `ivf_policy_results.INVALID_parity_parser.json`, SHA-256 `1410dec5e21993deb0bb0abf5b880fa92c157e4bd85476ee3d4459af195d7eed`. Its `NO_GO_IMPLEMENTATION_PARITY` is not a valid product verdict.
+- **Fix:** swap the return assignment and add a synthetic end-to-end Faiss/mirror score-parity regression test. Re-run the identical frozen protocol; do not reinterpret the invalid JSON as a NO_GO.
+

@@ -134,6 +134,27 @@ class FaissIntegrationTests(unittest.TestCase):
         expected_scan = sum(int(np.count_nonzero(assignments == int(c))) for c in cells)
         self.assertEqual(sum(index.get_list_size(int(c)) for c in cells), expected_scan)
 
+    def test_recall_scan_scores_are_distances_not_ids(self):
+        import faiss
+        import benchmark_ivf as runner
+
+        faiss.omp_set_num_threads(1)
+        rng = np.random.default_rng(13)
+        corpus = rng.normal(size=(100, 8)).astype(np.float32)
+        centroids = corpus[:5].copy()
+        labels = np.arange(100) % 5
+        groups = [np.flatnonzero(labels == c).astype(np.uint32) for c in range(5)]
+        queries = corpus[:1]
+        plans, all_d2, gt_kth = runner.prepare_queries(queries, corpus, centroids, groups)
+        quantizer = faiss.IndexFlatL2(8)
+        quantizer.add(centroids)
+        index = faiss.IndexIVFFlat(quantizer, 8, 5, faiss.METRIC_L2)
+        index.add(corpus)
+        grid, score_rows = runner.faiss_recall_scan(index, quantizer, queries, all_d2, gt_kth, 2, len(corpus))
+        _, mirror = common.score_candidates(plans[0]["candidates"][2], all_d2[0])
+        self.assertTrue(np.allclose(np.sort(score_rows[0]), np.sort(mirror), rtol=2e-5, atol=2e-5))
+        self.assertGreater(grid["recall"][0], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
