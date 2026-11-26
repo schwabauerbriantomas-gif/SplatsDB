@@ -1,0 +1,1405 @@
+{
+  "benchmark": "LongMemEval-S cleaned \u2014 scope ladder and engine parity",
+  "content_published": false,
+  "corpus": {
+    "answers_missing_total": 0,
+    "chunk_tokens_median": 180.0,
+    "chunks": 258799,
+    "chunks_per_session_median": 14.0,
+    "haystack_candidates_median": 48.0,
+    "questions": 500,
+    "session_chars_median": 10554.0,
+    "session_slots": 23867,
+    "sessions_shared_across_questions": 3942,
+    "unique_sessions": 19195
+  },
+  "dataset": {
+    "bytes": 277383467,
+    "path": "/mnt/d/huggingface/hub/datasets--xiaowu0162--longmemeval-cleaned/snapshots/98d7416c24c778c2fee6e6f3006e7a073259d48f/longmemeval_s_cleaned.json",
+    "sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442"
+  },
+  "engine": {
+    "R3_parity": {
+      "abs_diff_exact": 0,
+      "ann": {
+        "abs_diff_ann": 1,
+        "ann_hits@10": 168,
+        "exact_hits@10": 167,
+        "mean_overlap_ann_vs_exact": 0.9947999999999999,
+        "pass_ann": true,
+        "queries_with_any_flip_ann": 18,
+        "rule": "ANN path within 1 question of the exact path and mean ANN-vs-exact top-10 overlap >= 0.99"
+      },
+      "exact_hits@10": 167,
+      "head_global_hits@10": 167,
+      "mean_overlap_engine_exact_vs_numpy": 1.0,
+      "pass": true,
+      "pass_exact": true,
+      "queries_with_any_flip_exact": 0,
+      "rescoring": {
+        "global_ann": true,
+        "global_exact": true,
+        "pass": true,
+        "rule": "Python rescoring of the dump equals the engine-reported counts (both paths, all k)",
+        "wing_ann": true
+      },
+      "rule": "exact path within 1 question of head_global and mean top-10 overlap vs NumPy >= 0.999"
+    },
+    "R4_wing": {
+      "abs_diff_global": 317,
+      "abs_diff_within": 0,
+      "head_global_hits@10": 167,
+      "head_within_hits@10": 484,
+      "rule": "wing hit@10 within 1 question of head_within -> filter restricts to the haystack; within 1 of head_global -> filter ineffective",
+      "verdict": "FILTER_RESTRICTS_TO_HAYSTACK",
+      "wing_hits@10": 484
+    },
+    "binary_git_head": "afc0d49f1672fbcd1e6a3e119696cecd393bbef7",
+    "binary_sha256": "4792a97d0f46906a5aece52cfabcc746d4301340db8a3dbaf2d18dde8584bb30",
+    "config": {
+      "hnsw_ef_construction": 400,
+      "hnsw_ef_search": 100,
+      "hnsw_m": 32,
+      "metric": "l2",
+      "over_fetch": 3
+    },
+    "global": {
+      "ann": {
+        "@1": {
+          "hits": 52,
+          "n": 500,
+          "rate": 0.104
+        },
+        "@10": {
+          "hits": 168,
+          "n": 500,
+          "rate": 0.336
+        },
+        "@3": {
+          "hits": 104,
+          "n": 500,
+          "rate": 0.208
+        },
+        "@5": {
+          "hits": 126,
+          "n": 500,
+          "rate": 0.252
+        },
+        "engine_reported_counts": {
+          "@1": {
+            "hits": 52,
+            "n": 500
+          },
+          "@10": {
+            "hits": 168,
+            "n": 500
+          },
+          "@3": {
+            "hits": 104,
+            "n": 500
+          },
+          "@5": {
+            "hits": 126,
+            "n": 500
+          }
+        },
+        "per_type@10": {
+          "knowledge-update": {
+            "hits": 21,
+            "n": 78,
+            "rate": 0.2692307692307692
+          },
+          "multi-session": {
+            "hits": 42,
+            "n": 133,
+            "rate": 0.3157894736842105
+          },
+          "single-session-assistant": {
+            "hits": 49,
+            "n": 56,
+            "rate": 0.875
+          },
+          "single-session-preference": {
+            "hits": 5,
+            "n": 30,
+            "rate": 0.16666666666666666
+          },
+          "single-session-user": {
+            "hits": 6,
+            "n": 70,
+            "rate": 0.08571428571428572
+          },
+          "temporal-reasoning": {
+            "hits": 45,
+            "n": 133,
+            "rate": 0.3383458646616541
+          }
+        },
+        "rescoring_matches_engine": true
+      },
+      "exact": {
+        "@1": {
+          "hits": 52,
+          "n": 500,
+          "rate": 0.104
+        },
+        "@10": {
+          "hits": 167,
+          "n": 500,
+          "rate": 0.334
+        },
+        "@3": {
+          "hits": 104,
+          "n": 500,
+          "rate": 0.208
+        },
+        "@5": {
+          "hits": 126,
+          "n": 500,
+          "rate": 0.252
+        },
+        "engine_reported_counts": {
+          "@1": {
+            "hits": 52,
+            "n": 500
+          },
+          "@10": {
+            "hits": 167,
+            "n": 500
+          },
+          "@3": {
+            "hits": 104,
+            "n": 500
+          },
+          "@5": {
+            "hits": 126,
+            "n": 500
+          }
+        },
+        "per_type@10": {
+          "knowledge-update": {
+            "hits": 21,
+            "n": 78,
+            "rate": 0.2692307692307692
+          },
+          "multi-session": {
+            "hits": 41,
+            "n": 133,
+            "rate": 0.3082706766917293
+          },
+          "single-session-assistant": {
+            "hits": 49,
+            "n": 56,
+            "rate": 0.875
+          },
+          "single-session-preference": {
+            "hits": 5,
+            "n": 30,
+            "rate": 0.16666666666666666
+          },
+          "single-session-user": {
+            "hits": 6,
+            "n": 70,
+            "rate": 0.08571428571428572
+          },
+          "temporal-reasoning": {
+            "hits": 45,
+            "n": 133,
+            "rate": 0.3383458646616541
+          }
+        },
+        "rescoring_matches_engine": true
+      },
+      "timings": {
+        "build_time_s": 71.435,
+        "exact_p50_ms": 7.885,
+        "p50_ms": 1.719,
+        "p95_ms": 2.38,
+        "qps": 99.52229299363057,
+        "qps_includes_exact_reference": true,
+        "rows_fetched": 40,
+        "search_time_s": 5.024
+      }
+    },
+    "global_store_rows": 19195,
+    "inputs": "the head vectors (one per session) as .bin + meta.json",
+    "profile": "release",
+    "wing": {
+      "recall": {
+        "@1": {
+          "hits": 373,
+          "n": 500,
+          "rate": 0.746
+        },
+        "@10": {
+          "hits": 484,
+          "n": 500,
+          "rate": 0.968
+        },
+        "@3": {
+          "hits": 446,
+          "n": 500,
+          "rate": 0.892
+        },
+        "@5": {
+          "hits": 462,
+          "n": 500,
+          "rate": 0.924
+        },
+        "engine_reported_counts": {
+          "@1": {
+            "hits": 373,
+            "n": 500
+          },
+          "@10": {
+            "hits": 484,
+            "n": 500
+          },
+          "@3": {
+            "hits": 446,
+            "n": 500
+          },
+          "@5": {
+            "hits": 462,
+            "n": 500
+          }
+        },
+        "per_type@10": {
+          "knowledge-update": {
+            "hits": 78,
+            "n": 78,
+            "rate": 1.0
+          },
+          "multi-session": {
+            "hits": 132,
+            "n": 133,
+            "rate": 0.9924812030075187
+          },
+          "single-session-assistant": {
+            "hits": 55,
+            "n": 56,
+            "rate": 0.9821428571428571
+          },
+          "single-session-preference": {
+            "hits": 29,
+            "n": 30,
+            "rate": 0.9666666666666667
+          },
+          "single-session-user": {
+            "hits": 62,
+            "n": 70,
+            "rate": 0.8857142857142857
+          },
+          "temporal-reasoning": {
+            "hits": 128,
+            "n": 133,
+            "rate": 0.9624060150375939
+          }
+        },
+        "rescoring_matches_engine": true
+      },
+      "timings": {
+        "build_time_s": 94.443,
+        "p50_ms": 0.825,
+        "p95_ms": 1.011,
+        "qps": 1210.6537530266344,
+        "search_time_s": 0.413
+      }
+    },
+    "wing_store_rows": 23867
+  },
+  "exploratory_hybrid_rrf": {
+    "exploratory_post_protocol": true,
+    "hit@10": {
+      "rrf_keyword_chunkmax": {
+        "hits": 270,
+        "n": 500,
+        "rate": 0.54
+      },
+      "rrf_keyword_chunkmax_head": {
+        "hits": 250,
+        "n": 500,
+        "rate": 0.5
+      },
+      "rrf_keyword_head": {
+        "hits": 254,
+        "n": 500,
+        "rate": 0.508
+      }
+    },
+    "note": "written after the frozen results were seen; untuned RRF; not a predeclared reading",
+    "paired_vs_keyword_global@10": {
+      "rrf_keyword_chunkmax": {
+        "ci95": [
+          -0.036,
+          0.024
+        ],
+        "delta": -0.006
+      },
+      "rrf_keyword_chunkmax_head": {
+        "ci95": [
+          -0.086,
+          -0.006
+        ],
+        "delta": -0.046
+      },
+      "rrf_keyword_head": {
+        "ci95": [
+          -0.076,
+          0.002
+        ],
+        "delta": -0.038
+      }
+    },
+    "settings": {
+      "pool": 100,
+      "rrf_k": 60
+    }
+  },
+  "historical_2026_04_09": {
+    "native_hit@10": 0.304,
+    "native_per_type@10": {
+      "knowledge-update": 0.2051,
+      "multi-session": 0.3008,
+      "single-session-assistant": 0.875,
+      "single-session-preference": 0.1667,
+      "single-session-user": 0.0571,
+      "temporal-reasoning": 0.2857
+    },
+    "native_sha256": "63fd79e3bd67d916881987ce47020485b6928bf9ec927a5610d9a4101e4c47ac",
+    "native_store_rows": 23867,
+    "note": "April inputs and script are not in the repository; these numbers are read from the stored JSONs and are kept visible. The stored native JSON has 23,867 slot rows; the command as it existed before this change pre-filtered by the question's wing.",
+    "reference_hit@10": 0.966,
+    "reference_per_type@10": {
+      "knowledge-update": 1.0,
+      "multi-session": 0.9925,
+      "single-session-assistant": 0.9821,
+      "single-session-preference": 0.9667,
+      "single-session-user": 0.8857,
+      "temporal-reasoning": 0.9549
+    },
+    "reference_sha256": "5cb6d35186132bf58cd9df942d8587bcc4a7677ee321996272f739f3339d3fb2"
+  },
+  "incidents": [
+    "First Phase 1 launch held 4.38 GB RSS (whole-corpus token-id lists during chunking) with MemAvailable 3.10 GiB, below the 4 GiB floor: killed by exact PID before producing any result; rerun with block-wise chunking (RSS 2.52 GiB at the last memory checkpoint, per run log).",
+    "The April inputs and script are absent from the repository, so April's pipeline itself is not reproducible; dataset identity is established by identical corpus statistics.",
+    "ANN and exact paths differ by one question (168 vs 167) with 18 queries showing one flipped neighbour: inside the predeclared tolerance, reported unadjusted.",
+    "benchmarks/benchmark_reproducible.py::run_longmemeval_benchmark returned hardcoded numbers and pointed to a non-existing benches/ directory.",
+    "README documented the subcommand as bench-longmemeval; the CLI name is bench-long-mem-eval."
+  ],
+  "ladder": {
+    "chunkmax_global": {
+      "@1": {
+        "hits": 81,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 27,
+            "n": 78,
+            "rate": 0.34615384615384615
+          },
+          "multi-session": {
+            "hits": 12,
+            "n": 133,
+            "rate": 0.09022556390977443
+          },
+          "single-session-assistant": {
+            "hits": 30,
+            "n": 56,
+            "rate": 0.5357142857142857
+          },
+          "single-session-preference": {
+            "hits": 1,
+            "n": 30,
+            "rate": 0.03333333333333333
+          },
+          "single-session-user": {
+            "hits": 4,
+            "n": 70,
+            "rate": 0.05714285714285714
+          },
+          "temporal-reasoning": {
+            "hits": 7,
+            "n": 133,
+            "rate": 0.05263157894736842
+          }
+        },
+        "rate": 0.162
+      },
+      "@10": {
+        "hits": 215,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 49,
+            "n": 78,
+            "rate": 0.6282051282051282
+          },
+          "multi-session": {
+            "hits": 43,
+            "n": 133,
+            "rate": 0.3233082706766917
+          },
+          "single-session-assistant": {
+            "hits": 56,
+            "n": 56,
+            "rate": 1.0
+          },
+          "single-session-preference": {
+            "hits": 5,
+            "n": 30,
+            "rate": 0.16666666666666666
+          },
+          "single-session-user": {
+            "hits": 24,
+            "n": 70,
+            "rate": 0.34285714285714286
+          },
+          "temporal-reasoning": {
+            "hits": 38,
+            "n": 133,
+            "rate": 0.2857142857142857
+          }
+        },
+        "rate": 0.43
+      },
+      "@3": {
+        "hits": 146,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 36,
+            "n": 78,
+            "rate": 0.46153846153846156
+          },
+          "multi-session": {
+            "hits": 25,
+            "n": 133,
+            "rate": 0.18796992481203006
+          },
+          "single-session-assistant": {
+            "hits": 54,
+            "n": 56,
+            "rate": 0.9642857142857143
+          },
+          "single-session-preference": {
+            "hits": 3,
+            "n": 30,
+            "rate": 0.1
+          },
+          "single-session-user": {
+            "hits": 10,
+            "n": 70,
+            "rate": 0.14285714285714285
+          },
+          "temporal-reasoning": {
+            "hits": 18,
+            "n": 133,
+            "rate": 0.13533834586466165
+          }
+        },
+        "rate": 0.292
+      },
+      "@5": {
+        "hits": 188,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 46,
+            "n": 78,
+            "rate": 0.5897435897435898
+          },
+          "multi-session": {
+            "hits": 37,
+            "n": 133,
+            "rate": 0.2781954887218045
+          },
+          "single-session-assistant": {
+            "hits": 55,
+            "n": 56,
+            "rate": 0.9821428571428571
+          },
+          "single-session-preference": {
+            "hits": 5,
+            "n": 30,
+            "rate": 0.16666666666666666
+          },
+          "single-session-user": {
+            "hits": 19,
+            "n": 70,
+            "rate": 0.2714285714285714
+          },
+          "temporal-reasoning": {
+            "hits": 26,
+            "n": 133,
+            "rate": 0.19548872180451127
+          }
+        },
+        "rate": 0.376
+      },
+      "ci95_rate@10": [
+        0.386,
+        0.472
+      ]
+    },
+    "chunkmax_within": {
+      "@1": {
+        "hits": 425,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 72,
+            "n": 78,
+            "rate": 0.9230769230769231
+          },
+          "multi-session": {
+            "hits": 114,
+            "n": 133,
+            "rate": 0.8571428571428571
+          },
+          "single-session-assistant": {
+            "hits": 55,
+            "n": 56,
+            "rate": 0.9821428571428571
+          },
+          "single-session-preference": {
+            "hits": 22,
+            "n": 30,
+            "rate": 0.7333333333333333
+          },
+          "single-session-user": {
+            "hits": 56,
+            "n": 70,
+            "rate": 0.8
+          },
+          "temporal-reasoning": {
+            "hits": 106,
+            "n": 133,
+            "rate": 0.7969924812030075
+          }
+        },
+        "rate": 0.85
+      },
+      "@10": {
+        "hits": 495,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 78,
+            "n": 78,
+            "rate": 1.0
+          },
+          "multi-session": {
+            "hits": 133,
+            "n": 133,
+            "rate": 1.0
+          },
+          "single-session-assistant": {
+            "hits": 56,
+            "n": 56,
+            "rate": 1.0
+          },
+          "single-session-preference": {
+            "hits": 29,
+            "n": 30,
+            "rate": 0.9666666666666667
+          },
+          "single-session-user": {
+            "hits": 69,
+            "n": 70,
+            "rate": 0.9857142857142858
+          },
+          "temporal-reasoning": {
+            "hits": 130,
+            "n": 133,
+            "rate": 0.9774436090225563
+          }
+        },
+        "rate": 0.99
+      },
+      "@3": {
+        "hits": 472,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 77,
+            "n": 78,
+            "rate": 0.9871794871794872
+          },
+          "multi-session": {
+            "hits": 126,
+            "n": 133,
+            "rate": 0.9473684210526315
+          },
+          "single-session-assistant": {
+            "hits": 56,
+            "n": 56,
+            "rate": 1.0
+          },
+          "single-session-preference": {
+            "hits": 28,
+            "n": 30,
+            "rate": 0.9333333333333333
+          },
+          "single-session-user": {
+            "hits": 64,
+            "n": 70,
+            "rate": 0.9142857142857143
+          },
+          "temporal-reasoning": {
+            "hits": 121,
+            "n": 133,
+            "rate": 0.9097744360902256
+          }
+        },
+        "rate": 0.944
+      },
+      "@5": {
+        "hits": 489,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 78,
+            "n": 78,
+            "rate": 1.0
+          },
+          "multi-session": {
+            "hits": 131,
+            "n": 133,
+            "rate": 0.9849624060150376
+          },
+          "single-session-assistant": {
+            "hits": 56,
+            "n": 56,
+            "rate": 1.0
+          },
+          "single-session-preference": {
+            "hits": 29,
+            "n": 30,
+            "rate": 0.9666666666666667
+          },
+          "single-session-user": {
+            "hits": 67,
+            "n": 70,
+            "rate": 0.9571428571428572
+          },
+          "temporal-reasoning": {
+            "hits": 128,
+            "n": 133,
+            "rate": 0.9624060150375939
+          }
+        },
+        "rate": 0.978
+      },
+      "ci95_rate@10": [
+        0.98,
+        0.998
+      ]
+    },
+    "head_global": {
+      "@1": {
+        "hits": 52,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 5,
+            "n": 78,
+            "rate": 0.0641025641025641
+          },
+          "multi-session": {
+            "hits": 8,
+            "n": 133,
+            "rate": 0.06015037593984962
+          },
+          "single-session-assistant": {
+            "hits": 25,
+            "n": 56,
+            "rate": 0.44642857142857145
+          },
+          "single-session-preference": {
+            "hits": 2,
+            "n": 30,
+            "rate": 0.06666666666666667
+          },
+          "single-session-user": {
+            "hits": 1,
+            "n": 70,
+            "rate": 0.014285714285714285
+          },
+          "temporal-reasoning": {
+            "hits": 11,
+            "n": 133,
+            "rate": 0.08270676691729323
+          }
+        },
+        "rate": 0.104
+      },
+      "@10": {
+        "hits": 167,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 21,
+            "n": 78,
+            "rate": 0.2692307692307692
+          },
+          "multi-session": {
+            "hits": 41,
+            "n": 133,
+            "rate": 0.3082706766917293
+          },
+          "single-session-assistant": {
+            "hits": 49,
+            "n": 56,
+            "rate": 0.875
+          },
+          "single-session-preference": {
+            "hits": 5,
+            "n": 30,
+            "rate": 0.16666666666666666
+          },
+          "single-session-user": {
+            "hits": 6,
+            "n": 70,
+            "rate": 0.08571428571428572
+          },
+          "temporal-reasoning": {
+            "hits": 45,
+            "n": 133,
+            "rate": 0.3383458646616541
+          }
+        },
+        "rate": 0.334
+      },
+      "@3": {
+        "hits": 104,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 10,
+            "n": 78,
+            "rate": 0.1282051282051282
+          },
+          "multi-session": {
+            "hits": 25,
+            "n": 133,
+            "rate": 0.18796992481203006
+          },
+          "single-session-assistant": {
+            "hits": 47,
+            "n": 56,
+            "rate": 0.8392857142857143
+          },
+          "single-session-preference": {
+            "hits": 2,
+            "n": 30,
+            "rate": 0.06666666666666667
+          },
+          "single-session-user": {
+            "hits": 2,
+            "n": 70,
+            "rate": 0.02857142857142857
+          },
+          "temporal-reasoning": {
+            "hits": 18,
+            "n": 133,
+            "rate": 0.13533834586466165
+          }
+        },
+        "rate": 0.208
+      },
+      "@5": {
+        "hits": 126,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 13,
+            "n": 78,
+            "rate": 0.16666666666666666
+          },
+          "multi-session": {
+            "hits": 34,
+            "n": 133,
+            "rate": 0.2556390977443609
+          },
+          "single-session-assistant": {
+            "hits": 48,
+            "n": 56,
+            "rate": 0.8571428571428571
+          },
+          "single-session-preference": {
+            "hits": 3,
+            "n": 30,
+            "rate": 0.1
+          },
+          "single-session-user": {
+            "hits": 3,
+            "n": 70,
+            "rate": 0.04285714285714286
+          },
+          "temporal-reasoning": {
+            "hits": 25,
+            "n": 133,
+            "rate": 0.18796992481203006
+          }
+        },
+        "rate": 0.252
+      },
+      "ci95_rate@10": [
+        0.292,
+        0.376
+      ]
+    },
+    "head_within": {
+      "@1": {
+        "hits": 373,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 59,
+            "n": 78,
+            "rate": 0.7564102564102564
+          },
+          "multi-session": {
+            "hits": 112,
+            "n": 133,
+            "rate": 0.8421052631578947
+          },
+          "single-session-assistant": {
+            "hits": 55,
+            "n": 56,
+            "rate": 0.9821428571428571
+          },
+          "single-session-preference": {
+            "hits": 15,
+            "n": 30,
+            "rate": 0.5
+          },
+          "single-session-user": {
+            "hits": 36,
+            "n": 70,
+            "rate": 0.5142857142857142
+          },
+          "temporal-reasoning": {
+            "hits": 96,
+            "n": 133,
+            "rate": 0.7218045112781954
+          }
+        },
+        "rate": 0.746
+      },
+      "@10": {
+        "hits": 484,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 78,
+            "n": 78,
+            "rate": 1.0
+          },
+          "multi-session": {
+            "hits": 132,
+            "n": 133,
+            "rate": 0.9924812030075187
+          },
+          "single-session-assistant": {
+            "hits": 55,
+            "n": 56,
+            "rate": 0.9821428571428571
+          },
+          "single-session-preference": {
+            "hits": 29,
+            "n": 30,
+            "rate": 0.9666666666666667
+          },
+          "single-session-user": {
+            "hits": 62,
+            "n": 70,
+            "rate": 0.8857142857142857
+          },
+          "temporal-reasoning": {
+            "hits": 128,
+            "n": 133,
+            "rate": 0.9624060150375939
+          }
+        },
+        "rate": 0.968
+      },
+      "@3": {
+        "hits": 446,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 73,
+            "n": 78,
+            "rate": 0.9358974358974359
+          },
+          "multi-session": {
+            "hits": 126,
+            "n": 133,
+            "rate": 0.9473684210526315
+          },
+          "single-session-assistant": {
+            "hits": 55,
+            "n": 56,
+            "rate": 0.9821428571428571
+          },
+          "single-session-preference": {
+            "hits": 24,
+            "n": 30,
+            "rate": 0.8
+          },
+          "single-session-user": {
+            "hits": 50,
+            "n": 70,
+            "rate": 0.7142857142857143
+          },
+          "temporal-reasoning": {
+            "hits": 118,
+            "n": 133,
+            "rate": 0.8872180451127819
+          }
+        },
+        "rate": 0.892
+      },
+      "@5": {
+        "hits": 462,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 76,
+            "n": 78,
+            "rate": 0.9743589743589743
+          },
+          "multi-session": {
+            "hits": 126,
+            "n": 133,
+            "rate": 0.9473684210526315
+          },
+          "single-session-assistant": {
+            "hits": 55,
+            "n": 56,
+            "rate": 0.9821428571428571
+          },
+          "single-session-preference": {
+            "hits": 25,
+            "n": 30,
+            "rate": 0.8333333333333334
+          },
+          "single-session-user": {
+            "hits": 57,
+            "n": 70,
+            "rate": 0.8142857142857143
+          },
+          "temporal-reasoning": {
+            "hits": 123,
+            "n": 133,
+            "rate": 0.924812030075188
+          }
+        },
+        "rate": 0.924
+      },
+      "ci95_rate@10": [
+        0.952,
+        0.982
+      ]
+    },
+    "keyword_global": {
+      "@1": {
+        "hits": 107,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 30,
+            "n": 78,
+            "rate": 0.38461538461538464
+          },
+          "multi-session": {
+            "hits": 22,
+            "n": 133,
+            "rate": 0.16541353383458646
+          },
+          "single-session-assistant": {
+            "hits": 29,
+            "n": 56,
+            "rate": 0.5178571428571429
+          },
+          "single-session-preference": {
+            "hits": 1,
+            "n": 30,
+            "rate": 0.03333333333333333
+          },
+          "single-session-user": {
+            "hits": 9,
+            "n": 70,
+            "rate": 0.12857142857142856
+          },
+          "temporal-reasoning": {
+            "hits": 16,
+            "n": 133,
+            "rate": 0.12030075187969924
+          }
+        },
+        "rate": 0.214
+      },
+      "@10": {
+        "hits": 273,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 62,
+            "n": 78,
+            "rate": 0.7948717948717948
+          },
+          "multi-session": {
+            "hits": 57,
+            "n": 133,
+            "rate": 0.42857142857142855
+          },
+          "single-session-assistant": {
+            "hits": 53,
+            "n": 56,
+            "rate": 0.9464285714285714
+          },
+          "single-session-preference": {
+            "hits": 3,
+            "n": 30,
+            "rate": 0.1
+          },
+          "single-session-user": {
+            "hits": 30,
+            "n": 70,
+            "rate": 0.42857142857142855
+          },
+          "temporal-reasoning": {
+            "hits": 68,
+            "n": 133,
+            "rate": 0.5112781954887218
+          }
+        },
+        "rate": 0.546
+      },
+      "@3": {
+        "hits": 197,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 49,
+            "n": 78,
+            "rate": 0.6282051282051282
+          },
+          "multi-session": {
+            "hits": 37,
+            "n": 133,
+            "rate": 0.2781954887218045
+          },
+          "single-session-assistant": {
+            "hits": 52,
+            "n": 56,
+            "rate": 0.9285714285714286
+          },
+          "single-session-preference": {
+            "hits": 2,
+            "n": 30,
+            "rate": 0.06666666666666667
+          },
+          "single-session-user": {
+            "hits": 17,
+            "n": 70,
+            "rate": 0.24285714285714285
+          },
+          "temporal-reasoning": {
+            "hits": 40,
+            "n": 133,
+            "rate": 0.3007518796992481
+          }
+        },
+        "rate": 0.394
+      },
+      "@5": {
+        "hits": 221,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 57,
+            "n": 78,
+            "rate": 0.7307692307692307
+          },
+          "multi-session": {
+            "hits": 44,
+            "n": 133,
+            "rate": 0.3308270676691729
+          },
+          "single-session-assistant": {
+            "hits": 52,
+            "n": 56,
+            "rate": 0.9285714285714286
+          },
+          "single-session-preference": {
+            "hits": 3,
+            "n": 30,
+            "rate": 0.1
+          },
+          "single-session-user": {
+            "hits": 19,
+            "n": 70,
+            "rate": 0.2714285714285714
+          },
+          "temporal-reasoning": {
+            "hits": 46,
+            "n": 133,
+            "rate": 0.3458646616541353
+          }
+        },
+        "rate": 0.442
+      },
+      "ci95_rate@10": [
+        0.502,
+        0.588
+      ]
+    },
+    "keyword_within": {
+      "@1": {
+        "hits": 443,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 73,
+            "n": 78,
+            "rate": 0.9358974358974359
+          },
+          "multi-session": {
+            "hits": 120,
+            "n": 133,
+            "rate": 0.9022556390977443
+          },
+          "single-session-assistant": {
+            "hits": 56,
+            "n": 56,
+            "rate": 1.0
+          },
+          "single-session-preference": {
+            "hits": 18,
+            "n": 30,
+            "rate": 0.6
+          },
+          "single-session-user": {
+            "hits": 63,
+            "n": 70,
+            "rate": 0.9
+          },
+          "temporal-reasoning": {
+            "hits": 113,
+            "n": 133,
+            "rate": 0.849624060150376
+          }
+        },
+        "rate": 0.886
+      },
+      "@10": {
+        "hits": 496,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 78,
+            "n": 78,
+            "rate": 1.0
+          },
+          "multi-session": {
+            "hits": 131,
+            "n": 133,
+            "rate": 0.9849624060150376
+          },
+          "single-session-assistant": {
+            "hits": 56,
+            "n": 56,
+            "rate": 1.0
+          },
+          "single-session-preference": {
+            "hits": 29,
+            "n": 30,
+            "rate": 0.9666666666666667
+          },
+          "single-session-user": {
+            "hits": 70,
+            "n": 70,
+            "rate": 1.0
+          },
+          "temporal-reasoning": {
+            "hits": 132,
+            "n": 133,
+            "rate": 0.9924812030075187
+          }
+        },
+        "rate": 0.992
+      },
+      "@3": {
+        "hits": 479,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 78,
+            "n": 78,
+            "rate": 1.0
+          },
+          "multi-session": {
+            "hits": 128,
+            "n": 133,
+            "rate": 0.9624060150375939
+          },
+          "single-session-assistant": {
+            "hits": 56,
+            "n": 56,
+            "rate": 1.0
+          },
+          "single-session-preference": {
+            "hits": 23,
+            "n": 30,
+            "rate": 0.7666666666666667
+          },
+          "single-session-user": {
+            "hits": 68,
+            "n": 70,
+            "rate": 0.9714285714285714
+          },
+          "temporal-reasoning": {
+            "hits": 126,
+            "n": 133,
+            "rate": 0.9473684210526315
+          }
+        },
+        "rate": 0.958
+      },
+      "@5": {
+        "hits": 486,
+        "n": 500,
+        "per_type": {
+          "knowledge-update": {
+            "hits": 78,
+            "n": 78,
+            "rate": 1.0
+          },
+          "multi-session": {
+            "hits": 129,
+            "n": 133,
+            "rate": 0.9699248120300752
+          },
+          "single-session-assistant": {
+            "hits": 56,
+            "n": 56,
+            "rate": 1.0
+          },
+          "single-session-preference": {
+            "hits": 26,
+            "n": 30,
+            "rate": 0.8666666666666667
+          },
+          "single-session-user": {
+            "hits": 70,
+            "n": 70,
+            "rate": 1.0
+          },
+          "temporal-reasoning": {
+            "hits": 127,
+            "n": 133,
+            "rate": 0.9548872180451128
+          }
+        },
+        "rate": 0.972
+      },
+      "ci95_rate@10": [
+        0.984,
+        0.998
+      ]
+    }
+  },
+  "measured_on": "2026-11-26",
+  "model": {
+    "batch_size": 128,
+    "cuda": "12.4",
+    "cuda_available": true,
+    "gpu": "NVIDIA GeForce RTX 3090",
+    "matmul_allow_tf32": false,
+    "max_seq_length": 256,
+    "name": "sentence-transformers/all-MiniLM-L6-v2",
+    "numpy": "2.5.4",
+    "param_dtype": "torch.float32",
+    "platform": "Linux-6.18.58.1-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "seed": 20261206,
+    "sentence_transformers": "6.2.0",
+    "snapshot_files": {
+      "1110a243fdf4706b3f48f1d95db1a4f5529b4d41/config.json": {
+        "bytes": 612,
+        "sha256": "953f9c0d463486b10a6871cc2fd59f223b2c70184f49815e7efbcab5d8908b41"
+      },
+      "1110a243fdf4706b3f48f1d95db1a4f5529b4d41/model.safetensors": {
+        "bytes": 90868376,
+        "sha256": "53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db"
+      },
+      "1110a243fdf4706b3f48f1d95db1a4f5529b4d41/tokenizer.json": {
+        "bytes": 466247,
+        "sha256": "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037"
+      }
+    },
+    "torch": "2.6.0+cu124"
+  },
+  "paired": {
+    "chunkmax_global_minus_chunkmax_within@10": {
+      "ci95": [
+        -0.604,
+        -0.518
+      ],
+      "delta": -0.56
+    },
+    "chunkmax_global_minus_keyword_global@10": {
+      "ci95": [
+        -0.158,
+        -0.074
+      ],
+      "delta": -0.116
+    },
+    "chunkmax_within_minus_head_within@10": {
+      "ci95": [
+        0.008,
+        0.036
+      ],
+      "delta": 0.022
+    },
+    "head_global_minus_keyword_global@10": {
+      "ci95": [
+        -0.258,
+        -0.166
+      ],
+      "delta": -0.212
+    }
+  },
+  "receipts": {
+    "freeze_sha256": "0af62ab27cc0d04cd6a8af83b0351396b924b5660b6c97ba19c850d65bad5762",
+    "frozen_phase1_results_sha256": "66e8ada0af1d2816f18b28e6412e9b126dfe992d32952271343d20a327213d9d",
+    "frozen_phase1_script_sha256": "5ed7b76fd55b96ea153598aca87db8d9c90fc3549c039487a801ff01c8c08264",
+    "phase0_audit_sha256": "47afff383532df9385690fafa91bb3c346b11236043822e38cc0db10ebc6bfaf",
+    "protocol_phase2_sha256": "7a894cc0f031dd8cba1eb75fd4370979de5150c80cc9427df356c9fb1fcf8de9",
+    "protocol_sha256": "44f53cdd6a765ab9d0d7577e7bf989657939707bf76a838dc4b2a8bc98893dca",
+    "published_script_reproduces_frozen_counts": true,
+    "published_script_sha256": "8e85334df4904be8c16921a13c6e8b62d73e5752a0d65c416a688d975542e59e"
+  },
+  "schema_version": 1,
+  "settings": {
+    "bootstrap": {
+      "resamples": 10000,
+      "seed": 20261205
+    },
+    "global": "candidates = all unique sessions, no filter",
+    "ground_truth": "answer_session_ids (always inside the question's haystack: 500/500)",
+    "metric": "hit@k = any answer session among the top-k distinct sessions; ties by ascending session index",
+    "representations": {
+      "chunk-max": "turn-aligned chunks <= 200 word-pieces, max cosine per session",
+      "head": "one MiniLM vector per session, model-default truncation",
+      "keyword": "SQLite FTS5 unicode61, OR-query, bm25()"
+    },
+    "unit": "unique session (deduplicated by session id, first-occurrence order)",
+    "within": "candidates = the question's own haystack sessions"
+  },
+  "status": "COMPLETE"
+}

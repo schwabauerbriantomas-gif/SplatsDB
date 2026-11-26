@@ -94,7 +94,8 @@ jobs:
           ignore: RUSTSEC-2026-0441
 
   # Numeric validation harness: deterministic unit tests plus a small Faiss
-  # integration probe. UMAP is intentionally not installed in CI; the local
+  # integration probe, the LongMemEval scope tests and the report sync check.
+  # UMAP is intentionally not installed in CI; the local
   # atlas runner remains syntax-checked and receipt-verified separately.
   benchmark-tools:
     name: Benchmark tools (IVF/atlas)
@@ -108,9 +109,14 @@ jobs:
       - name: Install numeric test dependencies
         run: python -m pip install numpy scipy scikit-learn matplotlib faiss-cpu
       - name: Byte-compile benchmark harness
-        run: python -m py_compile benchmarks/ivf_atlas_common.py benchmarks/benchmark_ivf.py benchmarks/build_embedding_atlas.py benchmarks/report_ivf_atlas.py tests/test_ivf_atlas.py
+        run: python -m py_compile benchmarks/ivf_atlas_common.py benchmarks/benchmark_ivf.py benchmarks/build_embedding_atlas.py benchmarks/report_ivf_atlas.py tests/test_ivf_atlas.py benchmarks/longmemeval_scope.py benchmarks/report_longmemeval_scope.py benchmarks/benchmark_reproducible.py tests/test_longmemeval_scope.py
       - name: Unit and Faiss integration tests
         run: python -m unittest discover -s tests -p 'test_ivf_atlas.py' -v
+
+      - name: Unit tests (LongMemEval scope) and report sync
+        run: |
+          python -m unittest discover -s tests -p 'test_longmemeval_scope.py' -v
+          python benchmarks/report_longmemeval_scope.py --check
 
   # Python tooling of the Hermes memory hub (semantic-hub/hermes_*).
   # Stdlib-only by design: no pip deps, no GPU, no services — the embed

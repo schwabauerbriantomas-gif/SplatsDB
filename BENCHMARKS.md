@@ -171,11 +171,14 @@ The native run's recall (0.304) vs the NumPy reference (0.966) is a real gap und
 
 > **Corrected attribution (2026-10-25)**: a previous version of this section (and the `longmemeval` block in `bench-data/benchmark_results_hardware.json`) presented the NumPy recall (0.966) together with "3,125 QPS / p50 0.029 ms / build 105.3 s" as one "SplatsDB v2.5.0 native pipeline" result that "beats all published systems". Those throughput/latency figures appear in **neither** source JSON (5a has p50 0.056 ms and no QPS; 5b has 671.63 QPS / p50 1.448 ms / recall 0.304) and the "beats all published systems" claim compared retrieval-only against end-to-end systems. They were withdrawn — see [Removed claims](#removed-claims).
 
-Reproduce:
+> **Re-measured (2026-11-26) — the gap was scope, not the engine.** The NumPy reference ranks inside each question's own haystack (median 48 candidate sessions). On the same dataset and model, the current engine's haystack-restricted path returns **484/500 = 96.8%** hit@10 (reference 483/500), so the native 0.304 is not an engine gap. With the filter removed — one memory of 19,195 sessions — the same head vectors give **33.4%** [29.2, 37.6], turn-aligned chunk-max **43.0%** [38.6, 47.2] and keyword search (SQLite FTS5) **54.6%** [50.2, 58.8] at hit@10. The April native per-type pattern matches the unfiltered search (152/500 then, 167/500 now). Per-type tables, engine-parity receipts and limits: [`docs/validation/longmemeval-scope.md`](docs/validation/longmemeval-scope.md). The 2026-04-09 numbers above are kept unchanged; the attribution to "session grouping, L2-vs-cosine, ef tuning" is superseded by this measurement.
+
+Reproduce (the two 2026-04-09 scripts are not in the repository; these are the current runners):
 ```bash
-# TODO-B4 (requires embedding service + datasets in bench-data/)
-[COMANDO: python bench-data/longmemeval_full.py]           # 5a — NumPy reference
-[COMANDO: python bench-data/longmemeval_splatdb_native.py]  # 5b — native pipeline
+# Scope ladder: NumPy + SQLite FTS5, haystack-restricted and global scope, aggregate output only
+python benchmarks/longmemeval_scope.py --dataset longmemeval_s_cleaned.json --cache-dir /tmp/lm_cache
+# Engine on the same vectors: --scope wing (haystack-restricted, default) or --scope global (whole store)
+splatsdb bench-long-mem-eval --scope global --sessions sessions.bin --queries queries.bin --meta meta.json --dump dump.jsonl
 ```
 
 ---
