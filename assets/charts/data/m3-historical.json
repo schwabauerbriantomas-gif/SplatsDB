@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "source_receipt": "m3_eval/REPORT.json",
+  "verdict": "NO_GO",
+  "n_questions": 500,
+  "required_complete_pairs": 500,
+  "context_reduction": {
+    "glm-5.4": {
+      "paired_questions": 498,
+      "baseline_median": 70241,
+      "m3_total_median": 4376.5,
+      "m3_largest_median": 4376.5,
+      "reduction_percent": 93.76930852351191
+    },
+    "glm-5.3-flash": {
+      "paired_questions": 498,
+      "baseline_median": 70241,
+      "m3_total_median": 4378.5,
+      "m3_largest_median": 4378.5,
+      "reduction_percent": 93.76646118363918
+    }
+  },
+  "accuracy": {
+    "scored_questions": 499,
+    "glm-5.4": 0.814629258517034,
+    "glm-5.3-flash": 0.7955911823647295,
+    "delta_pp": 1.903807615230461,
+    "mcnemar": {
+      "positive": 36,
+      "negative": 23,
+      "p": 0.11747735024505848
+    }
+  },
+  "judges": {
+    "glm-5.4": {
+      "agreement": 0.9539078156312625,
+      "kappa": 0.8474350964414371,
+      "invalid_answers": 1,
+      "invalid_judged": 2
+    },
+    "glm-5.3-flash": {
+      "agreement": 0.9839679358717435,
+      "kappa": 0.9507099641931102,
+      "invalid_answers": 1,
+      "invalid_judged": 2
+    }
+  },
+  "m3_error_calls": 2
+}

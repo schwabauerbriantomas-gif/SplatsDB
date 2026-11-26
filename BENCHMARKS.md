@@ -108,7 +108,7 @@ Two runs of `cargo test --release --features cuda test_ptx_kernel_performance --
 | GPU (`batch_l2_distances`, RTX 3090) | **27 ms** | **20.93×** |
 
 **Run B — 2026-10-25 (6 runs, fused top-k k=16)**
-**Source**: [`bench-data/gpu_kernel_microbench_2026-10-25.json`](bench-data/gpu_kernel_microbench_2026-10-25.json) — `cargo test --release test_ptx_kernel_performance -- --nocapture`
+**Source**: transcribed from the test log; no JSON artifact is present in this tree — `cargo test --release test_ptx_kernel_performance -- --nocapture`
 **Conditions**: same shape; `l2_topk` fused kernel, **k=16**; the public batch wrapper uploads the dataset per call (VRAM cache not exercised — the production `/search` path uses `cached_dataset_index` since `1e6b4ea`)
 
 | Run | CPU ms | GPU ms | Speedup | Note |
@@ -119,7 +119,7 @@ Two runs of `cargo test --release --features cuda test_ptx_kernel_performance --
 | 4 | 738 | 29 | 25.45× | GPU outlier: concurrent cargo builds on host |
 | 5 | 630 | 21 | 30.0× | |
 | 6 | 575 | 17 | 33.82× | |
-| **Median** | **630** | **20** | **30.6×** | range: GPU 17–29 ms, CPU 563–738 ms |
+| **Median** | **605** | **19.5** | **30.6×** | median of run-level speedups; ratio of medians 31.03×; GPU range 17–29 ms, CPU 563–738 ms |
 
 Companion correctness test `test_ptx_kernel_correctness`: **PASS** (GPU/CPU agreement within 1e-2).
 
@@ -168,7 +168,7 @@ These figures validate the **retrieval approach** (embeddings + cosine), not Spl
 
 The native run's recall (0.304) vs the NumPy reference (0.966) is a real gap under this methodology (session grouping, L2-vs-cosine, ef tuning) — see the source JSON and `bench-data/longmemeval_splatdb_native.py` for the analysis. No end-to-end comparison against published systems is claimed: the paper's best 86.2% is for end-to-end systems, while both rows above are retrieval-only (different tasks).
 
-> **Corrected attribution (2026-10-25)**: a previous version of this section (and the `longmemeval` block in `bench-data/benchmark_results_hardware.json`) presented the NumPy recall (0.966) together with "3,125 QPS / p50 0.029 ms / build 105.3 s" as one "SplatDB v2.5.0 native pipeline" result that "beats all published systems". Those throughput/latency figures appear in **neither** source JSON (5a has p50 0.056 ms and no QPS; 5b has 671.63 QPS / p50 1.448 ms / recall 0.304) and the "beats all published systems" claim compared retrieval-only against end-to-end systems. They were withdrawn — see [Removed claims](#removed-claims).
+> **Corrected attribution (2026-10-25)**: a previous version of this section (and the `longmemeval` block in `bench-data/benchmark_results_hardware.json`) presented the NumPy recall (0.966) together with "3,125 QPS / p50 0.029 ms / build 105.3 s" as one "SplatsDB v2.5.0 native pipeline" result that "beats all published systems". Those throughput/latency figures appear in **neither** source JSON (5a has p50 0.056 ms and no QPS; 5b has 671.63 QPS / p50 1.448 ms / recall 0.304) and the "beats all published systems" claim compared retrieval-only against end-to-end systems. They were withdrawn — see [Removed claims](#removed-claims).
 
 Reproduce:
 ```bash
@@ -191,8 +191,8 @@ The following numbers appeared in previous versions of README.md / BENCHMARKS.md
 | "SplatsDB GPU **beats** Faiss HNSW CPU — 1.25× faster" | README Faiss comparison | Misleading framing: compares GPU brute-force at k=10 against Faiss CPU ANN at k=64. Different regimes; restated as "different regimes, not a head-to-head win". |
 | LongMemEval "beats all published systems" | README, `benchmark_results_hardware.json` analysis note | Retrieval-only (96.6%) vs paper's end-to-end systems (86.2%) — different tasks; caveat added, no system-level claim. |
 | HRM2 "Validated Rust result" table — Linear scan 94.79 ms / 10.55 QPS vs HRM2 0.99 ms / 1,012.77 QPS = "32.4×" | README "HRM2 vs Linear Scan" section | No source artifact (no JSON, no run log) and internally inconsistent arithmetic (1,012.77/10.55 ≈ 96×, not 32.4×). Table removed; replaced by an explicit NOT VALIDATED note. The historical "32× Python prototype" claim remains labeled as unvalidated context. |
-| LongMemEval throughput "3,125 QPS / p50 0.029 ms / build 105.3 s" attributed to the "SplatDB v2.5.0 native pipeline" (recall 0.966) | `bench-data/benchmark_results_hardware.json` `longmemeval` block; previous BENCHMARKS.md §5 | Numbers exist in no source JSON: `longmemeval_full_results.json` (NumPy reference — recall 0.966, p50 0.056 ms, no QPS) and `longmemeval_splatdb_native.json` (native — 671.63 QPS, p50 1.448 ms, recall@10 0.304) disagree with every figure. §5 rewritten as 5a (NumPy) / 5b (native) citing both JSONs; the JSON block itself still needs the same fix (owned by another agent). |
-| GPU microbenchmark "CPU 718 ms vs GPU 18 ms = 39.89×" (`test_ptx_kernel_performance`, 10K×640D×100q, 2026-10-15) | README "GPU Acceleration → Performance" | Contradicted the same test's logged run (565 ms / 27 ms / 20.93×, documented in §4 and README's benchmark section) and had no preserved run log. Replaced by the 20.93× figure; re-measured 2026-10-25 with a persisted artifact (`bench-data/gpu_kernel_microbench_2026-10-25.json`) — see §4. |
+| LongMemEval throughput "3,125 QPS / p50 0.029 ms / build 105.3 s" attributed to the "SplatsDB v2.5.0 native pipeline" (recall 0.966) | `bench-data/benchmark_results_hardware.json` `longmemeval` block; previous BENCHMARKS.md §5 | Numbers exist in no source JSON: `longmemeval_full_results.json` (NumPy reference — recall 0.966, p50 0.056 ms, no QPS) and `longmemeval_splatdb_native.json` (native — 671.63 QPS, p50 1.448 ms, recall@10 0.304) disagree with every figure. §5 rewritten as 5a (NumPy) / 5b (native) citing both JSONs; the JSON block itself still needs the same fix (owned by another agent). |
+| GPU microbenchmark "CPU 718 ms vs GPU 18 ms = 39.89×" (`test_ptx_kernel_performance`, 10K×640D×100q, 2026-10-15) | README "GPU Acceleration → Performance" | Contradicted the same test's logged run (565 ms / 27 ms / 20.93×, documented in §4 and README's benchmark section) and had no preserved run log. Replaced by the 20.93× figure; re-measured 2026-10-25 with per-run values transcribed here (no persisted JSON artifact) — see §4. |
 | TurboQuant ">95% top-10 recall at 5% search fraction" (4-bit, 640D) | README "Vector Compression → Compression Ratio" | No preserved result artifact. Replaced by a "source not preserved" note pointing at `quant-index`/`quant-search` for self-measurement. |
 | BEIR "Alternative Approaches" A/B table — BGE-base 0.5806 avg NDCG@10, passage-level 0.5432, title-only 0.1422, BM25+RRF ~0.55 | README "BEIR Information Retrieval → Alternative Approaches" | No preserved result files (`bench-data/alternative_results.json` covers only the fiqa baseline, NDCG@10 0.3848). Kept in README with a visible "source not preserved" label as directional findings; not citable as measured results. |
 

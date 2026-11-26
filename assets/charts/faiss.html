@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>SplatsDB vs Faiss — measured search regimes</title><meta name="description" content="SplatsDB vs Faiss — measured search regimes"/>
+<style>:root {
+  color-scheme: dark;
+  --bg: #070b14;
+  --surface: #0d1424;
+  --surface-2: #111b30;
+  --line: #263653;
+  --line-soft: #1a2942;
+  --text: #f1f5fd;
+  --muted: #98a8c3;
+  --faint: #6f7f9c;
+  --primary: #8ca3d4;
+  --deep: #34508e;
+  --secondary: #5f7cad;
+  --track: #192640;
+  --go: #7bc7a4;
+  --no-go: #df8294;
+  --warn: #d7b96f;
+  --radius: 22px;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; background: var(--bg); }
+body { font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: var(--text); }
+.chart {
+  position: relative;
+  isolation: isolate;
+  width: 1800px;
+  height: 1400px;
+  padding: 48px 60px 38px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 90% 2%, rgba(52, 80, 142, .32), transparent 35%),
+    radial-gradient(circle at 4% 100%, rgba(140, 163, 212, .07), transparent 30%),
+    var(--bg);
+}
+.chart::before, .chart::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  border: 1px solid rgba(140, 163, 212, .09);
+  border-radius: 50%;
+  pointer-events: none;
+}
+.chart::before { width: 760px; height: 760px; right: -260px; top: -350px; }
+.chart::after { width: 440px; height: 440px; right: -90px; top: -180px; }
+.header { display: flex; align-items: center; justify-content: space-between; gap: 32px; min-height: 126px; }
+.brand { display: flex; align-items: center; gap: 24px; min-width: 0; }
+.brand-mark { width: 104px; height: 104px; flex: 0 0 auto; }
+.kicker { color: var(--primary); font-size: 18px; font-weight: 750; letter-spacing: .16em; text-transform: uppercase; }
+h1 { margin: 9px 0 10px; font-size: 45px; line-height: 1.06; letter-spacing: -.035em; }
+.subtitle { margin: 0; color: var(--muted); font-size: 23px; line-height: 1.35; }
+.status {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 20px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(13, 20, 36, .88);
+  color: var(--primary);
+  font-size: 18px;
+  font-weight: 750;
+  letter-spacing: .07em;
+  text-align: center;
+  line-height: 1.3;
+}
+.status::before { content: ""; width: 10px; height: 10px; border-radius: 50%; background: currentColor; }
+.status.go { color: var(--go); border-color: rgba(123, 199, 164, .45); }
+.status.no-go { color: var(--no-go); border-color: rgba(223, 130, 148, .45); }
+.status.neutral { color: var(--primary); }
+.kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px; }
+.kpi {
+  min-height: 144px;
+  padding: 21px 24px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  background: linear-gradient(145deg, rgba(17, 27, 48, .94), rgba(13, 20, 36, .88));
+}
+.kpi-label { color: var(--muted); font-size: 16px; font-weight: 700; letter-spacing: .11em; text-transform: uppercase; }
+.kpi-value { margin-top: 8px; font-size: 42px; line-height: 1.05; font-weight: 760; letter-spacing: -.035em; }
+.kpi-value.go { color: var(--go); }
+.kpi-value.no-go { color: var(--no-go); }
+.kpi-detail { margin-top: 10px; color: var(--muted); font-size: 19px; line-height: 1.3; }
+.panels { display: grid; gap: 22px; flex: 1; min-height: 0; }
+.panels.two { grid-template-columns: 1.12fr .88fr; }
+.panels.equal { grid-template-columns: 1fr 1fr; }
+.panel {
+  min-width: 0;
+  padding: 24px 28px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: linear-gradient(150deg, rgba(17, 27, 48, .93), rgba(13, 20, 36, .95));
+}
+.panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 12px; }
+.panel-title { margin: 0; font-size: 28px; line-height: 1.15; letter-spacing: -.02em; }
+.panel-note { margin: 7px 0 0; color: var(--muted); font-size: 19px; line-height: 1.3; }
+.tag {
+  display: inline-block;
+  flex: 0 0 auto;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--muted);
+  background: var(--surface);
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: .04em;
+}
+.bar-row { display: grid; grid-template-columns: 245px minmax(0, 1fr) 142px; align-items: center; gap: 16px; min-height: 52px; }
+.bar-label { min-width: 0; font-size: 22px; line-height: 1.18; }
+.bar-label small, .small { display: block; margin-top: 4px; color: var(--faint); font-size: 16px; font-weight: 500; }
+.track { position: relative; height: 30px; overflow: hidden; border-radius: 10px; background: var(--track); }
+.fill { height: 100%; min-width: 3px; border-radius: 9px 10px 10px 9px; background: var(--primary); }
+.fill.secondary { background: var(--secondary); }
+.fill.deep { background: var(--deep); }
+.fill.go { background: var(--go); }
+.fill.no-go { background: var(--no-go); }
+.fill.warn { background: var(--warn); }
+.fill.outline { background: rgba(140, 163, 212, .12); border: 1px solid var(--primary); }
+.bar-value { color: var(--text); font-size: 22px; font-weight: 720; text-align: right; white-space: nowrap; }
+.bar-value small { color: var(--muted); font-size: 15px; font-weight: 550; }
+.legend { display: flex; flex-wrap: wrap; gap: 16px 22px; margin-top: 16px; color: var(--muted); font-size: 17px; }
+.legend-item { display: inline-flex; align-items: center; gap: 9px; }
+.dot { width: 11px; height: 11px; border-radius: 50%; background: var(--primary); }
+.dot.secondary { background: var(--secondary); }
+.dot.deep { background: var(--deep); }
+.dot.go { background: var(--go); }
+.dot.no-go { background: var(--no-go); }
+.hero-metric { display: flex; align-items: baseline; gap: 16px; margin: 4px 0 8px; }
+.hero-metric strong { font-size: 68px; line-height: 1; letter-spacing: -.05em; }
+.hero-metric span { color: var(--muted); font-size: 21px; }
+.split-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 18px; }
+.metric-box { padding: 17px 18px; border: 1px solid var(--line-soft); border-radius: 15px; background: rgba(7, 11, 20, .46); }
+.metric-box .metric-value { font-size: 29px; font-weight: 730; }
+.metric-box .metric-label { margin-top: 6px; color: var(--muted); font-size: 16px; line-height: 1.25; }
+.callout { margin-top: 18px; padding: 16px 18px; border-left: 4px solid var(--primary); border-radius: 4px 12px 12px 4px; background: rgba(140, 163, 212, .07); color: var(--muted); font-size: 19px; line-height: 1.42; }
+.callout.go { border-left-color: var(--go); }
+.callout.no-go { border-left-color: var(--no-go); }
+.callout strong { color: var(--text); }
+.type-row { display: grid; grid-template-columns: 270px minmax(0, 1fr); gap: 18px; align-items: center; min-height: 59px; }
+.type-name { font-size: 20px; line-height: 1.15; }
+.type-name small { margin-top: 3px; }
+.type-bars { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 18px; }
+.type-bar { min-width: 0; }
+.type-bar-top { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 5px; color: var(--muted); font-size: 15px; }
+.type-bar-top strong { color: var(--text); font-size: 16px; }
+.type-bar .track { height: 17px; }
+.footer { display: flex; align-items: flex-start; justify-content: space-between; gap: 30px; padding-top: 15px; border-top: 1px solid var(--line-soft); color: var(--faint); font-size: 16px; line-height: 1.4; }
+.footer .source { max-width: 1340px; }
+.footer .build { flex: 0 0 auto; color: var(--muted); font-weight: 650; white-space: nowrap; }
+a { color: var(--primary); text-decoration: none; }
+.code { font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; }
+@media (max-width: 1100px) {
+  .chart { width: 100%; height: auto; min-height: 0; padding: 28px; }
+  .header, .footer { flex-direction: column; align-items: flex-start; }
+  .kpis, .panels.two, .panels.equal, .split-metrics { grid-template-columns: 1fr; }
+  .bar-row { grid-template-columns: 170px minmax(0, 1fr) 105px; }
+  .type-row { grid-template-columns: 1fr; }
+  h1 { font-size: 36px; }
+  .brand-mark { width: 76px; height: 76px; }
+}
+</style></head>
+<body><main class="chart" role="img" aria-label="SplatsDB vs Faiss — measured search regimes">
+<header class="header">
+  <div class="brand">
+    <img class="brand-mark" src="../logo-splatsdb.svg" alt="SplatsDB logo"/>
+    <div>
+      <div class="kicker">SplatsDB / Measured evidence</div>
+      <h1>Search performance, in separate regimes</h1>
+      <p class="subtitle">SIFT-128, 100K vectors, 1K queries · same host · Ryzen 5 3400G + RTX 3090 · Windows 11 / WSL2</p>
+    </div>
+  </div>
+  <div class="status neutral">HISTORICAL RUN · 2026-04-10</div>
+</header><section class="kpis"><div class="kpi"><div class="kpi-label">Exact GPU top-k</div><div class="kpi-value ">12,195</div><div class="kpi-detail">QPS · k=10 · recall 1.0 · matched CPU</div></div><div class="kpi"><div class="kpi-label">CPU HNSW gap</div><div class="kpi-value ">14.8×</div><div class="kpi-detail">Faiss faster at k=64; similar recall</div></div><div class="kpi"><div class="kpi-label">HNSW recall</div><div class="kpi-value ">99.26%</div><div class="kpi-detail">Faiss · SplatsDB 98.60%</div></div><div class="kpi"><div class="kpi-label">IVF-PQ trade-off</div><div class="kpi-value ">69.0%</div><div class="kpi-detail">Lossy compression · 10,039 QPS</div></div></section><section class="panel"><div class="panel-head"><div><h2 class="panel-title">Throughput — read each row in its own regime</h2><p class="panel-note">QPS is not compared across different k or search types.</p></div><span class="tag">100K vectors · 1K queries</span></div><div class="bar-row"><div class="bar-label">SplatsDB GPU<small>exact · k=10 · RTX 3090</small></div><div class="track"><div class="fill " style="width:93.80769%"></div></div><div class="bar-value">12,195 <small>QPS</small></div></div><div class="bar-row"><div class="bar-label">Rust CPU<small>exact · k=10</small></div><div class="track"><div class="fill deep" style="width:22.62308%"></div></div><div class="bar-value">2,941 <small>QPS</small></div></div><div class="bar-row"><div class="bar-label">Faiss HNSW<small>CPU · approximate · k=64</small></div><div class="track"><div class="fill secondary" style="width:75.06154%"></div></div><div class="bar-value">9,758 <small>QPS</small></div></div><div class="bar-row"><div class="bar-label">Faiss IVF-PQ<small>CPU · approximate · k=64</small></div><div class="track"><div class="fill secondary" style="width:77.22308%"></div></div><div class="bar-value">10,039 <small>QPS</small></div></div><div class="bar-row"><div class="bar-label">SplatsDB HNSW<small>CPU · approximate · k=64</small></div><div class="track"><div class="fill deep" style="width:5.06154%"></div></div><div class="bar-value">658 <small>QPS</small></div></div><div class="legend"><span class="legend-item"><i class="dot"></i>Exact GPU</span><span class="legend-item"><i class="dot secondary"></i>Faiss ANN</span><span class="legend-item"><i class="dot deep"></i>SplatsDB CPU</span></div></section><section class="panels equal"><div class="panel"><div class="panel-head"><div><h2 class="panel-title">Recall</h2><p class="panel-note">The k changes by row; this is not a shared leaderboard.</p></div><span class="tag">k varies per row</span></div><div class="bar-row"><div class="bar-label">SplatsDB GPU · k=10<small>exact; matches CPU</small></div><div class="track"><div class="fill " style="width:100.00000%"></div></div><div class="bar-value">100.0%</div></div><div class="bar-row"><div class="bar-label">Faiss HNSW · k=64<small>approximate ANN</small></div><div class="track"><div class="fill secondary" style="width:99.26000%"></div></div><div class="bar-value">99.26%</div></div><div class="bar-row"><div class="bar-label">SplatsDB HNSW · k=64<small>approximate ANN</small></div><div class="track"><div class="fill deep" style="width:98.60000%"></div></div><div class="bar-value">98.60%</div></div><div class="bar-row"><div class="bar-label">Faiss IVF-PQ · k=64<small>lossy compression</small></div><div class="track"><div class="fill warn" style="width:69.00000%"></div></div><div class="bar-value">69.0%</div></div></div><div class="panel"><div class="panel-head"><div><h2 class="panel-title">Build cost &amp; GPU upload</h2><p class="panel-note">Index build times use the same April run.</p></div><span class="tag">not release timing</span></div><div class="bar-row"><div class="bar-label">Faiss IVF-PQ<small>k=64</small></div><div class="track"><div class="fill secondary" style="width:3.03700%"></div></div><div class="bar-value">3.0 s</div></div><div class="bar-row"><div class="bar-label">Faiss HNSW<small>M=32 · efC=400</small></div><div class="track"><div class="fill secondary" style="width:24.48900%"></div></div><div class="bar-value">24.5 s</div></div><div class="bar-row"><div class="bar-label">SplatsDB HNSW<small>computes α and κ</small></div><div class="track"><div class="fill deep" style="width:88.24800%"></div></div><div class="bar-value">88.2 s</div></div><div class="callout "><strong>GPU persistent:</strong> 12,195 QPS = 4.1× CPU.<br/><strong>Including one-time 17 ms VRAM upload:</strong> 10,101 QPS.</div></div></section><footer class="footer"><div class="source">Source: <a href="../../bench-data/benchmark_results_hardware.json">benchmark_results_hardware.json</a> · SplatsDB v2.5.0 run · <a href="faiss.html">standalone HTML chart</a><br/>Historical measurements, not a current release profile. GPU k=10 exact search and CPU k=64 ANN are not head-to-head.</div><div class="build">HTML + CSS · measured values only</div></footer></main></body></html>

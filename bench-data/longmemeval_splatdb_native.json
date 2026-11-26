@@ -1,5 +1,5 @@
 {
-  "benchmark": "LongMemEval-S-cleaned \u2014 SplatDB Native Methodology",
+  "benchmark": "LongMemEval-S-cleaned \u2014 SplatsDB Native Methodology",
   "date": "2026-04-09",
   "model": "all-MiniLM-L6-v2",
   "embedding_dim": 384,

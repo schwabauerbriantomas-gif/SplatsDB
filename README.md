@@ -8,11 +8,11 @@
 Vector search with uncertainty awareness. Knowledge graph + HNSW + GPU in a single Rust binary.
 </p>
 
-[![CI](https://github.com/schwabauerbriantomas-gif/splatdb/actions/workflows/ci.yml/badge.svg)](https://github.com/schwabauerbriantomas-gif/splatdb/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-2.11.0-blue.svg)](https://github.com/schwabauerbriantomas-gif/splatdb/releases)
+[![CI](https://github.com/schwabauerbriantomas-gif/SplatsDB/actions/workflows/ci.yml/badge.svg)](https://github.com/schwabauerbriantomas-gif/SplatsDB/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/version-2.11.0-blue.svg)](https://github.com/schwabauerbriantomas-gif/SplatsDB/releases)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-561%20default%20%2B%20545%20CPU-brightgreen.svg)](https://github.com/schwabauerbriantomas-gif/splatdb/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-561%20default%20%2B%20545%20CPU-brightgreen.svg)](https://github.com/schwabauerbriantomas-gif/SplatsDB/actions/workflows/ci.yml)
 [![LOC](https://img.shields.io/badge/LOC-27.6K-informational.svg)]()
 [![CUDA](https://img.shields.io/badge/GPU-RTX%203090-76B900.svg)]()
 
@@ -141,7 +141,7 @@ Combined with a two-level KMeans++ retrieval pipeline (HRM2), HNSW incremental i
 bash semantic-hub/faststart.sh
 ```
 
-Brings up the local embedding server (`google/embeddinggemma-2`, 768-d, :8860), the splatDB hub with exact GPU search (:8871), and runs an end-to-end smoke. Then:
+Brings up the local embedding server (`google/embeddinggemma-2`, 768-d, :8860), the SplatsDB hub with exact GPU search (:8871), and runs an end-to-end smoke. Then:
 
 ```bash
 # 1) embed a query
@@ -158,7 +158,7 @@ curl -s -X POST http://127.0.0.1:8871/search \
 
 ### 30-Second Trial (No Rust Needed)
 
-Download the [latest release binary](https://github.com/schwabauerbriantomas-gif/splatdb/releases) and run:
+Download the [latest release binary](https://github.com/schwabauerbriantomas-gif/SplatsDB/releases) and run:
 
 ```bash
 # Index pre-computed embeddings (any dimension, any provider)
@@ -415,13 +415,15 @@ On synthetic data HNSW delivers **~875× speedup** over linear scan at 10K. Real
 
 > **Removed claims**: a previous version of this section claimed GPU throughput of 1,667 QPS at 640D and 20,000 QPS for linear scan over 100 splats. Both numbers had no preserved source (no result file or run log; the 640D figure was marked "untraced" in `ab81716`). They were removed rather than restated.
 
-<p align="center"><img src="assets/splatsdb-faiss-comparison.png" alt="SplatsDB vs Faiss — same hardware" width="900"/></p>
+<p align="center"><img src="assets/splatsdb-faiss-comparison.png" alt="SplatsDB vs Faiss — historical measured search regimes, with exact GPU k=10 separated from approximate CPU k=64" width="900"/></p>
 
-> Chart regenerated 2026-10-25 from [`bench-data/benchmark_results_hardware.json`](bench-data/benchmark_results_hardware.json) — k and search type stated per panel; the GPU row (exact, k=10) lives in its own panel. The tables above and in [BENCHMARKS.md](BENCHMARKS.md) are the source of truth.
+> Chart regenerated 2026-11-26 in HTML/CSS from [`bench-data/benchmark_results_hardware.json`](bench-data/benchmark_results_hardware.json) — [standalone source](assets/charts/faiss.html), [shared theme](assets/charts/theme.css), [artifact hashes](assets/charts/manifest.json). k and search type are stated per row; the historical v2.5.0 run is not a current release profile. The tables above and in [BENCHMARKS.md](BENCHMARKS.md) remain the source of truth.
 
 ### LongMemEval Agent Memory Benchmark
 
-<p align="center"><img src="assets/splatsdb-longmemeval.png" alt="LongMemEval Results" width="900"/></p>
+<p align="center"><img src="assets/splatsdb-longmemeval.png" alt="LongMemEval retrieval-only results: NumPy brute-force reference clearly separated from the lower-recall SplatsDB native pipeline" width="900"/></p>
+
+> Chart regenerated 2026-11-26 in HTML/CSS — [standalone source](assets/charts/longmemeval.html), [shared theme](assets/charts/theme.css). It shows the NumPy reference and native pipeline side by side, including per-question-type recall; the 96.6% figure is **not** native-engine recall.
 
 > [LongMemEval](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned) is the standard benchmark for evaluating long-term conversational memory in AI agents. Tests retrieval across 500 questions, each with ~48 sessions and ~490 turns.
 
@@ -459,7 +461,9 @@ On synthetic data HNSW delivers **~875× speedup** over linear scan at 10K. Real
 
 #### Adapted M3 context-reduction evaluation — independent rerun
 
-<p align="center"><img src="assets/splatsdb-m3-context-rerun.png" alt="Adapted M3 independent rerun: context reduction, accuracy and GO verdict" width="900"/></p>
+<p align="center"><img src="assets/splatsdb-m3-context-rerun.png" alt="Adapted M3 independent rerun: GO under the predeclared protocol, with context reduction, accuracy, ITT sensitivity, judge validity, coverage and filters" width="900"/></p>
+
+> Chart regenerated 2026-11-26 in HTML/CSS — [standalone source](assets/charts/m3-rerun.html), [measured subset](assets/charts/data/m3-rerun.json), [shared theme](assets/charts/theme.css). The chart keeps the earlier NO_GO run explicitly scoped and separate.
 
 A separate local adaptation of `m3-glm-protocol` @ `15795ca` was evaluated with GLM-5.4 and GLM-5.3-Flash using crossed judges and a new full-context baseline. A **[predeclared independent rerun](docs/validation/m3-adaptation-rerun-protocol.md)** (protocol SHA `c6973edb93af`) returned **GO**: median prompt usage fell **93.76%** (70,241 to 4,384.5/4,383.5 tokens), with 498/500 complete token pairs; symmetric accuracy was **81.46% vs 80.16%** (+1.30 pp, McNemar p=0.2624), and the intent-to-treat sensitivity also passed. One question per stage was filtered in both models, within the predeclared budget; there were zero non-filter errors and no imputation. See [methodology, results and limitations](docs/validation/m3-adaptation-rerun.md). The [earlier run](docs/validation/m3-adaptation.md) remains **NO_GO** under its stricter 500/500 rule; this rerun does not reinterpret it.
 
@@ -483,7 +487,7 @@ Two runs of `cargo test --release --features cuda test_ptx_kernel_performance` (
 | Run | Kernel path | CPU (single-thread) | GPU (RTX 3090) | Speedup | Source |
 |-----|-------------|--------------------|----------------|---------|--------|
 | 2026-10-15 (single run) | `batch_l2_distances` — full distance matrix, **no top-k** | 565 ms | 27 ms | 20.93× | transcribed from the test log; no persisted artifact |
-| **2026-10-25 (median of 6)** | `l2_topk` — fused top-k, **k=16** | 630 ms | 20 ms | **30.6×** | [`bench-data/gpu_kernel_microbench_2026-10-25.json`](bench-data/gpu_kernel_microbench_2026-10-25.json) |
+| **2026-10-25 (median of 6)** | `l2_topk` — fused top-k, **k=16** | 630 ms | 20 ms | **30.6×** | transcribed from the test log; no persisted artifact |
 
 2026-10-25 per-run spread: 31.28×, 34.32×, 29.0×, 25.45× (GPU outlier during concurrent cargo builds), 30.0×, 33.82× — range GPU 17–29 ms, CPU 563–738 ms. Both runs are kernel-level microbenchmarks on synthetic data, not end-to-end search benchmarks; at this shape GPU time is dominated by the one-time dataset upload (~25 MB amortized over 100 queries per call) — the production win of the VRAM dataset cache (v2.7.0) is at the call-graph level: upload once per dataset version instead of every call. Companion correctness test `test_ptx_kernel_correctness` passes (GPU/CPU agreement within tolerance). Full per-run table and reproduction commands: [BENCHMARKS.md §4](BENCHMARKS.md#4-gpu-vs-cpu-kernel-microbenchmark-640d).
 
@@ -1095,7 +1099,7 @@ cargo build --release --features cuda
 
 ### Performance
 
-**Kernel microbenchmark** (re-measured 2026-10-25, `cargo test --release --features cuda test_ptx_kernel_performance`, RTX 3090): 6 runs over 10K×640D × 100 queries with the fused `l2_topk` kernel (**k=16**) — median **CPU 630ms vs GPU 20ms = 30.6×** (per-run 25.45×–34.32×; single-threaded CPU baseline; companion correctness test `test_ptx_kernel_correctness` passes). Persisted artifact: `bench-data/gpu_kernel_microbench_2026-10-25.json`. An earlier single run (2026-10-15) measured the batch-L2 path without top-k at **20.93×** (565ms/27ms) — different kernel path, not directly comparable; full labeled table and reproduction commands: [BENCHMARKS.md §4](BENCHMARKS.md#4-gpu-vs-cpu-kernel-microbenchmark-640d). A previous version of this paragraph quoted "CPU 718ms vs GPU 18ms = 39.89×" — that figure had no preserved run log and was corrected to the logged runs above.
+**Kernel microbenchmark** (re-measured 2026-10-25, `cargo test --release --features cuda test_ptx_kernel_performance`, RTX 3090): 6 runs over 10K×640D × 100 queries with the fused `l2_topk` kernel (**k=16**) — median CPU **605 ms**, GPU **19.5 ms**; median of the six run-level speedups **30.6×** (ratio of medians 31.03×; per-run speedups 25.45×–34.32×; single-threaded CPU baseline; companion correctness test `test_ptx_kernel_correctness` passes). No JSON artifact is present in this tree; the six runs are transcribed in `BENCHMARKS.md`. An earlier single run (2026-10-15) measured the batch-L2 path without top-k at **20.93×** (565ms/27ms) — different kernel path, not directly comparable; full labeled table and reproduction commands: [BENCHMARKS.md §4](BENCHMARKS.md#4-gpu-vs-cpu-kernel-microbenchmark-640d). A previous version of this paragraph quoted "CPU 718ms vs GPU 18ms = 39.89×" — that figure had no preserved run log and was corrected to the logged runs above.
 
 **Serve integration (v2.6.0, 2026-10-20)** — `splatsdb serve --gpu` uploads the dataset to VRAM at boot and routes `/search` (with embedding) through the PTX `l2_topk_kernel`. Measured on the semantic-hub dataset (26,273×768d, RTX 3090, WSL2), 30 queries against exact brute-force ground truth + 600-query soak:
 

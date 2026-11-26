@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "sources": {
+    "faiss": "Source: <a href=\"../../bench-data/benchmark_results_hardware.json\">benchmark_results_hardware.json</a> · SplatsDB v2.5.0 run · <a href=\"faiss.html\">standalone HTML chart</a>",
+    "longmemeval": "Sources: <a href=\"../../bench-data/longmemeval_full_results.json\">NumPy JSON</a> · <a href=\"../../bench-data/longmemeval_splatdb_native.json\">native JSON</a> · <a href=\"../../bench-data/longmemeval_baseline_results.json\">question counts</a> · <a href=\"longmemeval.html\">standalone HTML chart</a>",
+    "m3-rerun": "Source: <a href=\"data/m3-rerun.json\">m3-rerun.json</a> (minimal measured subset) · <a href=\"m3-rerun.html\">standalone HTML chart</a> · <a href=\"../../docs/validation/m3-adaptation-rerun.md\">methodology and limits</a>",
+    "m3-historical": "Source: <a href=\"data/m3-historical.json\">m3-historical.json</a> (minimal measured subset) · <a href=\"m3-historical.html\">standalone HTML chart</a> · <a href=\"../../docs/validation/m3-adaptation.md\">historical report</a>"
+  },
+  "artifacts": {
+    "faiss.html": {
+      "sha256": "2d3abd6a373ae2ff69c3a64ddcf7c7ae32cb4395e0e6c79ed1a5ab7078b832a5",
+      "bytes": 13766
+    },
+    "longmemeval.html": {
+      "sha256": "d943979ae930812d087fd14a42192267b62a40559c9103c99c50f44a1d5a167e",
+      "bytes": 14871
+    },
+    "m3-rerun.html": {
+      "sha256": "bc1f2bfa6a9b3ed2893523053b52b68b32d31597cb7485c225ab5f9a4e40393c",
+      "bytes": 13373
+    },
+    "m3-historical.html": {
+      "sha256": "e466f4cc3df142bb51e936c33fe760b734abf7790cdf3a27818d2e7bdb74fde0",
+      "bytes": 13344
+    },
+    "splatsdb-faiss-comparison.png": {
+      "sha256": "c011b7a36527190f690979101d138831d5d42be019b03fa5d73311685f5ab34c",
+      "bytes": 692511
+    },
+    "splatsdb-longmemeval.png": {
+      "sha256": "c7ec29559271b6d60dda3019e7a27bb1eb1dd349301a423ec0e8075fa116b57f",
+      "bytes": 668001
+    },
+    "splatsdb-m3-context-rerun.png": {
+      "sha256": "00b361fcffab3c9e39d8d8518267e0b870d77686782fe0fa0fcad1c3a5c9f528",
+      "bytes": 726114
+    },
+    "splatsdb-m3-context.png": {
+      "sha256": "34d5efff6a589f6b54c4c211790dca0d64df0c0706c7d8589fa2da0f81038583",
+      "bytes": 723595
+    },
+    "m3-historical.json": {
+      "sha256": "7c25bf4ea69377fde6607d1e53aa5b2fb7ad78923e77e175a24b817e196b7a3a",
+      "bytes": 1191
+    },
+    "m3-rerun.json": {
+      "sha256": "03e9a8dab1c8d6bf29a597425c5aa9e89eb52444017941108b3d93d98ba923ca",
+      "bytes": 1749
+    },
+    "theme.css": {
+      "sha256": "f4fdba3cd9b0094b0915923860e8c494869cccb03c72459260faa3828b3a3591",
+      "bytes": 7924
+    },
+    "README.md": {
+      "sha256": "2ac7217081adf14f73cd2b4e3e6091818b5808b47a5331097eb22dbf28598e7b",
+      "bytes": 2436
+    },
+    "validate.py": {
+      "sha256": "d4232a1948989166c5182b0bdb604922ba7bedc57bd3e727433ea557b2a8c17d",
+      "bytes": 8349
+    },
+    "build.py": {
+      "sha256": "66ebfe3cca6daac79a3db71f988a5305b247c8a9d941ac65fb05ca6fdf6d5688",
+      "bytes": 20201
+    }
+  }
+}

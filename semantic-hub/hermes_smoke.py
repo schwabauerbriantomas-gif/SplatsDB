@@ -8,7 +8,7 @@ Valida, contra servicios reales:
      el target) encuentran la sesión esperada en top-k
   4. sanidad de la métrica: literal < basura (distancia)
   5. /recall NATIVO del motor (≥ 2.9.0): pipeline completo dentro de
-     splatDB (embed → search → sidecar → tiers → fail-closed → log)
+     SplatsDB (embed → search → sidecar → tiers → fail-closed → log)
 
 Las tripletas (query, sesión esperada, k) están tomadas del benchmark
 medido el 2026-11-05 (corpus real, MRR sesión 0.60 vs 0.27 FTS). Si el

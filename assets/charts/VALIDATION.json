@@ -1,0 +1,20 @@
+{
+  "status": "CHARTS_VALIDATED",
+  "checks": [
+    "faiss: local links, visible text, PNG 1800x1400",
+    "longmemeval: local links, visible text, PNG 1800x1400",
+    "m3-rerun: local links, visible text, PNG 1800x1400",
+    "m3-historical: local links, visible text, PNG 1800x1400",
+    "faiss: required values and verdict scope",
+    "longmemeval: required values and verdict scope",
+    "m3-rerun: required values and verdict scope",
+    "m3-historical: required values and verdict scope",
+    "faiss: source arithmetic and exact-result flag",
+    "longmemeval: counts and both weighted recalls",
+    "m3: both measured subsets, reductions, deltas and verdict gates",
+    "microbenchmark: six runs, per-run speedups, medians and ratio",
+    "documentation: chart image and source links resolve",
+    "manifest: 14 artifact hashes and sizes"
+  ],
+  "count": 14
+}
