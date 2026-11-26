@@ -142,7 +142,9 @@ class FaissIntegrationTests(unittest.TestCase):
         rng = np.random.default_rng(13)
         corpus = rng.normal(size=(100, 8)).astype(np.float32)
         centroids = corpus[:5].copy()
-        labels = np.arange(100) % 5
+        x2 = np.einsum("ij,ij->i", corpus, corpus)
+        m2 = np.einsum("ij,ij->i", centroids, centroids)
+        labels = np.argmin(x2[:, None] - 2 * (corpus @ centroids.T) + m2[None, :], axis=1)
         groups = [np.flatnonzero(labels == c).astype(np.uint32) for c in range(5)]
         queries = corpus[:1]
         plans, all_d2, gt_kth = runner.prepare_queries(queries, corpus, centroids, groups)
@@ -150,8 +152,8 @@ class FaissIntegrationTests(unittest.TestCase):
         quantizer.add(centroids)
         index = faiss.IndexIVFFlat(quantizer, 8, 5, faiss.METRIC_L2)
         index.add(corpus)
-        grid, score_rows = runner.faiss_recall_scan(index, quantizer, queries, all_d2, gt_kth, 2, len(corpus))
-        _, mirror = common.score_candidates(plans[0]["candidates"][2], all_d2[0])
+        grid, score_rows = runner.faiss_recall_scan(index, quantizer, queries, all_d2, gt_kth, 4, len(corpus))
+        _, mirror = common.score_candidates(common.get_candidates(plans[0], 4), all_d2[0])
         self.assertTrue(np.allclose(np.sort(score_rows[0]), np.sort(mirror), rtol=2e-5, atol=2e-5))
         self.assertGreater(grid["recall"][0], 0.0)
 
