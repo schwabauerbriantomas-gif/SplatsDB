@@ -954,7 +954,7 @@ curl -X POST http://localhost:8199/store \
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `text` | string | Yes | Text content (auto-hashed to embedding if no `embedding`) |
+| `text` | string | Yes | Text content (stored under a hash of the text if no `embedding`; the response then carries `embedding_source: "text_hash"`) |
 | `embedding` | float[] | No | Pre-computed embedding vector |
 | `category` | string | No | Category tag |
 | `id` | string | No | Custom ID (auto-generated if omitted) |
@@ -962,8 +962,10 @@ curl -X POST http://localhost:8199/store \
 Response:
 
 ```json
-{"id": "mem_42", "status": "stored"}
+{"id": "mem_42", "status": "stored", "embedding_source": "text_hash", "warning": "The request carried no `embedding` vector: this item was stored under a hash of its text, which has no meaning and will not be found by similarity to other texts. Send `embedding` from a real model for anything that must be searched by meaning."}
 ```
+
+The request above sends no `embedding`, so the server stores a hash of the text and says so. A request that carries `embedding` gets neither `embedding_source` nor `warning`.
 
 #### `POST /search` — Search Memories
 
@@ -1042,7 +1044,7 @@ Requires a data-dir with a persisted field (`field/members.idx`, `field/radii.bi
 
 Phase 1 can run on the PTX kernel (`--gpu` in the CLI): cluster winners are identical to CPU (30/30), but per-invocation context+upload overhead (~330 ms) makes it only worthwhile as a **resident** index in a long-running server with large K. At this scale the exact mode is the right default; two-phase pays off when K grows and the raw vectors can't stay in fast memory.
 
-> **Note**: The default HTTP server stores hash-based pseudo-embeddings when the request carries no `embedding` vector (`simple_hash_embedding`: one hash of the text seeds a PRNG that fills the dimensions — no semantic understanding, and the `status: "stored"` response does not flag it; the CLI's verbatim commands use a different stand-in, `simcos_embed`, trigram hashing). For production use, provide real embeddings from a model (e.g. OpenAI, Cohere, MiniLM, BGE) via the `embedding` field.
+> **Note**: The default HTTP server stores hash-based pseudo-embeddings when the request carries no `embedding` vector (`simple_hash_embedding`: one hash of the text seeds a PRNG that fills the dimensions — no semantic understanding). The response then carries `"embedding_source": "text_hash"` and a `warning`; `status` stays `"stored"`. The CLI's verbatim commands use a different stand-in, `simcos_embed`, trigram hashing. For production use, provide real embeddings from a model (e.g. OpenAI, Cohere, MiniLM, BGE) via the `embedding` field.
 
 ---
 

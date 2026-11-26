@@ -29,6 +29,8 @@
 //!     the batch worker (A03-F05).
 //!   - `simple_hash_embedding` hashes the text ONCE and derives the D
 //!     dimensions from a SplitMix64 PRNG (O(1) hashes instead of O(D)).
+//!     It is used when `/store` carries no `embedding` vector; that
+//!     response says so (`embedding_source: "text_hash"` and a `warning`).
 //!
 //! Security:
 //!   - API key authentication via SPLATSDB_API_KEY env var (optional): the
@@ -603,6 +605,8 @@ impl Durability {
                 status: StatusCode::CONFLICT,
                 message: "id already belongs to a different WAL entry".into(),
                 response: Some(Box::new(StoreResponse {
+                    embedding_source: None,
+                    warning: None,
                     error: Some("id already belongs to a different WAL entry".into()),
                     id: id.into(),
                     status: "conflict".into(),
@@ -654,6 +658,8 @@ impl Durability {
 
     fn success(&self, id: &str) -> StoreResponse {
         StoreResponse {
+            embedding_source: None,
+            warning: None,
             error: None,
             id: id.into(),
             status: "stored".into(),
@@ -679,6 +685,8 @@ impl Durability {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: message.into(),
             response: Some(Box::new(StoreResponse {
+                embedding_source: None,
+                warning: None,
                 error: Some(message.into()),
                 id: id.into(),
                 status: if may_be_persisted {
@@ -883,6 +891,18 @@ pub struct StoreResponse {
     pub error: Option<String>,
     /// "wal" (persistente en --data-dir) o "ephemeral" (sólo memoria).
     pub persistence: String,
+    /// `"text_hash"` when the request carried no `embedding` vector and the
+    /// server stored `simple_hash_embedding(text)` instead. Absent when the
+    /// client supplied the vector.
+    ///
+    /// Same key and naming as the MCP server's labels (`real`, `simcos`,
+    /// `provided`): `text_hash` names this server's own placeholder, which
+    /// is not SimCos.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_source: Option<&'static str>,
+    /// Plain-language notice that accompanies `embedding_source: "text_hash"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -1021,9 +1041,13 @@ async fn store_memory(
             ));
         }
     }
-    let embedding = req
-        .embedding
-        .unwrap_or_else(|| simple_hash_embedding(&req.text, dim));
+    // A request without a vector is stored under a hash of its text. That
+    // placeholder carries no meaning, so the response says so: it used to be
+    // indistinguishable from the response of a store of a real embedding.
+    let (embedding, text_hash) = match req.embedding {
+        Some(vector) => (vector, false),
+        None => (simple_hash_embedding(&req.text, dim), true),
+    };
     let arr = Array2::from_shape_vec((1, dim), embedding.clone())
         .map_err(|e| error(StatusCode::BAD_REQUEST, format!("Bad embedding shape: {e}")))?;
     let id_num = state.next_id.fetch_add(1, Ordering::SeqCst);
@@ -1095,10 +1119,12 @@ async fn store_memory(
                 Json(serde_json::json!({ "error": "internal error" })),
             )
         })?;
-    let response = match wal_outcome {
+    let mut response = match wal_outcome {
         Ok(_) => match state.durability.as_ref() {
             Some(d) => d.success(&id),
             None => StoreResponse {
+                embedding_source: None,
+                warning: None,
                 error: None,
                 id: id.clone(),
                 status: "stored".into(),
@@ -1121,6 +1147,10 @@ async fn store_memory(
             return Err((e.status, Json(body)));
         }
     };
+    if text_hash && response.status == "stored" {
+        response.embedding_source = Some("text_hash");
+        response.warning = Some(TEXT_HASH_WARNING);
+    }
     Ok((
         StatusCode::OK,
         Json(serde_json::to_value(response).expect("serializable store response")),
@@ -2851,6 +2881,12 @@ fn reassemble_gpu_rows(
 /// O(1) hashes: the text is hashed ONCE and the D dimensions are derived
 /// from a SplitMix64 PRNG seeded with that hash (previously the text was
 /// re-hashed D times — O(D) hasher passes — R9 §5.1).
+///
+/// A `/store` that falls back to it is answered with
+/// `embedding_source: "text_hash"` and this warning.
+const TEXT_HASH_WARNING: &str = "The request carried no `embedding` vector: this item was stored under a hash of its \
+ text, which has no meaning and will not be found by similarity to other texts. Send `embedding` from a real model \
+ for anything that must be searched by meaning.";
 fn simple_hash_embedding(text: &str, dim: usize) -> Vec<f32> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -3632,6 +3668,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
+    }
+
+    // ── procedencia del vector: un hash del texto nunca pasa por silencio ──
+
+    #[tokio::test]
+    async fn store_without_embedding_flags_the_text_hash() {
+        // Las dos rutas: con WAL (un server con --data-dir) y efímera.
+        let (app, d) = test_app_with_durability(&temp_wal_dir("text_hash")).await;
+        let (app_mem, _) = test_app().await;
+        for (name, app) in [("wal", app), ("ephemeral", app_mem)] {
+            let (status, body) = send(
+                app,
+                "POST",
+                "/store",
+                Some(json!({ "text": "prefiere modo oscuro" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{name}: {body}");
+            assert_eq!(body["status"], "stored", "{name}: {body}");
+            assert_eq!(body["embedding_source"], "text_hash", "{name}: {body}");
+            let warning = body["warning"].as_str().unwrap_or_default();
+            assert!(warning.contains("has no meaning"), "{name}: {body}");
+        }
+        d.flush().expect("wal flush");
+    }
+
+    #[tokio::test]
+    async fn store_with_real_embedding_adds_no_notice() {
+        // Con un vector del cliente la respuesta no gana claves: esa ruta
+        // queda igual que antes del cambio.
+        let (app, d) = test_app_with_durability(&temp_wal_dir("real_vector")).await;
+        let (status, body) = send(
+            app,
+            "POST",
+            "/store",
+            Some(json!({ "text": "vector real", "embedding": unit_vec(32, 0) })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "stored", "{body}");
+        assert_eq!(body.get("embedding_source"), None, "{body}");
+        assert_eq!(body.get("warning"), None, "{body}");
+        d.flush().expect("wal flush");
     }
 
     // ── durabilidad: WAL + shard "default" ─────────────────────
