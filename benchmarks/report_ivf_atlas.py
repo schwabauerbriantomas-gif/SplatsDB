@@ -32,7 +32,7 @@ def ivf_report(data: dict) -> str:
         "",
         "This is an implementation/policy experiment on synthetic perturbed self-queries, not a human-semantic, calibrated-confidence or production-QPS benchmark.",
         "",
-        "The first run stopped before producing output on a non-grid ratio-probe harness bug; see the [incident record](ivf-atlas-incidents.md). The protocol was not changed.",
+        "Early harness incidents are recorded in the [incident register](ivf-atlas-incidents.md), including the invalid Faiss-parser NO_GO and its preserved artifact. The protocol was not changed.",
         "",
         "## H3 — Faiss/mirror parity",
         "",
@@ -68,7 +68,18 @@ def ivf_report(data: dict) -> str:
         lines.append("")
     train = data["train_regressor"]
     build = data["build"]
+    measured = [row for targets in data["h4_policy_targets"].values() for row in targets.values() if "relative_scan_reduction" in row]
+    scan_increases = sum(row["relative_scan_reduction"] < 0 for row in measured)
+    learned_98_reduction = data["h4_policy_targets"]["learned"]["0.98"]["relative_scan_reduction"]
+    learned_98_ci = data["h4_policy_targets"]["learned"]["0.98"]["relative_scan_reduction_ci95"]
+    learned_98_ci_text = "with a CI that crosses zero" if learned_98_ci[0] <= 0 <= learned_98_ci[1] else f"with reduction CI {ci(learned_98_ci)}"
     lines += [
+        "## Reading",
+        "",
+        f"Across **{len(measured)}** measured family/target outcomes, **{scan_increases}** increase scan relative to their validation-selected fixed comparator. No family meets the predeclared H4 rule. The learned regressor at the 98% target reduces scan by **{pct(learned_98_reduction)}**, below the 5% floor, {learned_98_ci_text}; the other selected outcomes do not establish a useful scan/recall trade-off.",
+        "",
+        "This is a NO_GO for these three policy families under this protocol, not proof that every possible adaptive policy must fail.",
+        "",
         "## Cost and reproducibility",
         "",
         f"- Faiss index addition: **{build['faiss_add_seconds']:.3f} s**; serialized index: **{build['faiss_serialized_index_bytes']:,} bytes**; mirror cell files: **{build['mirror_cell_file_bytes']:,} bytes**. KMeans training and Rust build time are not measured here.",
@@ -97,12 +108,16 @@ def atlas_report(data: dict) -> str:
         "",
         "## Structural metrics",
         "",
-        "| Projection | kNN@10 | kNN@50 | Trust@10 | Continuity@10 | Spearman | Scale-invariant stress |",
-        "|---|---:|---:|---:|---:|---:|---:|",
-        f"| PCA | {p['knn_10']:.4f} | {p['knn_50']:.4f} | {p['trustworthiness_10']:.4f} | {p['continuity_10']:.4f} | {p['spearman']:.4f} | {p['scale_invariant_stress']:.4f} |",
-        f"| UMAP | {u['knn_10']:.4f} | {u['knn_50']:.4f} | {u['trustworthiness_10']:.4f} | {u['continuity_10']:.4f} | {u['spearman']:.4f} | {u['scale_invariant_stress']:.4f} |",
+        "| Projection | kNN@10 | kNN@50 | Trust@10 | Trust@50 | Continuity@10 | Continuity@50 | Spearman | Scale-invariant stress |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        f"| PCA | {p['knn_10']:.4f} | {p['knn_50']:.4f} | {p['trustworthiness_10']:.4f} | {p['trustworthiness_50']:.4f} | {p['continuity_10']:.4f} | {p['continuity_50']:.4f} | {p['spearman']:.4f} | {p['scale_invariant_stress']:.4f} |",
+        f"| UMAP | {u['knn_10']:.4f} | {u['knn_50']:.4f} | {u['trustworthiness_10']:.4f} | {u['trustworthiness_50']:.4f} | {u['continuity_10']:.4f} | {u['continuity_50']:.4f} | {u['spearman']:.4f} | {u['scale_invariant_stress']:.4f} |",
         "",
         "Evaluation uses 2,000 points and 100,000 non-self sampled pairs. Class separation is `not_applicable` because no labels are present; user-task accuracy was not measured.",
+        "",
+        "## Reading",
+        "",
+        "UMAP preserves more exact local neighbors and has higher trustworthiness than PCA in this run, but PCA retains higher distance-rank correlation and lower scale-invariant stress. This is a local-versus-global structural trade-off, not a universal projection winner or evidence of retrieval utility.",
         "",
         "## Rendering cost and limits",
         "",
