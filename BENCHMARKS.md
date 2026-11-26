@@ -6,6 +6,7 @@ Every number in this file is tied to a source: either a committed result JSON or
 - Last full regeneration: **2026-10-25** (partial — see per-table dates)
 - Numbers without a preserved source have been removed from the docs (see [Removed claims](#removed-claims))
 - Reproduction commands are being consolidated by the benchmark harness work (TODO-B4); placeholders below are marked `[COMANDO: ...]`
+- **2026-11-26 matched controls:** [adaptive IVF policy gate](docs/validation/ivf-policy.md) and [embedding atlas](docs/validation/embedding-atlas.md), with aggregate JSON receipts and exact reproduction commands in [benchmarks/README.md](benchmarks/README.md). These CPU structural/policy results are not production-QPS comparisons.
 
 > The previous version of this file (dated 2026-03-29) contained tables whose numbers could not be traced to any preserved result file (most notably 1,667 QPS at 640D and 20,000 QPS linear-scan over 100 splats). It was replaced wholesale. The removed numbers are cataloged in the final section, not silently dropped.
 

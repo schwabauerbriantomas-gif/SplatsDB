@@ -9,6 +9,10 @@
 | [validation/splat-routing-protocol.md](validation/splat-routing-protocol.md) | Frozen H1/H2 routing-gate design and denominators |
 | [validation/splat-routing.md](validation/splat-routing.md) | Measured routing gate, k=200 sensitivity, non-claims and reproducibility receipts |
 | [validation/sota-splats-routing.md](validation/sota-splats-routing.md) | Primary-source SOTA review and falsifiable next experiments |
+| [validation/ivf-atlas-protocol.md](validation/ivf-atlas-protocol.md) | Frozen matched IVF-policy and embedding-atlas protocol |
+| [validation/ivf-policy.md](validation/ivf-policy.md) | Faiss/mirror parity, fixed and adaptive probing receipts, NO_GO verdicts |
+| [validation/embedding-atlas.md](validation/embedding-atlas.md) | PCA/UMAP structural metrics, density-render limits and reproducibility |
+| [validation/ivf-atlas-incidents.md](validation/ivf-atlas-incidents.md) | Harness incidents and preserved invalid artifacts; no protocol changes |
 
 ## Benchmark documentation policy
 

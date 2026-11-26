@@ -93,6 +93,25 @@ jobs:
           # 2026-10-01). Re-evaluate when hyper/axum drop pin-utils.
           ignore: RUSTSEC-2026-0441
 
+  # Numeric validation harness: deterministic unit tests plus a small Faiss
+  # integration probe. UMAP is intentionally not installed in CI; the local
+  # atlas runner remains syntax-checked and receipt-verified separately.
+  benchmark-tools:
+    name: Benchmark tools (IVF/atlas)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install numeric test dependencies
+        run: python -m pip install numpy scipy scikit-learn matplotlib faiss-cpu
+      - name: Byte-compile benchmark harness
+        run: python -m py_compile benchmarks/ivf_atlas_common.py benchmarks/benchmark_ivf.py benchmarks/build_embedding_atlas.py benchmarks/report_ivf_atlas.py tests/test_ivf_atlas.py
+      - name: Unit and Faiss integration tests
+        run: python -m unittest discover -s tests -p 'test_ivf_atlas.py' -v
+
   # Python tooling of the Hermes memory hub (semantic-hub/hermes_*).
   # Stdlib-only by design: no pip deps, no GPU, no services — the embed
   # server is mocked with an in-thread http.server.
