@@ -8,11 +8,13 @@
 
 SplatsDB has a **narrow, reproducible routing result**, not a demonstrated state-of-the-art ANN or probabilistic-retrieval system. The local gate shows that learned KMeans centroids beat a random codebook at low scan budgets before exact re-scoring; the 10%-budget effect is +8.1 pp, while the smaller effects remain exploratory under the small-sample rule. Exact top-10 distances matched brute force, but exact search scanned essentially the whole 11,069-vector corpus. [Local receipts](splat-routing.md).
 
-The broader literature establishes three boundaries:
+The broader literature establishes four boundaries:
 
 1. Partitioning, learned codebooks, quantization and refinement are mature ANN components[1][2]. ScaNN explicitly separates reducing the number of scored items from improving the scoring rate, and contributes anisotropic quantization for that second task[1]. SPANN uses an inverted index with balanced posting lists and query-aware pruning in a memory-disk system[2]. Faiss provides established IVF, PQ and HNSW implementations[4]. **KMeans routing plus exact re-scoring is therefore not a novel algorithmic category.**[1][2]
 2. Probabilistic embeddings are a representation-learning method, not a label obtained by attaching Gaussian parameters to a cluster[5]. PCME++ addresses ambiguous image-text correspondence with learned probabilistic embeddings and a closed-form probabilistic distance[5]. SplatsDB's current `α/κ` fields do not reproduce that training problem or establish calibrated uncertainty[5].
 3. Agent-memory claims require end-to-end evaluation[8][12]. LongMemEval covers five abilities, including temporal reasoning, knowledge updates and abstention[8]. MemoryAgentBench evaluates accurate retrieval, test-time learning, long-range understanding and selective forgetting, and reports that current methods do not master all four[12]. Token reduction alone is not a sufficient product claim[12].
+
+4. Closer prior art narrows the remaining gap. GARLIC learns anisotropic Gaussian cells[13]. LIRA/DARTH/QASP cover learned or adaptive probing[14][15][16]. CalibRAG calibrates against decision correctness rather than retrieval scores[18]. The open question is narrower and empirical, not a new retrieval category.
 
 **Recommended positioning:** an integrated, self-hosted retrieval runtime with learned splat-cell routing, optional exact bounds and verbatim source access. Do not claim probabilistic uncertainty, universal ANN superiority or better agent outcomes until the corresponding experiments pass.
 
@@ -63,15 +65,28 @@ Only an ablation that changes the splat routing while holding the rest fixed can
 
 | Area | Established prior art | SplatsDB today | Defensible contribution | Missing evidence |
 |---|---|---|---|---|
-| Learned cell routing | IVF/ScaNN/SPANN partitioning and refinement.[1][2] | Local GO vs random codebook; strongest evidence at low scan | Integrated implementation with raw receipts | Matched Faiss IVFFlat comparison and larger independent query set |
+| Learned cell routing | IVF/ScaNN/SPANN/GARLIC/LIRA partitioning, probing and refinement.[1][2][13][14] | Local GO vs random codebook; strongest evidence at low scan | Integrated implementation with aggregate receipts | Matched Faiss IVFFlat comparison and larger independent query set |
 | HRM2 hierarchy | Coarse/fine partitioning belongs to established ANN practice.[1][2] | Implemented two-level path; not covered by the new flat-codebook gate | Alternative index organization | Separate matched-scan recall/latency/memory comparison |
+| Adaptive probing | SPANN ratio pruning, DARTH early termination and QASP recall-curve prediction.[2][15][16] | Fixed `nprobe` measured; no new policy claim | Explicit computation control only | Ratio, productive-doubling and small learned-regressor controls at matched recall/scan |
 | Exact cell bounds | Triangle-bound pruning is established geometry | Exact correctness pass; essentially full scan at 11k×384 | Optional exact backend and correctness reference | Scale/latency/memory envelope across datasets |
 | Probabilistic embeddings | PCME++ learns distributions for ambiguous matching[5]. | `α/κ` persisted; energy ranking negative in A5 | No current probabilistic-performance claim | Task-trained distributions and calibration experiments |
-| Abstention | Sufficiency plus model confidence; risk-control frameworks[7][11]. | Heuristic distance bands and source text | Source-inspection affordance inside the runtime | End-to-end selective risk-coverage evaluation |
+| Abstention | Sufficiency, risk control, decision calibration and downstream relevance evaluation[7][11][18][19]. | Heuristic distance bands and source text | Source-inspection affordance inside the runtime | Outcome-supervised calibration and end-to-end selective risk-coverage evaluation |
 | Agent memory | LongMemEval, Zep, Mem0 and MemoryAgentBench[8][9][10].[12] | M3 token reduction; MCP/graph integration | Single self-hosted runtime for experimentation | End-to-end task outcomes and update/forgetting tests |
 | GPU/HNSW/graph | Mature independent implementations and algorithms[4]. | Existing separate components | Operational integration | No splat-specific attribution without ablation |
 
-## 6. Three-category product assessment
+## 6. Closer prior art and sharpened novelty boundary
+
+The extended primary-source review narrows, rather than expands, the novelty claim.
+
+1. **Gaussian partitioning is established territory.** GARLIC learns anisotropic Gaussian cells, selects cells with Mahalanobis distance and prunes candidates. Its covariance ablation reports lower recall-per-probe as expressiveness falls from full to diagonal to isotropic[13]. It is a Euclidean preprint, not evidence for normalized text embeddings; the authors explicitly leave von Mises–Fisher/angular counterparts for future work[13]. A low-rank or vMF experiment on angular text embeddings is therefore a testable gap, not a novelty claim.
+2. **Adaptive probing is also established.** SPANN prunes posting lists using their distance relative to the closest centroid[2]. LIRA learns per-query partition probing[14], DARTH stops search using a learned recall predictor[15], and QASP predicts a per-query recall-progression curve by supervised regression[16]. “Adaptive” or “learned routing” alone is not a contribution. The narrower opening is a training-free closed-form per-splat yield/stop rule using `μ/α/κ` that beats fixed `nprobe`, the SPANN ratio, productive-cluster doubling and a small learned regressor at matched recall, scan and memory.
+3. **Second-order parameters still need a task.** PCME learns distributions for ambiguous cross-modal correspondence[17]; PCME++ keeps mean-only retrieval strong and makes probabilistic scoring a separate design choice[5]. These results do not turn cluster spread into semantic uncertainty, and they are consistent with the negative local A5 energy-ranking result.
+4. **The calibration target is decision correctness.** CalibRAG states that normalized reranker scores are not calibrated probabilities of correctness and trains an outcome-supervised forecaster[18]. On its HotpotQA/Llama-2-7B configuration it reports ECE 0.106 versus 0.477 for a cross-encoder and 0.248 for LLM reranking; those are protocol-specific results, not SplatsDB expectations[18]. eRAG separately finds only a small correlation between query-document relevance labels and downstream RAG performance[19]. A future confidence head therefore needs outcome labels, held-out and shift evaluation, and selective risk/coverage—not another distance band.
+5. **Exactness must beat an exact scan.** PDX shows that dimension-pruning methods can lose to SIMD-optimized linear scans, while data layout changes the comparison[20]. SplatsDB's exact field route must beat an exact SIMD scan at recall 1.0 before any speed claim is defensible.
+
+**Minimum fair-control package:** use the same vectors, held-out queries, top-k, kernels and thread counts; sweep list count; report recall versus distance computations, p50/p95 wall time, bytes and build/update cost[2][15][20]. Count covariance storage explicitly, and compare anisotropic/vMF routing against the isotropic control[13]. For confidence, compare raw cosine, the current band, a CalibRAG-style outcome-supervised head and a shuffled-signal control[18]. No new policy is justified unless it beats fixed probes and the ratio/doubling/learned controls[2][15][16].
+
+## 7. Three-category product assessment
 
 ### Validated locally
 
@@ -92,23 +107,23 @@ Only an ablation that changes the splat routing while holding the rest fixed can
 
 | Direction | Utility if it works | Cost | Cheap falsification path |
 |---|---|---|---|
-| Adaptive query-aware probing | Better recall at lower scan than fixed `nprobe` | Medium: policy and tuning complexity | Compare against fixed `nprobe`, learned/random cells and SPANN-style query-aware pruning before implementing a new policy |
+| Adaptive query-aware probing | Better recall at lower scan than fixed `nprobe` | Medium: policy and tuning complexity | Compare against fixed `nprobe`, SPANN ratio, productive-cluster doubling and DARTH/QASP-style learned controls at matched recall/scan |
 | Calibrated selective retrieval | Lower selective error at controlled coverage | Medium: labels, calibration and drift handling | Start with downstream calibration; no new index until signal exists |
 | Learned probabilistic codebooks | Task-specific ambiguity modelling | High: training data, objectives and capacity-matched controls | Test learned variance against deterministic `μ` on a task with real ambiguity |
 | Integrated agent-memory runtime | Operational simplicity and reproducible ablations | Medium-high: systems and evaluation work | Hold generator/pipeline fixed and compare full-context, vanilla RAG and Faiss-based variants |
-| Exact-bound pruning at scale | Exactness with less compute on favorable geometry | Medium: corpus/hardware matrix | Measure where pruning occurs before claiming an operating envelope |
+| Exact-bound pruning at scale | Exactness with less compute on favorable geometry | Medium: corpus/hardware matrix | Beat an exact SIMD scan at recall 1.0 before claiming speed; PDX shows layout can invalidate pruning gains[20] |
 
-## 7. Recommended sequence
+## 8. Recommended sequence
 
-1. **Run the matched IVF baseline before any new algorithm.** This is the highest-information, lowest-cost next step and can falsify the remaining differentiator.
+1. **Run the matched IVF and probe-policy baselines before any new algorithm.** Use the same k-means cells and SIMD kernels, then add the SPANN ratio, productive-cluster doubling and a small learned regressor. This is the highest-information, lowest-cost next step and can falsify the remaining differentiator.
 2. **Expand independent semantic queries.** Use human-intent queries rather than lexical paraphrases, increase the query count and report paired deltas with intervals and the noise floor.
-3. **Calibrate downstream, not at the centroid.** Measure answer correctness and selective risk before calling any field uncertainty.
-4. **Evaluate adaptive probing as a controlled experiment.** Do not add complexity unless it beats fixed-`nprobe` and established query-aware controls.
+3. **Calibrate downstream, not at the centroid.** Compare raw cosine and the current band with an outcome-supervised correctness head on held-out and shifted queries; report selective risk/coverage before calling any field uncertainty.
+4. **Evaluate adaptive probing and angular cells as controlled experiments.** Do not add complexity unless a policy beats fixed-`nprobe`, ratio/doubling and learned controls, or an angular variant beats isotropic routing at matched scan and memory.
 5. **Run an end-to-end memory ablation.** Only then make an agent-memory utility claim.
 
 No new routing algorithm is justified by this review alone. The necessary new code for the current step was the reproducible analyzer, independent HTTP mirror, raw receipts and report generator—not a novelty feature introduced before the missing baselines exist.
 
-## 8. Source quality and research limits
+## 9. Source quality and research limits
 
 | Source | Status | Reading depth used here |
 |---|---|---|
@@ -121,10 +136,18 @@ No new routing algorithm is justified by this review alone. The necessary new co
 | Zep [9] | arXiv preprint, 2025 | Full text; architecture and reported benchmark tables |
 | Mem0 [10] | arXiv preprint, 2025 | Abstract; attributed claims only |
 | MemoryAgentBench [12] | ICLR 2026 | Full text; competencies and incremental evaluation design |
+| GARLIC [13] | arXiv preprint, 2025 | Abstract, method, covariance ablation and limitations; Euclidean only |
+| LIRA [14] | WWW 2025 | Abstract and probing-model design; distance-computation regime |
+| DARTH [15] | SIGMOD 2026 | Abstract and recall-predictor design; requires search traces |
+| QASP [16] | arXiv v3, 2026 | Abstract and feature model; recent supervised policy, not independently reproduced |
+| PCME [17] | CVPR 2021 | Abstract and probabilistic representation motivation; cross-modal regime |
+| CalibRAG [18] | NeurIPS 2025 | Abstract, calibration method and reranker comparison; values tied to its protocol |
+| eRAG [19] | arXiv, 2024 | Abstract; downstream-relevance correlation claim |
+| PDX [20] | SIGMOD 2025 | Abstract; exact/pruning layout comparison, not a SplatsDB benchmark |
 | ANN-Benchmarks [3] / Faiss [4] | Official benchmark / official documentation | Live result structure and implementation scope |
 
 - This is a targeted technical review, not an exhaustive systematic literature review or an independent reproduction of cited benchmark scores.
-- Recent preprints and vendor-authored evaluations require extra caution; no cited result is treated as a SplatsDB measurement.
+- Recent preprints and vendor-authored evaluations require extra caution; no cited result is treated as a SplatsDB measurement. GARLIC and QASP are especially recent, and their regimes are kept explicit.
 - The attempted LongMemEval-V2 page was rate-limited (HTTP 429) and is excluded from the findings.
 - No source found supports the claim that a KMeans-derived `α/κ` or `1 − d/R` is calibrated correctness uncertainty.
 - Local conclusions remain limited to one 11,069×384 corpus, deterministic perturbation queries and 100 queries per gate run.
@@ -135,6 +158,7 @@ No new routing algorithm is justified by this review alone. The necessary new co
     > "One task is to reduce the number of items that are scored to identify the top result. This is typically done with a space partitioning method. The other task is improving the rate at which items are scored. This is typically done with quantization, and is where the main contribution of our work lies."
 [2] https://proceedings.neurips.cc/paper_files/paper/2021/file/299dc35e747eb77177d9cea10a802da2-Paper.pdf
     > "In the search stage, we use a query-aware scheme to dynamically prune the access of unnecessary posting lists."
+    > "Instead of searching closest K posting lists for all queries, we dynamically decide a posting list to be searched only if the distance between its centroid and query is almost the same as the distance between query and the closest centroid."
 [3] https://ann-benchmarks.com
     > "Results are split by distance measure and dataset."
 [4] https://github.com/facebookresearch/faiss/wiki
@@ -155,3 +179,21 @@ No new routing algorithm is justified by this review alone. The necessary new co
     > "Our method improves the fraction of correct answers among times where the model responds by 2–10% for Gemini, GPT, and Gemma."
 [12] https://proceedings.iclr.cc/paper_files/paper/2026/file/fd1eff9dd295df50a41f2521942fa31d-Paper-Conference.pdf
     > "Empirical results reveal that current methods fall short of mastering all four competencies, underscoring the need for further research into comprehensive memory mechanisms for LLM agents."
+[13] https://arxiv.org/html/2505.24608
+    > "GARLIC employs Mahalanobis distance and Gaussian primitives, which assume a Euclidean metric and are therefore not directly compatible with angular similarity. This may be addressed by adopting angular counterparts, such as von Mises–Fisher distributions, which we leave for future work."
+    > "As shown in Table 2, reducing the Gaussian expressiveness from full to diagonal and then to isotropic leads to a notable decline in average Recall@1 per probe."
+[14] https://arxiv.org/html/2503.23409
+    > "This can reduce probing waste and allow for query-aware probing with nprobe individually."
+[15] https://arxiv.org/html/2505.19001
+    > "DARTH uses a novel method for providing target declarative recall on top of an ANNS index by employing an adaptive early termination strategy integrated into the search algorithm."
+[16] https://arxiv.org/html/2607.29606v3
+    > "predicts the complete recall progression curve per query via a single upfront supervised regression, from which a search policy is derived for any recall target"
+[17] https://arxiv.org/abs/2101.05068
+    > "Instead, we propose to use Probabilistic Cross-Modal Embedding (PCME), where samples from the different modalities are represented as probabilistic distributions in the common embedding space."
+[18] https://arxiv.org/html/2411.08891
+    > "Thus, the resulting scores, although often normalized between 0 and 1, are not calibrated probabilities of correctness and cannot be directly used for decision calibration."
+    > "HotpotQA Cross-encoder 60.74 34.98 0.477 0.477 LLM-rerank 60.57 38.52 0.248 0.297 CalibRAG 72.47 42.37 0.106 0.206"
+[19] https://arxiv.org/abs/2404.13781
+    > "evaluation of the retrieval model's performance based on query-document relevance labels shows a small correlation with the RAG system's downstream performance."
+[20] https://arxiv.org/abs/2503.04422
+    > "We found that these algorithms on the horizontal vector layout can lose to SIMD-optimized linear scans, even if they are SIMD-optimized."

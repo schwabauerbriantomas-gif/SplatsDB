@@ -31,7 +31,7 @@ SplatsDB is a **retrieval engine built around a field of Gaussian splats**, not 
 - **Ranking stays geometric:** candidate members are re-scored with exact L2. α/κ Gaussian energy is available for experiments, but the A5 audit found that mixing it into ranking degrades retrieval; it is not the basis of the validated benefit.
 - **Integrated runtime:** MCP, knowledge graph, HNSW, optional GPU and memory profiles are exposed by the same binary. These are integration features, not evidence of a splat-specific quality gain.
 
-For the external technical position, see the [primary-source SOTA review](docs/validation/sota-splats-routing.md): established IVF/quantization systems, probabilistic embeddings, calibrated abstention and current agent-memory evaluation.
+For the external technical position, see the [primary-source SOTA review](docs/validation/sota-splats-routing.md): established IVF/quantization systems, anisotropic Gaussian partitioning, adaptive probing, probabilistic embeddings, decision calibration and current agent-memory evaluation. The review makes the remaining opening explicit and unproven: angular low-rank cell routing or a closed-form splat-yield policy that beats matched IVF, ratio/doubling and learned controls.
 
 ### What is validated — and what is not
 
