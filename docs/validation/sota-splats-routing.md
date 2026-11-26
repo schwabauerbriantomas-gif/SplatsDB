@@ -8,13 +8,15 @@
 
 SplatsDB has a **narrow, reproducible routing result**, not a demonstrated state-of-the-art ANN or probabilistic-retrieval system. The local gate shows that learned KMeans centroids beat a random codebook at low scan budgets before exact re-scoring; the 10%-budget effect is +8.1 pp, while the smaller effects remain exploratory under the small-sample rule. Exact top-10 distances matched brute force, but exact search scanned essentially the whole 11,069-vector corpus. [Local receipts](splat-routing.md).
 
-The broader literature establishes four boundaries:
+The broader literature establishes five boundaries:
 
 1. Partitioning, learned codebooks, quantization and refinement are mature ANN components[1][2]. ScaNN explicitly separates reducing the number of scored items from improving the scoring rate, and contributes anisotropic quantization for that second task[1]. SPANN uses an inverted index with balanced posting lists and query-aware pruning in a memory-disk system[2]. Faiss provides established IVF, PQ and HNSW implementations[4]. **KMeans routing plus exact re-scoring is therefore not a novel algorithmic category.**[1][2]
 2. Probabilistic embeddings are a representation-learning method, not a label obtained by attaching Gaussian parameters to a cluster[5]. PCME++ addresses ambiguous image-text correspondence with learned probabilistic embeddings and a closed-form probabilistic distance[5]. SplatsDB's current `α/κ` fields do not reproduce that training problem or establish calibrated uncertainty[5].
 3. Agent-memory claims require end-to-end evaluation[8][12]. LongMemEval covers five abilities, including temporal reasoning, knowledge updates and abstention[8]. MemoryAgentBench evaluates accurate retrieval, test-time learning, long-range understanding and selective forgetting, and reports that current methods do not master all four[12]. Token reduction alone is not a sufficient product claim[12].
 
 4. Closer prior art narrows the remaining gap. GARLIC learns anisotropic Gaussian cells[13]. LIRA/DARTH/QASP cover learned or adaptive probing[14][15][16]. CalibRAG calibrates against decision correctness rather than retrieval scores[18]. The open question is narrower and empirical, not a new retrieval category.
+
+5. 3DGS contributes useful design patterns: LOD hierarchies, anchors and scale-aware filtering[22][23][25]. MCMC and compression add further capacity-management ideas[24][27]. They are hypotheses to test with retrieval metrics, not evidence that a vector index inherits rendering quality.
 
 **Recommended positioning:** an integrated, self-hosted retrieval runtime with learned splat-cell routing, optional exact bounds and verbatim source access. Do not claim probabilistic uncertainty, universal ANN superiority or better agent outcomes until the corresponding experiments pass.
 
@@ -86,7 +88,28 @@ The extended primary-source review narrows, rather than expands, the novelty cla
 
 **Minimum fair-control package:** use the same vectors, held-out queries, top-k, kernels and thread counts; sweep list count; report recall versus distance computations, p50/p95 wall time, bytes and build/update cost[2][15][20]. Count covariance storage explicitly, and compare anisotropic/vMF routing against the isotropic control[13]. For confidence, compare raw cosine, the current band, a CalibRAG-style outcome-supervised head and a shuffled-signal control[18]. No new policy is justified unless it beats fixed probes and the ratio/doubling/learned controls[2][15][16].
 
-## 7. Three-category product assessment
+## 7. 3D Gaussian Splatting: transferable methods and non-transfers
+
+SplatsDB shares the Gaussian-splat representation with 3DGS, but it does not reconstruct a visual scene. The useful transfer is the design principle, never the rendering score: photometric error, camera visibility and vector retrieval quality are different objectives[21].
+
+| 3DGS line | What the source establishes | Transferable question for SplatsDB | What does not transfer |
+|---|---|---|---|
+| Original 3DGS[21] | Anisotropic covariance, interleaved optimization/density control and visibility-aware rendering | Can anisotropic cells and selective computation improve candidate generation? | Camera visibility and rendered image quality are not retrieval evidence; exact raw-vector re-scoring remains necessary |
+| LOD hierarchies[25][26] | Multi-resolution hierarchies and anchor levels selected for large scenes | Can HRM2 choose coarse/fine levels against a declared recall/scan target? | View distance is not query difficulty; level selection must use retrieval measurements |
+| Scaffold-GS[23] | Anchor points generate local Gaussians and their attributes | Can anchored residual cells reduce index bytes without losing recall? | A view-conditioned MLP and its rendering gains do not establish compact semantic retrieval |
+| Density control[24][30] | Error-driven densification and MCMC-style relocation/pruning | Should cells split, merge or relocate based on held-out retrieval errors at fixed memory? | Pixel error and opacity are not relevance; uncontrolled growth can consume the scan budget |
+| Scale/anti-aliasing[22] | Scale-aware 3D smoothing and 2D Mip filters | Does bandwidth/scale normalization help across local densities or embedding-model changes? | There is no camera sampling frequency in semantic space; every new embedding model needs a rebuilt, recalibrated index |
+| Compression[27][28] | Significance-based pruning/VQ and KMeans parameter codebooks | Can metadata or learned residuals be compressed while preserving recall and exact re-scoring? | Rendering compression ratios and FPS do not transfer; raw-vector storage must be counted separately |
+| 2DGS geometry[29] | Oriented planar disks with depth/normal consistency for surfaces | Is a specialized representation useful only for genuine spatial/GIS/3D workloads? | A semantic vector database has no view-consistent surface to reconstruct |
+
+### 3DGS-inspired experiment queue — proposed, not implemented
+
+1. **Error-driven cell management at fixed memory.** Starting from the same flat `k=100/200` codebooks, split cells with high held-out boundary-miss contribution and merge low-yield overlapping cells. Compare against fixed KMeans and the matched random control at equal cell/vector bytes; report recall@10, scan fraction, build time and p50/p95. Try stochastic MCMC-style relocation only if a deterministic error-driven variant is insufficient, because stochasticity adds another source of variance[24][30].
+2. **Recall-driven LOD.** Select HRM2 levels using measured or predicted recall, not a rendering-distance proxy, and compare against flat cells and adaptive `nprobe` at the same scan budget[25][26].
+3. **Embedding-model shift test.** Measure whether scale/bandwidth normalization improves robustness across local densities. A new embedding model requires a new index and calibration set; never query the old index with incompatible vectors[22].
+4. **Compression as a separate gate.** Measure codebook, residual, metadata and raw-vector bytes together. Do not import LightGaussian/CompGS compression ratios or claim compression from the routing result alone[27][28].
+
+## 8. Three-category product assessment
 
 ### Validated locally
 
@@ -110,20 +133,22 @@ The extended primary-source review narrows, rather than expands, the novelty cla
 | Adaptive query-aware probing | Better recall at lower scan than fixed `nprobe` | Medium: policy and tuning complexity | Compare against fixed `nprobe`, SPANN ratio, productive-cluster doubling and DARTH/QASP-style learned controls at matched recall/scan |
 | Calibrated selective retrieval | Lower selective error at controlled coverage | Medium: labels, calibration and drift handling | Start with downstream calibration; no new index until signal exists |
 | Learned probabilistic codebooks | Task-specific ambiguity modelling | High: training data, objectives and capacity-matched controls | Test learned variance against deterministic `μ` on a task with real ambiguity |
+| 3DGS-inspired cell management | Better recall per byte or scan at fixed capacity | Medium-high: held-out error attribution and stochastic controls | Compare error-driven split/merge/relocation against fixed KMeans at matched memory before adding MCMC or anchors |
 | Integrated agent-memory runtime | Operational simplicity and reproducible ablations | Medium-high: systems and evaluation work | Hold generator/pipeline fixed and compare full-context, vanilla RAG and Faiss-based variants |
 | Exact-bound pruning at scale | Exactness with less compute on favorable geometry | Medium: corpus/hardware matrix | Beat an exact SIMD scan at recall 1.0 before claiming speed; PDX shows layout can invalidate pruning gains[20] |
 
-## 8. Recommended sequence
+## 9. Recommended sequence
 
 1. **Run the matched IVF and probe-policy baselines before any new algorithm.** Use the same k-means cells and SIMD kernels, then add the SPANN ratio, productive-cluster doubling and a small learned regressor. This is the highest-information, lowest-cost next step and can falsify the remaining differentiator.
 2. **Expand independent semantic queries.** Use human-intent queries rather than lexical paraphrases, increase the query count and report paired deltas with intervals and the noise floor.
 3. **Calibrate downstream, not at the centroid.** Compare raw cosine and the current band with an outcome-supervised correctness head on held-out and shifted queries; report selective risk/coverage before calling any field uncertainty.
 4. **Evaluate adaptive probing and angular cells as controlled experiments.** Do not add complexity unless a policy beats fixed-`nprobe`, ratio/doubling and learned controls, or an angular variant beats isotropic routing at matched scan and memory.
-5. **Run an end-to-end memory ablation.** Only then make an agent-memory utility claim.
+5. **Test error-driven cell management before adding hierarchy.** Use held-out retrieval errors at fixed memory and compare against fixed KMeans; only then evaluate recall-driven LOD or MCMC-style relocation.
+6. **Run an end-to-end memory ablation.** Only then make an agent-memory utility claim.
 
 No new routing algorithm is justified by this review alone. The necessary new code for the current step was the reproducible analyzer, independent HTTP mirror, raw receipts and report generator—not a novelty feature introduced before the missing baselines exist.
 
-## 9. Source quality and research limits
+## 10. Source quality and research limits
 
 | Source | Status | Reading depth used here |
 |---|---|---|
@@ -144,12 +169,20 @@ No new routing algorithm is justified by this review alone. The necessary new co
 | CalibRAG [18] | NeurIPS 2025 | Abstract, calibration method and reranker comparison; values tied to its protocol |
 | eRAG [19] | arXiv, 2024 | Abstract; downstream-relevance correlation claim |
 | PDX [20] | SIGMOD 2025 | Abstract; exact/pruning layout comparison, not a SplatsDB benchmark |
+| Original 3DGS [21] | SIGGRAPH/ACM TOG 2023 | Abstract; representation and density-control foundation |
+| Mip-Splatting [22] | CVPR 2024 | Abstract; scale-aware filtering, not a retrieval experiment |
+| Scaffold-GS [23] | CVPR 2024 | Abstract; anchor-generated local Gaussians |
+| 3DGS-MCMC [24] | NeurIPS 2024 | Abstract; SGLD and deterministic densification/pruning transition |
+| Hierarchical 3DGS [25] / Octree-GS [26] | CVPR 2024 / arXiv v2 | Abstracts; LOD design and multi-resolution anchors |
+| LightGaussian [27] / CompGS [28] | NeurIPS 2024 / ECCV 2024 | Abstracts; significance pruning and VQ for rendering parameters |
+| 2DGS [29] / Revising Densification [30] | SIGGRAPH 2024 / ECCV 2024 | Abstracts; surface representation and error-driven density control |
 | ANN-Benchmarks [3] / Faiss [4] | Official benchmark / official documentation | Live result structure and implementation scope |
 
 - This is a targeted technical review, not an exhaustive systematic literature review or an independent reproduction of cited benchmark scores.
 - Recent preprints and vendor-authored evaluations require extra caution; no cited result is treated as a SplatsDB measurement. GARLIC and QASP are especially recent, and their regimes are kept explicit.
 - The attempted LongMemEval-V2 page was rate-limited (HTTP 429) and is excluded from the findings.
 - No source found supports the claim that a KMeans-derived `α/κ` or `1 − d/R` is calibrated correctness uncertainty.
+- 3DGS sources are used as design-pattern evidence only. No rendering metric is compared with vector recall, and no PSNR/SSIM/FPS result is claimed as a database result.
 - Local conclusions remain limited to one 11,069×384 corpus, deterministic perturbation queries and 100 queries per gate run.
 
 ## Sources
@@ -197,3 +230,23 @@ No new routing algorithm is justified by this review alone. The necessary new co
     > "evaluation of the retrieval model's performance based on query-document relevance labels shows a small correlation with the RAG system's downstream performance."
 [20] https://arxiv.org/abs/2503.04422
     > "We found that these algorithms on the horizontal vector layout can lose to SIMD-optimized linear scans, even if they are SIMD-optimized."
+[21] https://arxiv.org/abs/2308.04079
+    > "we perform interleaved optimization/density control of the 3D Gaussians, notably optimizing anisotropic covariance to achieve an accurate representation of the scene"
+[22] https://arxiv.org/abs/2311.16493
+    > "we introduce a 3D smoothing filter which constrains the size of the 3D Gaussian primitives based on the maximal sampling frequency induced by the input views"
+[23] https://arxiv.org/abs/2312.00109
+    > "We introduce Scaffold-GS, which uses anchor points to distribute local 3D Gaussians, and predicts their attributes on-the-fly based on viewing direction and distance within the view frustum."
+[24] https://proceedings.neurips.cc/paper_files/paper/2024/hash/93be245fce00a9bb2333c17ceae4b732-Abstract-Conference.html
+    > "We then rewrite the densification and pruning strategies in 3D Gaussian Splatting as simply a deterministic state transition of MCMC samples, removing these heuristics from the framework."
+[25] https://arxiv.org/abs/2406.12080
+    > "We introduce a hierarchy of 3D Gaussians that preserves visual quality for very large scenes, while offering an efficient Level-of-Detail (LOD) solution for efficient rendering of distant content with effective level selection and smooth transitions between levels."
+[26] https://arxiv.org/abs/2403.17898
+    > "Our model dynamically selects the appropriate level from the set of multi-resolution anchor points, ensuring consistent rendering performance with adaptive LOD adjustments while maintaining high-fidelity rendering results."
+[27] https://arxiv.org/abs/2311.17245
+    > "Gaussian Vector Quantization, based on each Gaussian's global significance, further lowers bitwidth with minimal accuracy loss."
+[28] https://arxiv.org/abs/2311.18159
+    > "we introduce a simple vector quantization method based on K-means algorithm to quantize the Gaussian parameters"
+[29] https://arxiv.org/abs/2403.17888
+    > "Our key idea is to collapse the 3D volume into a set of 2D oriented planar Gaussian disks."
+[30] https://arxiv.org/abs/2404.06109
+    > "Our main contribution is a more principled, pixel-error driven formulation for density control in 3DGS, leveraging an auxiliary, per-pixel error function as the criterion for densification."
