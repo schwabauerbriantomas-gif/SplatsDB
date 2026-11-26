@@ -32,6 +32,8 @@ def ivf_report(data: dict) -> str:
         "",
         "This is an implementation/policy experiment on synthetic perturbed self-queries, not a human-semantic, calibrated-confidence or production-QPS benchmark.",
         "",
+        "The first run stopped before producing output on a non-grid ratio-probe harness bug; see the [incident record](ivf-atlas-incidents.md). The protocol was not changed.",
+        "",
         "## H3 — Faiss/mirror parity",
         "",
         f"- Comparisons: **{parity['comparisons']}**; recall mismatches: **{parity['recall_mismatches']}**; distance-multiset mismatches: **{parity['distance_mismatches']}**; scan mismatches: **{parity['scan_mismatches']}**.",

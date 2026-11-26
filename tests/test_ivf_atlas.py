@@ -33,6 +33,13 @@ class PolicyTests(unittest.TestCase):
     def test_ratio_always_returns_at_least_one_cell(self):
         self.assertEqual(common.ratio_probe(self.plan, 0.0), 1)
 
+    def test_policy_accepts_non_grid_ratio_probe(self):
+        all_d2 = common.brute_d2(self.corpus, self.query[None, :])
+        gt_kth = np.asarray([common.top_k(all_d2[0])[1][-1]])
+        result = common.policy_result([self.plan], all_d2, gt_kth, [3], len(self.corpus))
+        self.assertEqual(result["recall"].shape, (1,))
+        self.assertGreater(result["scan"][0], 0.0)
+
     def test_productive_doubling_guards_and_full_scan(self):
         self.assertGreaterEqual(common.productive_probe(self.plan, 1.0), 1)
         self.assertEqual(common.productive_probe(self.plan, 0.0), 100)

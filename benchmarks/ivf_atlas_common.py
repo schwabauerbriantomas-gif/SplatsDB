@@ -87,8 +87,16 @@ def candidate_plan(query: np.ndarray, mu: np.ndarray, groups: Sequence[np.ndarra
     delta = mu - query
     dmu = np.einsum("ij,ij->i", delta, delta).astype(np.float32)
     order = np.argsort(dmu, kind="stable")
-    candidates = {int(p): np.concatenate([groups[c] for c in order[:p]]) for p in probes}
-    return {"dmu": dmu, "order": order, "candidates": candidates}
+    ordered_groups = [groups[c] for c in order]
+    candidates = {int(p): np.concatenate(ordered_groups[:p]) for p in probes}
+    return {"dmu": dmu, "order": order, "ordered_groups": ordered_groups, "candidates": candidates}
+
+
+def get_candidates(plan: dict, p: int) -> np.ndarray:
+    p = int(p)
+    if p not in plan["candidates"]:
+        plan["candidates"][p] = np.concatenate(plan["ordered_groups"][:p])
+    return plan["candidates"][p]
 
 
 def score_candidates(candidates: np.ndarray, query_d2: np.ndarray, k: int = 10) -> tuple[np.ndarray, np.ndarray]:
@@ -102,7 +110,7 @@ def grid_recall_scan(plans: Sequence[dict], all_d2: np.ndarray, gt_kth: np.ndarr
     for p in PROBES:
         recalls, scans = [], []
         for i, plan in enumerate(plans):
-            _, scores = score_candidates(plan["candidates"][p], all_d2[i])
+            _, scores = score_candidates(get_candidates(plan, p), all_d2[i])
             recalls.append(threshold_recall(scores[None, :], gt_kth[i : i + 1])[0])
             scans.append(len(plan["candidates"][p]) / n)
         result[p] = {"recall": np.asarray(recalls), "scan": np.asarray(scans)}
@@ -174,7 +182,7 @@ def predicted_probe(model: HistGradientBoostingRegressor, plan: dict, n: int, ta
 def policy_result(plans: Sequence[dict], all_d2: np.ndarray, gt_kth: np.ndarray, probe_for_query: Sequence[int], n: int) -> dict[str, np.ndarray]:
     recalls, scans = [], []
     for i, (plan, p) in enumerate(zip(plans, probe_for_query)):
-        _, scores = score_candidates(plan["candidates"][int(p)], all_d2[i])
+        _, scores = score_candidates(get_candidates(plan, int(p)), all_d2[i])
         recalls.append(threshold_recall(scores[None, :], gt_kth[i : i + 1])[0])
         scans.append(len(plan["candidates"][int(p)]) / n)
     return {"recall": np.asarray(recalls), "scan": np.asarray(scans)}

@@ -64,7 +64,7 @@ def python_operation(family: str, config: float | None, target: float, model, pl
             p = common.productive_probe(plan, float(config))
         else:
             p = common.predicted_probe(model, plan, corpus_size, target)
-        common.score_candidates(plan["candidates"][p], all_d2[i])
+        common.score_candidates(common.get_candidates(plan, p), all_d2[i])
     return run
 
 
