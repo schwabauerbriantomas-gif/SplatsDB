@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# faststart.sh — pipeline completo splatDB + embeddinggemma-2 en un comando.
+# faststart.sh — pipeline completo SplatsDB + embeddinggemma-2 en un comando.
 # 1) embedding server (:8860, google/embeddinggemma-2 vía SentenceTransformer)
-# 2) hub splatDB (:8871, búsqueda GPU exacta)
+# 2) hub SplatsDB (:8871, búsqueda GPU exacta)
 # 3) smoke end-to-end
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -28,7 +28,7 @@ else
   echo "   listo"
 fi
 
-echo "── 2/3 hub splatDB (:8871, GPU exacto)"
+echo "── 2/3 hub SplatsDB (:8871, GPU exacto)"
 bash "$ROOT/semantic-hub/hub-ensure.sh" >/dev/null 2>&1 || true
 wait_http http://127.0.0.1:8871/health 120 \
   || { echo "   ERROR: hub no levantó (ver $LOG/semantic-hub.log)"; exit 1; }

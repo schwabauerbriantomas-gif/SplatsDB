@@ -29,7 +29,7 @@
   "note": "Lossy compression trades recall for speed"
  },
  "splatdb_hnsw_cpu": {
-  "engine": "SplatDB v2.5.0 (Rust)",
+  "engine": "SplatsDB v2.5.0 (Rust)",
   "M": 32,
   "ef_construction": 400,
   "ef_search": 100,
@@ -42,7 +42,7 @@
   "note": "CPU, same HNSW params as Faiss for fair comparison"
  },
  "splatdb_gpu_topk": {
-  "engine": "SplatDB v2.5.0 (Rust + CUDA PTX)",
+  "engine": "SplatsDB v2.5.0 (Rust + CUDA PTX)",
   "gpu": "RTX 3090",
   "n_vectors": 100000,
   "dim": 128,
@@ -101,7 +101,7 @@
  "analysis": {
   "faiss_hnsw_vs_splatdb": "Faiss HNSW is 14.8x faster on QPS (9758 vs 658) with similar recall (0.9926 vs 0.986). Faiss benefits from 20+ years of SIMD/BLAS optimization.",
   "splatdb_gpu": "RTX 3090 gives 4.1x speedup over CPU for brute-force top-k search (12,195 vs 2,941 QPS with k=10).",
-  "splatdb_advantages": "SplatDB offers features Faiss lacks: Gaussian splatting with uncertainty (μ, α, κ), semantic memory with BM25+vector+RRF, spatial memory (MemPalace), verbatim storage, MCP server, distributed cluster, and native LLM agent integration.",
-  "longmemeval_advantage": "SplatDB achieves 96.6% recall@10 on LongMemEval, beating all published systems' best of 86.2%. Spatial pre-filter reduces search space from 500 to ~48 candidates."
+  "splatdb_advantages": "SplatsDB offers features Faiss lacks: Gaussian splatting with uncertainty (μ, α, κ), semantic memory with BM25+vector+RRF, spatial memory (MemPalace), verbatim storage, MCP server, distributed cluster, and native LLM agent integration.",
+  "longmemeval_advantage": "The NumPy brute-force reference achieves 96.6% recall@10 on LongMemEval. It does not measure native SplatsDB recall or support an end-to-end comparison against published systems."
  }
 }

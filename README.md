@@ -5,40 +5,56 @@
 <h1 align="center">SplatsDB</h1>
 
 <p align="center">
-Vector search with uncertainty awareness. Knowledge graph + HNSW + GPU in a single Rust binary.
+Gaussian splat routing with exact raw-vector re-scoring. Knowledge graph + HNSW + GPU in one Rust binary.
 </p>
 
-[![CI](https://github.com/schwabauerbriantomas-gif/splatdb/actions/workflows/ci.yml/badge.svg)](https://github.com/schwabauerbriantomas-gif/splatdb/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-2.11.0-blue.svg)](https://github.com/schwabauerbriantomas-gif/splatdb/releases)
+[![CI](https://github.com/schwabauerbriantomas-gif/SplatsDB/actions/workflows/ci.yml/badge.svg)](https://github.com/schwabauerbriantomas-gif/SplatsDB/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/version-2.11.0-blue.svg)](https://github.com/schwabauerbriantomas-gif/SplatsDB/releases)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-561%20default%20%2B%20545%20CPU-brightgreen.svg)](https://github.com/schwabauerbriantomas-gif/splatdb/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-561%20default%20%2B%20545%20CPU-brightgreen.svg)](https://github.com/schwabauerbriantomas-gif/SplatsDB/actions/workflows/ci.yml)
 [![LOC](https://img.shields.io/badge/LOC-27.6K-informational.svg)]()
 [![CUDA](https://img.shields.io/badge/GPU-RTX%203090-76B900.svg)]()
 
 ---
 
-<p align="center"><sub>Search returns confidence scores based on κ (concentration) — agents know when to trust results.</sub></p>
+<p align="center"><sub>Learned splat cells route queries to a small candidate pool; raw vectors are re-scored exactly. Distance-based flags are diagnostics, not correctness probabilities.</sub></p>
 
 ---
 
 ## Why SplatsDB?
 
-SplatsDB is **not** a Faiss competitor on raw QPS. If you need the fastest possible brute-force ANN on a single metric, Faiss wins. SplatsDB's differentials are:
+SplatsDB is a **retrieval engine built around a field of Gaussian splats**, not a claim that Gaussian energy improves ranking by itself. The validated path uses learned splat centroids to route queries before exact re-scoring of raw vectors.
 
-- **Uncertainty-aware retrieval**: Queries return confidence scores derived from κ (concentration). Ambiguous or out-of-distribution queries get flagged as "low confidence." No other vector DB does this.
-- **GraphSplat hybrid search**: Vector similarity + knowledge graph traversal in one engine. LangChain and LlamaIndex typically need 3 separate tools (vector store, graph DB, fusion layer) to achieve the same result.
-- **Agent memory**: Built-in MCP server for long-term AI agent memory. Connect to Claude in 2 minutes — no glue code needed.
-- **Single binary, pure Rust**: No Python runtime, no Java, no Docker dependency. One `cargo build --release` and you're done.
+- **Measured routing utility:** against a random codebook at matched scan budgets, the learned `k=100` codebook improved recall@10 by **8.1 points at ~15% scan**. The frozen CI gate also passed at 20% and 40%, but those smaller effects (+3.6 and +0.7 points) are below the conservative 5-point small-sample noise floor and remain exploratory. [Protocol, aggregate results and limits](docs/validation/splat-routing.md).
+- **Exact by construction when needed:** `field-search` uses cell radii and the triangle inequality. In the new gate it matched brute-force top-10 distances on 100/100 queries; it did **not** materially prune at 11k×384, so this is a correctness feature, not a measured speedup at that scale.
+- **Ranking stays geometric:** candidate members are re-scored with exact L2. α/κ Gaussian energy is available for experiments, but the A5 audit found that mixing it into ranking degrades retrieval; it is not the basis of the validated benefit.
+- **Integrated runtime:** MCP, knowledge graph, HNSW, optional GPU and memory profiles are exposed by the same binary. These are integration features, not evidence of a splat-specific quality gain.
+
+For the external technical position, see the [primary-source SOTA review](docs/validation/sota-splats-routing.md): established IVF/quantization systems, anisotropic Gaussian partitioning, adaptive probing, probabilistic embeddings, decision calibration and current agent-memory evaluation. It also maps 3DGS methods—LOD hierarchies, anchors, error-driven density control, scale filtering and pruning/VQ—to falsifiable index experiments while excluding rendering metrics as retrieval evidence. A separate alternative-representation track covers Topo-GS, GraphSplatting and scientific-volume splatting for embedding, graph and spatial-data visualization, evaluated by topology/geometry/user-task metrics rather than ANN recall. The review makes the remaining opening explicit and unproven: angular low-rank cell routing, error-driven cell management or a closed-form splat-yield policy that beats matched IVF, ratio/doubling and learned controls.
+
+### What is validated — and what is not
+
+| Capability | Current evidence | Scope |
+|---|---|---|
+| Learned splat-cell routing | **Validated locally** | Low-scan effect clears the conservative noise floor; smaller effects remain exploratory |
+| Exact triangle-bound field search | **Correctness validated** | No material pruning observed at 11k×384 |
+| α/κ as a ranking improvement | **Falsified in A5** | Do not use energy as the default relevance score |
+| `topic` / `confidence` | **Diagnostic only** | Distance-to-centroid membership; not calibrated correctness probability |
+| Compression / smaller memory | **Not validated by the routing gate** | Raw member vectors are retained for exact re-scoring |
+| Agent task success / hallucination prevention | **Not established** | MCP integration and verbatim sources do not prove better answers |
+| GPU / HNSW / graph / M3 | **Separate components** | Not attributable to Gaussian splats without an isolating experiment |
 
 ### Comparison
 
+The table records architecture and integration surface, not a claim that checkmarks imply superior retrieval quality.
+
 | Feature | SplatsDB | Faiss | Pinecone | Qdrant | Milvus/Zilliz | LanceDB |
-|---------|---------|-------|----------|--------|---------------|---------|
+|---|---|---|---|---|---|---|
 | Language | Rust | C++ | Go/Rust | Rust | Go+C++ | Rust |
 | License | GPL-3.0 | MIT | Proprietary | Apache 2.0 | Apache 2.0 | Apache 2.0 |
-| Gaussian Splats | ✅ | — | — | — | — | — |
-| Uncertainty scores | ✅ (flagging only — see [A5 findings](docs/A5_FINDINGS.md)) | — | — | — | — | — |
+| Splat-cell routing + exact re-scoring | ✅ | IVF family | — | — | IVF/graph family | — |
+| Topic-membership diagnostic | ✅ (not calibrated) | — | — | — | — | — |
 | Knowledge Graph | ✅ | — | — | — | — | — |
 | Spatial Memory (Wing/Room/Hall/Tunnel) | ✅ | — | — | — | — | — |
 | MCP server (18 tools) | ✅ | — | — | — | — | — |
@@ -50,7 +66,7 @@ SplatsDB is **not** a Faiss competitor on raw QPS. If you need the fastest possi
 | Vector compression | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Pricing (cloud managed) | **Free** | N/A | $50–$500/mo | Usage-based | $99–$155/mo | Free |
 
-> **Honest note**: Faiss remains the gold standard for raw CPU ANN throughput — its HNSW is **14.8× faster** than SplatsDB's HNSW on CPU (9,758 vs 658 QPS at k=64, recall 0.9926 vs 0.986). SplatsDB's GPU path is **brute-force exact top-k at k=10**: 12,195 QPS with the dataset persistent in VRAM. That is a different regime (exact vs approximate, k=10 vs k=64, GPU vs CPU) — not a like-for-like win over Faiss; see [Benchmarks](#benchmarks). Milvus and Qdrant have richer ecosystem integrations (LangChain, LlamaIndex, managed cloud). SplatsDB's niche is uncertainty-aware retrieval + knowledge graph + agent memory + spatial memory in a single Rust binary.
+> **Honest note:** Faiss remains the gold standard for raw CPU ANN throughput — its HNSW is **14.8× faster** than SplatsDB's HNSW on CPU (9,758 vs 658 QPS at k=64, recall 0.9926 vs 0.986). SplatsDB's GPU path is **brute-force exact top-k at k=10**: 12,195 QPS with the dataset persistent in VRAM. That is a different regime (exact vs approximate, k=10 vs k=64, GPU vs CPU) — not a like-for-like win over Faiss; see [Benchmarks](#benchmarks). The differentiating evidence is learned splat-cell routing plus the integrated runtime, not universal superiority.
 
 ---
 
@@ -85,20 +101,23 @@ SplatsDB is **not** a Faiss competitor on raw QPS. If you need the fastest possi
 
 ## What Is This?
 
-SplatsDB applies **Gaussian Splatting** — a technique from 3D neural rendering — to vector search. Instead of storing raw embedding vectors, each document is represented as a probabilistic Gaussian (mean μ, opacity α, concentration κ). This enables:
+SplatsDB stores a **field of Gaussian splats**. A splat carries a mean `μ`, persisted `α` and `κ`, and—in the validated routing path—a geometric cell radius `R` covering its raw member vectors.
 
-- **Richer similarity semantics** via splat overlap instead of point-to-point distance *(as a storage/compression representation — for ranking quality, score with the embedding metric: an empirical audit found splat-energy/density fusion degrades recall by 25 pts with p<0.05; splats shine as a routing codebook: 0.87 recall@10 reading 31% of the corpus. Details: [docs/A5_FINDINGS.md](docs/A5_FINDINGS.md))*
-- **Natural compression** through distribution parameters (3–8 bit quantization)
-- **Uncertainty-aware retrieval** — sparse regions have high energy, guiding active learning
-- **Knowledge graph overlay** — typed entities and relations augment vector retrieval
+The useful distinction is between **representation** and **ranking**:
 
-Combined with a two-level KMeans++ retrieval pipeline (HRM2), HNSW incremental indexing, and 15 CUDA GPU kernels (7 distance + 8 extended), SplatsDB provides a full-featured vector search engine in ~27.6K lines of pure Rust + CUDA (27,648 by `wc -l` — Rust `src/` 26,624 + CUDA `kernels/` 1,024, raw lines; the single LOC criterion also used by the badge and the [Module Map](#module-map)).
+- `μ` and the learned cell partition determine which candidates are gathered.
+- Raw member vectors are re-scored with the embedding metric, preserving geometric ranking.
+- `R` supports optional exact triangle-bound search.
+- `α/κ` do not establish relevance or correctness probabilities; their use as an energy ranking signal was falsified in the A5 audit.
+
+This makes the current utility concrete: **control how many vectors are examined before exact re-scoring, using a learned partition rather than an arbitrary one**. It does not require claiming probabilistic semantics that the measurements do not support.
 
 **Key use cases:**
-- AI agent long-term memory (MCP server for Claude, GPT, open-source LLMs)
-- Semantic search over document collections
-- Knowledge graph construction and retrieval
-- GPU-accelerated nearest neighbor search at scale
+
+- Controlled-scan candidate retrieval over memory-resident embeddings
+- Exact field search when correctness matters more than latency
+- Self-hosted agent-memory infrastructure with MCP and verbatim source text
+- Experimental Gaussian-energy scoring with an explicit negative-evidence warning
 
 ---
 
@@ -112,17 +131,17 @@ Combined with a two-level KMeans++ retrieval pipeline (HRM2), HNSW incremental i
 │                                                                   │
 │  ┌──────────────┐  ┌─────────────────────────────────────────┐ │
 │  │ Query Layer   │  │ GraphSplat                              │ │
-│  │ HRM2 Two-     │  │ Knowledge Graph                         │ │
-│  │ Level         │  │ Hybrid Search +                         │ │
-│  │ Retrieval     │  │ BFS Traversal                           │ │
+│  │ Splat Routing │  │ Knowledge Graph                         │ │
+│  │ + Exact      │  │ Hybrid Search +                         │ │
+│  │ Re-scoring   │  │ BFS Traversal                           │ │
 │  └──────┬───────┘  └──────────────────┬──────────────────────┘ │
 │         └─────────────────────────────┼────────────────────────┘│
 │                                       │                         │
 │  ┌────────────────────────────────────▼────────────────────────┐│
-│  │            Gaussian Splat Embeddings                         │ │
-│  │         (mean μ + opacity α + concentration κ)               │ │
-│  ├──────────────────────────────────────────────────────────────┤ │
-│  │  Compression: TurboQuant / PolarQuant (3–8 bit)              │ │
+│  │       Splat Cells (μ, α, κ, R) + Raw Member Vectors       │ │
+│  │   μ: routing · R: exact bounds · α/κ: experimental        │ │
+│  ├────────────────────────────────────────────────────────────┤ │
+│  │  Compression: TurboQuant / PolarQuant (separate modes)     │ │
 │  ├──────────────────────────────────────────────────────────────┤ │
 │  │  Indexes: HNSW │ LSH │ KMeans++ (coarse → fine)             │ │
 │  ├──────────────────────────────────────────────────────────────┤ │
@@ -141,7 +160,7 @@ Combined with a two-level KMeans++ retrieval pipeline (HRM2), HNSW incremental i
 bash semantic-hub/faststart.sh
 ```
 
-Brings up the local embedding server (`google/embeddinggemma-2`, 768-d, :8860), the splatDB hub with exact GPU search (:8871), and runs an end-to-end smoke. Then:
+Brings up the local embedding server (`google/embeddinggemma-2`, 768-d, :8860), the SplatsDB hub with exact GPU search (:8871), and runs an end-to-end smoke. Then:
 
 ```bash
 # 1) embed a query
@@ -158,7 +177,7 @@ curl -s -X POST http://127.0.0.1:8871/search \
 
 ### 30-Second Trial (No Rust Needed)
 
-Download the [latest release binary](https://github.com/schwabauerbriantomas-gif/splatdb/releases) and run:
+Download the [latest release binary](https://github.com/schwabauerbriantomas-gif/SplatsDB/releases) and run:
 
 ```bash
 # Index pre-computed embeddings (any dimension, any provider)
@@ -250,49 +269,54 @@ SplatsDB uses a simple binary format for vector data:
 
 ## How It Works
 
-### Gaussian Splat Embeddings
+## How It Works
 
-Traditional vector databases store raw embedding vectors and compute point-to-point distances. SplatsDB represents each document as a **probabilistic Gaussian**:
+### Splat cells and raw vectors
 
-- **μ (mean)**: Position in embedding space — the "center" of the concept
-- **α (opacity)**: How strongly this document is represented — akin to importance weight
-- **κ (concentration)**: How focused the representation is — high κ means precise, low κ means broad
+A splat mean `μ` is a learned position in embedding space. During `ingest`, KMeans learns the codebook and each raw vector is assigned to its nearest splat. The engine persists the raw vectors, splat means, memberships and cell radii.
 
-**ELI5**: Imagine each document is a paint splat on a wall.
-- A doc about "Golden Retriever puppies" has **high κ** — a tiny, precise dot.
-- A doc about "dogs in general" has **low κ** — a big, blurry splat.
-- **α** is how bright the paint is — important docs are brighter.
-- When you search, we measure how much your query overlaps each splat. The AI knows *how confident* it is about each match.
+- **μ (mean):** candidate-routing center.
+- **R (radius):** maximum member-to-centroid distance; the geometric quantity used by exact bounds.
+- **α (opacity) and κ (concentration):** available for experimental Gaussian scoring, but not required by two-phase routing and not calibrated confidence values.
 
-Similarity is computed as **splat overlap** (integral of two Gaussians), which naturally captures:
-- Documents that cover broad topics (low κ) match more queries, but with lower confidence
-- Documents that are very specific (high κ) match fewer queries, but with higher precision
-- Overlap is symmetric and differentiable — enabling energy-based exploration
+The current routing evidence therefore supports **learned cell geometry**, not the statement that every document acquires a useful probabilistic interpretation merely by being assigned a splat.
 
-### HRM2 Two-Level Retrieval
+### Two-Phase Splat Routing
 
-The query pipeline uses Hierarchical Rejection Mapping (HRM2):
+1. Compute distances from the query to splat means.
+2. Select the nearest `nprobe` cells.
+3. Gather their raw member vectors through the persisted CSR layout.
+4. Compute exact L2 scores for those candidates and return top-k.
 
-1. **Coarse KMeans++**: Partition all splats into N coarse clusters
-2. **Fine KMeans++**: Each coarse cluster has M fine sub-clusters
-3. **Probe**: Only search the top P fine clusters relevant to the query
-4. **Exact re-rank**: Compute full splat overlap for candidates
+Increasing `nprobe` exchanges more vector scans for higher candidate coverage. The measured learned-versus-random benefit is real at low scan budgets and becomes small when a large fraction of the corpus is already being examined. See the [predeclared routing gate](docs/validation/splat-routing.md) for primary and `k=200` sensitivity receipts.
 
-This reduces search from O(N) to O(N/P) with minimal recall loss.
+### HRM2 Hierarchical Codebooks
 
-### Gaussian Re-scoring
+HRM2 implements an alternative two-level coarse/fine KMeans retrieval path. The hierarchy is an index organization, not evidence of probabilistic uncertainty or automatically higher recall. The new routing gate uses flat `k=100` and `k=200` codebooks and does **not** validate HRM2; compare HRM2 separately at matched scan, recall, latency and memory before using it in a performance claim.
 
-Candidate retrieval (HNSW or HRM2) returns neighbors by geometric distance. SplatsDB then re-scores candidates with a per-item Gaussian weight:
+### Exact Triangle-Bound Field Search
 
+Default `field-search` treats each splat as a cell with radius `R` and uses:
+
+```text
+d(q, x) ≥ d(q, μ) − R
 ```
+
+A cell can be skipped only when its lower bound loses to a complete top-k threshold. This preserves exactness; it does not guarantee useful pruning on every corpus. At 11,069×384 the new gate visited 99.88% of clusters and scanned 99.9988% of vectors, so no material speed claim is made for that dataset.
+
+### Gaussian Energy: Experimental, Not the Default Benefit
+
+```text
 score(i) = αᵢ · exp(−κᵢ · ‖q − μᵢ‖²)
 ```
 
-where each stored item carries α (opacity / importance) and κ (concentration / specificity) alongside its mean μ. The re-scoring step is what produces the confidence signal: an item with high κ only scores high when it is very close to the query, while a low-κ item contributes a broader, weaker match. The same α/κ model drives the Gaussian re-scoring and confidence flagging implemented in `src/splats.rs` (`gaussian_score`). The earlier energy-landscape uncertainty estimation (`src/energy.rs`, `src/ebm/`) was **removed in v2.7.x** after being falsified as a ranking signal — see the v2.6 audit below and `docs/A5_FINDINGS.md`.
+This is a real implemented scoring mode, but A5 found that energy/density fusion degrades semantic retrieval instead of improving it. Uniform `α/κ` also reduces the Gaussian argmax to the minimum-distance argmax. Use geometric candidate ranking unless running a separately designed experiment; see [`A5_FINDINGS.md`](docs/A5_FINDINGS.md).
 
-Probabilistic scoring of candidates is not new as a technique — probabilistic cross-media embedding methods (e.g. PCME / PCME++) and mixture-model retrieval score candidates distributionally in the academic literature. SplatsDB's contribution is at the product level: per-item κ re-scoring, uncertainty flags, and confidence-aware results exposed as first-class database features (search results, MCP tools), not as a research artifact.
+### Topic and Confidence Fields
 
-> **v2.6 empirical audit** (30 queries vs exact GT, 26k×768; measurement source **not preserved** — the `bench-latent/` directory referenced by earlier revisions no longer exists in the tree or history): energy re-scoring as a *ranking* signal collapses recall to ~0.00–0.05 in 768d — κ clamps low and α dominates, so the ranking becomes cluster popularity. Rank with the embedding metric; confidence flagging stays a first-class feature. Details in [`docs/A5_FINDINGS.md`](docs/A5_FINDINGS.md).
+The HTTP `topic` identifies the result's splat cell. Its numeric `confidence` is `1 − d/R`, clamped to `[0,1]`: a measure of how close a result lies to the cell center. MCP/verbatim HIGH/MEDIUM/LOW labels are fixed vector-distance bands. **Neither is a calibrated probability that a passage answers the question correctly.**
+
+Verbatim retrieval is independently useful because the agent can inspect the original source, but that affordance does not prove hallucination prevention or better task outcomes.
 
 ### SimCos Embeddings
 
@@ -307,32 +331,23 @@ When no pre-computed embeddings are provided, SplatsDB uses **SimCos** — a sim
 
 SimCos is a **toy embedding** useful for quick demos and testing. For production use, pass pre-computed embeddings from your preferred model (OpenAI, Cohere, local transformers, etc.).
 
-### α, κ, and Uncertainty: A Concrete Example
+### No Uncertainty Inference from α/κ
 
-Two documents can share the same mean (μ) but have very different uncertainty profiles:
+`α` and `κ` affect experimental Gaussian energy, but they are not learned correctness or ambiguity estimates in this pipeline. No ranking/confidence example is provided: A5 falsified the tested energy-ranking benefit, and the current fields are not calibrated probabilities.
 
-```
-Document A: μ=[0.1, 0.3, ...], κ=50 (precise, narrow topic)
-Document B: μ=[0.1, 0.3, ...], κ=5  (broad, covers many sub-topics)
+### Choosing a Search Path
 
-Query: "machine learning"
-→ Document A: high overlap score, high confidence → ranked #1
-→ Document B: moderate overlap, low confidence → ranked lower, flagged as uncertain
-```
+- **HNSW:** default approximate graph retrieval for general vector search.
+- **Two-phase splat routing:** use when explicit candidate-scan control and learned cell routing matter; measure recall against the exact route for the target corpus.
+- **HRM2:** two-level coarse/fine retrieval; benchmark separately because the flat-codebook gate does not cover this path.
+- **Exact field search:** use when exact geometric results are required; do not assume pruning will be fast at small scale or high dimension.
+- **Gaussian energy:** experimental only; do not substitute it for geometric ranking based on the current evidence.
 
-A high κ means the document is tightly focused — it matches few queries, but when it matches, you can be confident. A low κ means the document is broad — it matches many queries, but results carry less certainty. This is information no plain vector distance can give you.
+### Field Search: Splats as Cells with Radii
 
-### When to Use HRM2 Splats vs HNSW
+The v2.6 field search treats each splat as a cell with radius `R = max member→centroid distance`. The triangle inequality provides a safe lower bound; the pruning threshold becomes valid only after top-k is complete. Every ingest persists `field/` (members CSR + radii) plus a `raw` shard, so `field-search` (CLI) and `/field-search` (HTTP) work out of the box.
 
-- **HNSW** is the default for production. It indexes μ vectors directly and achieves 0.995+ recall. α and κ are used during re-ranking for confidence scoring.
-- **HRM2 splats** are useful when you need overlap-based similarity (capturing topic breadth), uncertainty estimation, or don't have enough data for a good HNSW graph.
-- **Rule of thumb**: Use HNSW for speed, use HRM2 when uncertainty matters.
-
-### Field Search: Splats as Cells with Radii (v2.6)
-
-The v2.6 field search treats each splat as a **cell with a radius** (R = max member→centroid distance) and uses the triangle inequality `d(q,x) ≥ d(q,μ) − R` as a **safe bound**: an entire cluster is skipped when its bound loses to the current k-th best. This makes `field-search` **exact by construction** (measured recall 0.99 vs brute-force GT on 26k×768 — the 2 misses are float32 ties), while HNSW remains approximate (0.997). A subtle implementation rule matters: the pruning threshold `kth` is only a valid bound once the top-k is complete.
-
-Honest envelope: at 26k×768d the radii (≈1.0) are the same order as query-to-centroid distances (≈0.6), so bound pruning is ~1% — the win appears at larger scale (≥500k vectors) or reduced dimensions (MRL 128/256). Every ingest persists `field/` (members CSR + radii) plus a `raw` shard, so both `field-search` (CLI) and `/field-search` (HTTP) work out of the box.
+The exact route is valuable as a correctness reference and as an optional exact backend. Its measured pruning envelope is dataset-dependent, and the new 11k×384 receipt showed essentially full scan.
 
 ---
 
@@ -410,18 +425,20 @@ On synthetic data HNSW delivers **~875× speedup** over linear scan at 10K. Real
 - GPU upload to VRAM: 17ms (one-time per dataset load); with upload included the GPU path is 10,101 QPS.
 - On CPU like-for-like, **Faiss HNSW is 14.8× faster than SplatsDB HNSW** (9,758 vs 658 QPS at k=64) with similar recall (0.9926 vs 0.986). Faiss uses highly optimized C++ with BLAS/SIMD.
 - SplatsDB HNSW build is ~3.6× slower (88s vs 24.5s) — it computes splat parameters (α, κ) during indexing.
-- SplatsDB's value is not raw ANN QPS — it's uncertainty-aware retrieval + knowledge graph + agent memory + spatial memory in one binary
+- SplatsDB's current evidence is not raw ANN QPS superiority: it is learned splat-cell routing with exact re-scoring, plus separately integrated knowledge-graph, memory and spatial features
 - Full results: `bench-data/benchmark_results_hardware.json`
 
 > **Removed claims**: a previous version of this section claimed GPU throughput of 1,667 QPS at 640D and 20,000 QPS for linear scan over 100 splats. Both numbers had no preserved source (no result file or run log; the 640D figure was marked "untraced" in `ab81716`). They were removed rather than restated.
 
-<p align="center"><img src="assets/splatsdb-faiss-comparison.png" alt="SplatsDB vs Faiss — same hardware" width="900"/></p>
+<p align="center"><img src="assets/splatsdb-faiss-comparison.png" alt="SplatsDB vs Faiss — historical measured search regimes, with exact GPU k=10 separated from approximate CPU k=64" width="900"/></p>
 
-> Chart regenerated 2026-10-25 from [`bench-data/benchmark_results_hardware.json`](bench-data/benchmark_results_hardware.json) — k and search type stated per panel; the GPU row (exact, k=10) lives in its own panel. The tables above and in [BENCHMARKS.md](BENCHMARKS.md) are the source of truth.
+> Chart regenerated 2026-11-26 in HTML/CSS from [`bench-data/benchmark_results_hardware.json`](bench-data/benchmark_results_hardware.json) — [standalone source](assets/charts/faiss.html), [shared theme](assets/charts/theme.css), [artifact hashes](assets/charts/manifest.json). k and search type are stated per row; the historical v2.5.0 run is not a current release profile. The tables above and in [BENCHMARKS.md](BENCHMARKS.md) remain the source of truth.
 
 ### LongMemEval Agent Memory Benchmark
 
-<p align="center"><img src="assets/splatsdb-longmemeval.png" alt="LongMemEval Results" width="900"/></p>
+<p align="center"><img src="assets/splatsdb-longmemeval.png" alt="LongMemEval retrieval-only results: NumPy brute-force reference clearly separated from the lower-recall SplatsDB native pipeline" width="900"/></p>
+
+> Chart regenerated 2026-11-26 in HTML/CSS — [standalone source](assets/charts/longmemeval.html), [shared theme](assets/charts/theme.css). It shows the NumPy reference and native pipeline side by side, including per-question-type recall; the 96.6% figure is **not** native-engine recall.
 
 > [LongMemEval](https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned) is the standard benchmark for evaluating long-term conversational memory in AI agents. Tests retrieval across 500 questions, each with ~48 sessions and ~490 turns.
 
@@ -459,7 +476,9 @@ On synthetic data HNSW delivers **~875× speedup** over linear scan at 10K. Real
 
 #### Adapted M3 context-reduction evaluation — independent rerun
 
-<p align="center"><img src="assets/splatsdb-m3-context-rerun.png" alt="Adapted M3 independent rerun: context reduction, accuracy and GO verdict" width="900"/></p>
+<p align="center"><img src="assets/splatsdb-m3-context-rerun.png" alt="Adapted M3 independent rerun: GO under the predeclared protocol, with context reduction, accuracy, ITT sensitivity, judge validity, coverage and filters" width="900"/></p>
+
+> Chart regenerated 2026-11-26 in HTML/CSS — [standalone source](assets/charts/m3-rerun.html), [measured subset](assets/charts/data/m3-rerun.json), [shared theme](assets/charts/theme.css). The chart keeps the earlier NO_GO run explicitly scoped and separate.
 
 A separate local adaptation of `m3-glm-protocol` @ `15795ca` was evaluated with GLM-5.4 and GLM-5.3-Flash using crossed judges and a new full-context baseline. A **[predeclared independent rerun](docs/validation/m3-adaptation-rerun-protocol.md)** (protocol SHA `c6973edb93af`) returned **GO**: median prompt usage fell **93.76%** (70,241 to 4,384.5/4,383.5 tokens), with 498/500 complete token pairs; symmetric accuracy was **81.46% vs 80.16%** (+1.30 pp, McNemar p=0.2624), and the intent-to-treat sensitivity also passed. One question per stage was filtered in both models, within the predeclared budget; there were zero non-filter errors and no imputation. See [methodology, results and limitations](docs/validation/m3-adaptation-rerun.md). The [earlier run](docs/validation/m3-adaptation.md) remains **NO_GO** under its stricter 500/500 rule; this rerun does not reinterpret it.
 
@@ -483,7 +502,7 @@ Two runs of `cargo test --release --features cuda test_ptx_kernel_performance` (
 | Run | Kernel path | CPU (single-thread) | GPU (RTX 3090) | Speedup | Source |
 |-----|-------------|--------------------|----------------|---------|--------|
 | 2026-10-15 (single run) | `batch_l2_distances` — full distance matrix, **no top-k** | 565 ms | 27 ms | 20.93× | transcribed from the test log; no persisted artifact |
-| **2026-10-25 (median of 6)** | `l2_topk` — fused top-k, **k=16** | 630 ms | 20 ms | **30.6×** | [`bench-data/gpu_kernel_microbench_2026-10-25.json`](bench-data/gpu_kernel_microbench_2026-10-25.json) |
+| **2026-10-25 (median of 6)** | `l2_topk` — fused top-k, **k=16** | 630 ms | 20 ms | **30.6×** | transcribed from the test log; no persisted artifact |
 
 2026-10-25 per-run spread: 31.28×, 34.32×, 29.0×, 25.45× (GPU outlier during concurrent cargo builds), 30.0×, 33.82× — range GPU 17–29 ms, CPU 563–738 ms. Both runs are kernel-level microbenchmarks on synthetic data, not end-to-end search benchmarks; at this shape GPU time is dominated by the one-time dataset upload (~25 MB amortized over 100 queries per call) — the production win of the VRAM dataset cache (v2.7.0) is at the call-graph level: upload once per dataset version instead of every call. Companion correctness test `test_ptx_kernel_correctness` passes (GPU/CPU agreement within tolerance). Full per-run table and reproduction commands: [BENCHMARKS.md §4](BENCHMARKS.md#4-gpu-vs-cpu-kernel-microbenchmark-640d).
 
@@ -838,7 +857,7 @@ Add to your AI agent's MCP configuration (e.g., Claude Code, Cursor, Hermes):
 
 | Tool | Required Params | Optional Params | Description |
 |------|----------------|-----------------|-------------|
-| `splatsdb_verbatim_search` | `query` | `top_k` (default 10) | Search with confidence scoring to prevent hallucination. Results carry HIGH/MEDIUM/LOW confidence based on vector distance, plus the original verbatim text for verification. |
+| `splatsdb_verbatim_search` | `query` | `top_k` (default 10) | Search with heuristic vector-distance bands and original verbatim text for verification. HIGH/MEDIUM/LOW are diagnostics, not calibrated correctness probabilities. |
 | `splatsdb_compress` | `text` | — | Compress text with AAAK (semantic + binary compression). Returns semantically compressed text that LLMs can read natively, plus binary compressed data for storage. |
 | `splatsdb_decompress` | `data` | — | Decompress AAAK binary data (hex-encoded) back to LLM-readable semantic text. |
 
@@ -1095,7 +1114,7 @@ cargo build --release --features cuda
 
 ### Performance
 
-**Kernel microbenchmark** (re-measured 2026-10-25, `cargo test --release --features cuda test_ptx_kernel_performance`, RTX 3090): 6 runs over 10K×640D × 100 queries with the fused `l2_topk` kernel (**k=16**) — median **CPU 630ms vs GPU 20ms = 30.6×** (per-run 25.45×–34.32×; single-threaded CPU baseline; companion correctness test `test_ptx_kernel_correctness` passes). Persisted artifact: `bench-data/gpu_kernel_microbench_2026-10-25.json`. An earlier single run (2026-10-15) measured the batch-L2 path without top-k at **20.93×** (565ms/27ms) — different kernel path, not directly comparable; full labeled table and reproduction commands: [BENCHMARKS.md §4](BENCHMARKS.md#4-gpu-vs-cpu-kernel-microbenchmark-640d). A previous version of this paragraph quoted "CPU 718ms vs GPU 18ms = 39.89×" — that figure had no preserved run log and was corrected to the logged runs above.
+**Kernel microbenchmark** (re-measured 2026-10-25, `cargo test --release --features cuda test_ptx_kernel_performance`, RTX 3090): 6 runs over 10K×640D × 100 queries with the fused `l2_topk` kernel (**k=16**) — median CPU **605 ms**, GPU **19.5 ms**; median of the six run-level speedups **30.6×** (ratio of medians 31.03×; per-run speedups 25.45×–34.32×; single-threaded CPU baseline; companion correctness test `test_ptx_kernel_correctness` passes). No JSON artifact is present in this tree; the six runs are transcribed in `BENCHMARKS.md`. An earlier single run (2026-10-15) measured the batch-L2 path without top-k at **20.93×** (565ms/27ms) — different kernel path, not directly comparable; full labeled table and reproduction commands: [BENCHMARKS.md §4](BENCHMARKS.md#4-gpu-vs-cpu-kernel-microbenchmark-640d). A previous version of this paragraph quoted "CPU 718ms vs GPU 18ms = 39.89×" — that figure had no preserved run log and was corrected to the logged runs above.
 
 **Serve integration (v2.6.0, 2026-10-20)** — `splatsdb serve --gpu` uploads the dataset to VRAM at boot and routes `/search` (with embedding) through the PTX `l2_topk_kernel`. Measured on the semantic-hub dataset (26,273×768d, RTX 3090, WSL2), 30 queries against exact brute-force ground truth + 600-query soak:
 
@@ -1163,7 +1182,7 @@ This means: a document that is *similar* to your query AND is *connected* to oth
 
 ### Retrieve + 2-Hop Expansion Example
 
-This is where GraphSplat outperforms plain vector search — it doesn't just find the closest document, it discovers the *context* around it:
+GraphSplat can expand a vector match into its graph neighborhood, returning related context as well as the closest documents. This is a retrieval affordance, not a measured claim of higher answer quality:
 
 ```
 Vector-only search for "database indexing strategy":
@@ -1274,11 +1293,11 @@ MCP query → Vector search finds top-5 splats
          → Drawer lookup: exact original text returned
 ```
 
-This is the opposite of how Pinecone/Qdrant handle text — they truncate or discard it. SplatsDB keeps the source of truth because for agent memory, losing *why* a decision was made kills future recall.
+Verbatim storage is an optional source-preservation layer inside SplatsDB. It lets an agent inspect the original text rather than rely only on summaries or distance bands; other systems' text/metadata behavior depends on their configuration.
 
 **Status**: Implemented (alpha) — the **Drawer layer** (verbatim original text) is real and shipped:
 - CLI (`src/cli/verbatim_cmds.rs`): `verbatim-store --id <ID> --text "<verbatim>" [--category <CAT>]` persists the original text via the metadata store; `verbatim-get --id <ID>` returns it exactly; `verbatim-search --query "<q>" -k 10` returns results tagged HIGH/MEDIUM/LOW confidence.
-- MCP: `splatsdb_verbatim_search` — returns verbatim text alongside confidence for hallucination-checking.
+- MCP: `splatsdb_verbatim_search` — returns verbatim text alongside heuristic distance bands for source verification; neither is a hallucination guarantee.
 - Caveat: this path embeds with SimCos hashing (demo-grade) — for production, store real embeddings through the main store.
 - Not yet implemented: the LLM-generated **Summary** layer and the full three-layer API (Splat + Summary + Drawer as one query surface).
 
@@ -1292,18 +1311,19 @@ The concept: a compressed representation that any LLM can read natively without 
 Original text (1,200 tokens):
   "On January 15th, 2025, the team decided to migrate from Faiss to SplatsDB
    for the production vector search pipeline. The primary motivation was the
-   need for uncertainty-aware retrieval and knowledge graph integration.
+   need for learned splat routing and knowledge graph integration.
    Brian will lead the migration, targeting completion by end of Q1."
 
 Compressed (~40 tokens, 30x):
-  "2025-01-15: migrate Faiss→SplatsDB prod. reason: uncertainty+KG.
+  "2025-01-15: migrate Faiss→SplatsDB prod. reason: splat-routing+KG.
    lead: Brian. target: Q1 end."
 ```
 
 **Why this matters for SplatsDB:**
-- TurboQuant gives 8x on vectors → 30x on text is the bigger win for agent memory
-- MCP server can return compressed summaries within token budgets
-- Agent only fetches full drawer when needed → saves ~90% tokens on average query
+
+- Text compression is separate from vector compression and from splat routing; gains in one do not establish gains in another.
+- MCP can return LLM-readable semantic text or binary-compressed data when that representation is appropriate.
+- Token savings must be measured on the target workload with `compress-bench`; no average query-level saving is claimed.
 
 **Status**: Implemented (alpha) as **AAAK compression** (`src/text_compression.rs`):
 - CLI: `compress --text "<text>" --verbose` (semantic + binary compression with stats), `decompress --data <hex>`, `compress-bench --size small|medium|large` (measures the ratio on sample text).
@@ -1483,22 +1503,21 @@ Spatial memory has an initial implementation. The building blocks exist:
 | LanceDB | **Free** (self-hosted) | — | — |
 | **SplatsDB** | **Free forever** | — | — |
 
-### Where SplatsDB Wins
+### Where SplatsDB Differs
 
-1. **Spatial Memory** — Wing/Room/Hall/Tunnel with auto-labeling and auto-tunnel detection. No other vector DB has hierarchical spatial navigation. Qdrant has generic payload filters but no spatial hierarchy. On LongMemEval, the retrieval approach (embeddings + cosine) achieves **96.6% recall@10** (NumPy brute-force baseline; see methodology note in benchmarks section) vs 86.2% best in original paper.
+These are integration and architecture differences, not a universal ranking against other databases.
 
-2. **MCP Server** — 18 tools ready to use with any MCP-compatible agent (Claude, GPT, etc.). Zero glue code. Competitors require custom SDK integrations or REST wrappers.
-
-3. **Embedded** — Works as CLI tool, Rust library, or MCP server. Milvus and Qdrant require a separate server process. Chroma is embedded but limited to single-node.
-
-5. **Cost** — Free, self-hosted, no usage limits. Pinecone charges $50/mo minimum. Zilliz starts at $99/GB. SplatsDB runs on a $5 VPS.
+1. **Spatial labels and learned splat cells** — Wing/Room/Hall/Tunnel labels, MCP and splat routing can be used in one self-hosted runtime. No universal uniqueness claim is made. The LongMemEval **96.6% recall@10** figure is a NumPy brute-force reference, not native SplatsDB recall, and is not directly comparable with scores from the original paper under another pipeline.
+2. **MCP surface** — 18 tools are available for MCP-compatible agents. Integration effort still depends on the host, embeddings and deployment.
+3. **Embedded Rust runtime** — CLI, Rust library and MCP server surfaces share the same binary; some competitors are primarily client-server, while others also offer embedded modes.
+4. **Self-hosted cost model** — no SplatsDB cloud usage fee; hardware, embedding, operations and evaluation costs remain.
 
 ### Where Competitors Win (Honest Assessment)
 
 | Area | Leader | Gap |
 |------|--------|-----|
-| Raw QPS (single-node) | Faiss | 4–6x faster (optimized C++ + SIMD) |
-| Ecosystem integrations | Milvus, Qdrant | LangChain, LlamaIndex, Haystack, 50+ connectors |
+| Raw QPS (single-node) | Faiss | Measured HNSW CPU advantage: 14.8× at k=64 on the recorded SIFT-100K run; see Faiss Comparison |
+| Ecosystem integrations | Milvus, Qdrant | Broader managed-service and connector ecosystems |
 | Managed cloud | Pinecone, Qdrant | Zero-ops deployments, auto-scaling |
 | Dataset scale (proven) | Milvus | Billions of vectors (SplatsDB tested to 100K) |
 | Multi-tenancy | Qdrant | Native sharding per tenant |

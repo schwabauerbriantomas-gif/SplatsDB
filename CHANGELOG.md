@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **validation**: frozen H1/H2 splat-routing protocol, independent HTTP mirror, aggregate JSON results, raw-receipt hashes, report generator and extended 35-source primary-source SOTA, 3DGS and alternative-representation review. The learned `k=100` codebook beats a random control at the frozen endpoints; only the +8.1 pp low-scan effect clears the conservative 5-point small-sample floor. Exact top-10 distance parity is 100/100, with no material pruning at 11k×384.
+- **docs**: README repositioned around learned splat-cell routing, exact raw-vector re-scoring and explicit non-claims; MCP/graph/GPU integration is separated from splat-specific evidence.
+
+### Changed
+- **MCP/verbatim**: HIGH/MEDIUM/LOW outputs are described as heuristic vector-distance bands, not calibrated correctness probabilities or hallucination prevention. Additive `close_or_moderate` and `diagnostic_only` fields clarify the summary; legacy `reliable` remains only for compatibility.
+
 ## [v2.11.0] - 2026-11-22
 
 ### Added
@@ -95,7 +104,7 @@
 - GPU: no more global panic-hook swap (fallback causes now logged once); extended-kernel PTX cached per process (was JIT-loaded from disk per call, even inside the k-means loop); l2/cosine top-k honors >48KB shared-memory opt-in (silent failures for K≥24); sentinel −1 no longer surfaces as vector 0; CPU fallbacks log once instead of silently degrading
 - CI: `cargo-audit` job; `Cargo.lock` versioned; release binaries smoke-tested before publish; dead Python tests (m2m-memory inheritance) removed; pentest setups fail loudly instead of passing empty
 - MCP stdio dispatcher runs behind `catch_unwind`: a panic in a tool handler returns JSON-RPC `-32603` instead of killing the server process; GPU clamp test asserts exact result length and sentinel/NaN-free outputs under CUDA
-- docs: badge/tests count measured (393), GPU microbenchmark re-measured with persisted artifact (`bench-data/gpu_kernel_microbench_2026-10-25.json`: 6 runs, median 30.6×, GPU 20ms @ 10K×640D×100q), longmemeval NumPy-vs-native results separated (native: 0.304 recall / 671.63 QPS), unsourced HRM2/TurboQuant claims marked NOT VALIDATED, 15 missing CLI commands documented, verbatim/compression status corrected, inert config keys (`semantic_fusion`, `semantic_vector_weight`, `semantic_bm25_*`, `semantic_decay_halflife`, `autoscale_*`) documented as unused in code (doc-comments in `src/config/mod.rs`), `build_single` input preconditions documented in code (doc-comment in `src/encoding.rs`), LOC badge recount (34,461)
+- docs: badge/tests count measured (393), GPU microbenchmark re-measured with per-run values transcribed in `BENCHMARKS.md` (no JSON artifact present): 6 runs, median of run-level speedups 30.6×, GPU 20 ms @ 10K×640D×100q, longmemeval NumPy-vs-native results separated (native: 0.304 recall / 671.63 QPS), unsourced HRM2/TurboQuant claims marked NOT VALIDATED, 15 missing CLI commands documented, verbatim/compression status corrected, inert config keys (`semantic_fusion`, `semantic_vector_weight`, `semantic_bm25_*`, `semantic_decay_halflife`, `autoscale_*`) documented as unused in code (doc-comments in `src/config/mod.rs`), `build_single` input preconditions documented in code (doc-comment in `src/encoding.rs`), LOC badge recount (34,461)
 
 ### Security
 - **deps**: rusqlite 0.31 → 0.41.1 / libsqlite3-sys 0.28 → 0.39.1 (SQLite bundled 3.54.1) — RUSTSEC-2026-0459 / CVE-2026-119375: SQLite < 3.54.0 puede devolver memoria no inicializada del page-cache al abrir una DB con un WAL hermano de page size distinto (vector local, CVSS:4.0 AV:L/VC:H). La advisory entró al RUSTSEC DB el 13-nov-2026 13:33 UTC; fue la primera CI que la vio. Único cambio de API: rusqlite ≥0.41 quitó FromSql para usize (SQLite es i64) — un cast en sqlite_store.rs.

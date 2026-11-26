@@ -1084,7 +1084,7 @@ fn tool_definitions() -> Vec<Value> {
         // ── Verbatim Storage tools ──────────────────────────────────────
         json!({
             "name": "splatsdb_verbatim_search",
-            "description": "Search with confidence scoring to prevent hallucination. Returns results with HIGH/MEDIUM/LOW confidence based on vector distance, plus original verbatim text for verification.",
+            "description": "Search with vector-distance diagnostics and original verbatim text for verification. Returns heuristic HIGH/MEDIUM/LOW distance bands, not calibrated correctness probabilities.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2288,11 +2288,15 @@ fn handle_verbatim_search(state: &Mutex<McpState>, params: &Value) -> Result<Val
 
             // Confidence classification
             let (confidence, emoji, explanation) = if n.distance < 0.3 {
-                ("HIGH", "🟢", "Very reliable match")
+                (
+                    "HIGH",
+                    "🟢",
+                    "Close vector match; relevance is not guaranteed",
+                )
             } else if n.distance < 0.6 {
-                ("MEDIUM", "🟡", "Good match — verify context")
+                ("MEDIUM", "🟡", "Moderate vector distance; verify context")
             } else {
-                ("LOW", "🔴", "Weak match — verify against source")
+                ("LOW", "🔴", "Large vector distance; verify against source")
             };
 
             let similarity = (1.0 / (1.0 + n.distance as f64)).min(1.0);
@@ -2337,9 +2341,12 @@ fn handle_verbatim_search(state: &Mutex<McpState>, params: &Value) -> Result<Val
             "high": high_count,
             "medium": medium_count,
             "low": low_count,
+            "close_or_moderate": high_count + medium_count,
+            // Legacy compatibility field; this is a distance-band count, not a reliability estimate.
             "reliable": high_count + medium_count,
+            "diagnostic_only": true,
         },
-        "disclaimer": "Always verify LOW confidence results against original source text to prevent hallucination",
+        "disclaimer": "Confidence bands are heuristic vector-distance diagnostics, not calibrated correctness probabilities; always verify against original source text",
     }))
 }
 

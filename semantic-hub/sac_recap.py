@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sac_recap — recap SAC del estado de una sesión Hermes vía splatDB /recap.
+"""sac_recap — recap SAC del estado de una sesión Hermes vía SplatsDB /recap.
 
 Lee los mensajes de una sesión desde el state.db del perfil (RO: copia a
 /tmp, jamás abre la DB viva), arma el action log (tool_calls = comandos,

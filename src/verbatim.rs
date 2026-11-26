@@ -1,13 +1,13 @@
 //! Verbatim Storage — Store and retrieve original document text alongside splats.
 //!
-//! When a vector search returns results, the confidence score tells you how reliable
-//! the match is. Verbatim storage ensures you always have the original source text
-//! to verify against, preventing hallucination.
+//! Vector-distance bands are heuristic diagnostics, not calibrated probabilities
+//! that a result answers a question correctly. Verbatim storage lets the caller
+//! inspect the original source instead of trusting those bands as proof.
 //!
-//! Confidence levels:
-//! - HIGH (distance < 0.3): Very reliable match, source text is directly relevant
-//! - MEDIUM (0.3 <= distance < 0.6): Good match, verify context before relying on it
-//! - LOW (distance >= 0.6): Weak match, treat as suggestive — always verify against source
+//! Distance bands:
+//! - HIGH (distance < 0.3): Close vector match; relevance is not guaranteed
+//! - MEDIUM (0.3 <= distance < 0.6): Moderate vector distance; verify context
+//! - LOW (distance >= 0.6): Large vector distance; always verify against source
 
 use serde::{Deserialize, Serialize};
 
@@ -47,9 +47,9 @@ impl Confidence {
     /// Human-readable explanation of the confidence level.
     pub fn explanation(&self) -> &'static str {
         match self {
-            Confidence::High => "Very reliable match — source text is directly relevant",
-            Confidence::Medium => "Good match — verify context before relying on it",
-            Confidence::Low => "Weak match — treat as suggestive, always verify against source",
+            Confidence::High => "Close vector match; relevance is not guaranteed",
+            Confidence::Medium => "Moderate vector distance; verify context",
+            Confidence::Low => "Large vector distance; always verify against source",
         }
     }
 

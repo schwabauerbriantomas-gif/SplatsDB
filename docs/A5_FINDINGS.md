@@ -1,5 +1,7 @@
 # A5 — Empirical audit: energy-as-score vs cosine retrieval (2026-09-22)
 
+> **Follow-up (2026-11-26):** the current local embedding cache contains **11,069 × 384** rows, not the historical 9,533-row setup described below. The new [frozen routing gate](validation/splat-routing.md) uses that current cache and deterministic perturbation queries to validate index mechanics, not semantic retrieval quality. Its learned-versus-random result does not reverse A5's negative energy-ranking verdict.
+
 Causal experiment: does splat energy `E(x) = -log(Σ αᵢ·exp(-κᵢ·‖x−μᵢ‖²))` improve
 retrieval when mixed into the ranking score? Short answer: **no — it degrades it**,
 consistently, on two corpora, with hand-written semantic ground truth and bootstrap

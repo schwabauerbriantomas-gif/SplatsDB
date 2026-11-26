@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>LongMemEval — NumPy reference and SplatsDB native</title><meta name="description" content="LongMemEval — NumPy reference and SplatsDB native"/>
+<style>:root {
+  color-scheme: dark;
+  --bg: #070b14;
+  --surface: #0d1424;
+  --surface-2: #111b30;
+  --line: #263653;
+  --line-soft: #1a2942;
+  --text: #f1f5fd;
+  --muted: #98a8c3;
+  --faint: #6f7f9c;
+  --primary: #8ca3d4;
+  --deep: #34508e;
+  --secondary: #5f7cad;
+  --track: #192640;
+  --go: #7bc7a4;
+  --no-go: #df8294;
+  --warn: #d7b96f;
+  --radius: 22px;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; background: var(--bg); }
+body { font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: var(--text); }
+.chart {
+  position: relative;
+  isolation: isolate;
+  width: 1800px;
+  height: 1400px;
+  padding: 48px 60px 38px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 90% 2%, rgba(52, 80, 142, .32), transparent 35%),
+    radial-gradient(circle at 4% 100%, rgba(140, 163, 212, .07), transparent 30%),
+    var(--bg);
+}
+.chart::before, .chart::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  border: 1px solid rgba(140, 163, 212, .09);
+  border-radius: 50%;
+  pointer-events: none;
+}
+.chart::before { width: 760px; height: 760px; right: -260px; top: -350px; }
+.chart::after { width: 440px; height: 440px; right: -90px; top: -180px; }
+.header { display: flex; align-items: center; justify-content: space-between; gap: 32px; min-height: 126px; }
+.brand { display: flex; align-items: center; gap: 24px; min-width: 0; }
+.brand-mark { width: 104px; height: 104px; flex: 0 0 auto; }
+.kicker { color: var(--primary); font-size: 18px; font-weight: 750; letter-spacing: .16em; text-transform: uppercase; }
+h1 { margin: 9px 0 10px; font-size: 45px; line-height: 1.06; letter-spacing: -.035em; }
+.subtitle { margin: 0; color: var(--muted); font-size: 23px; line-height: 1.35; }
+.status {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 20px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(13, 20, 36, .88);
+  color: var(--primary);
+  font-size: 18px;
+  font-weight: 750;
+  letter-spacing: .07em;
+  text-align: center;
+  line-height: 1.3;
+}
+.status::before { content: ""; width: 10px; height: 10px; border-radius: 50%; background: currentColor; }
+.status.go { color: var(--go); border-color: rgba(123, 199, 164, .45); }
+.status.no-go { color: var(--no-go); border-color: rgba(223, 130, 148, .45); }
+.status.neutral { color: var(--primary); }
+.kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px; }
+.kpi {
+  min-height: 144px;
+  padding: 21px 24px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  background: linear-gradient(145deg, rgba(17, 27, 48, .94), rgba(13, 20, 36, .88));
+}
+.kpi-label { color: var(--muted); font-size: 16px; font-weight: 700; letter-spacing: .11em; text-transform: uppercase; }
+.kpi-value { margin-top: 8px; font-size: 42px; line-height: 1.05; font-weight: 760; letter-spacing: -.035em; }
+.kpi-value.go { color: var(--go); }
+.kpi-value.no-go { color: var(--no-go); }
+.kpi-detail { margin-top: 10px; color: var(--muted); font-size: 19px; line-height: 1.3; }
+.panels { display: grid; gap: 22px; flex: 1; min-height: 0; }
+.panels.two { grid-template-columns: 1.12fr .88fr; }
+.panels.equal { grid-template-columns: 1fr 1fr; }
+.panel {
+  min-width: 0;
+  padding: 24px 28px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: linear-gradient(150deg, rgba(17, 27, 48, .93), rgba(13, 20, 36, .95));
+}
+.panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 12px; }
+.panel-title { margin: 0; font-size: 28px; line-height: 1.15; letter-spacing: -.02em; }
+.panel-note { margin: 7px 0 0; color: var(--muted); font-size: 19px; line-height: 1.3; }
+.tag {
+  display: inline-block;
+  flex: 0 0 auto;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: var(--muted);
+  background: var(--surface);
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: .04em;
+}
+.bar-row { display: grid; grid-template-columns: 245px minmax(0, 1fr) 142px; align-items: center; gap: 16px; min-height: 52px; }
+.bar-label { min-width: 0; font-size: 22px; line-height: 1.18; }
+.bar-label small, .small { display: block; margin-top: 4px; color: var(--faint); font-size: 16px; font-weight: 500; }
+.track { position: relative; height: 30px; overflow: hidden; border-radius: 10px; background: var(--track); }
+.fill { height: 100%; min-width: 3px; border-radius: 9px 10px 10px 9px; background: var(--primary); }
+.fill.secondary { background: var(--secondary); }
+.fill.deep { background: var(--deep); }
+.fill.go { background: var(--go); }
+.fill.no-go { background: var(--no-go); }
+.fill.warn { background: var(--warn); }
+.fill.outline { background: rgba(140, 163, 212, .12); border: 1px solid var(--primary); }
+.bar-value { color: var(--text); font-size: 22px; font-weight: 720; text-align: right; white-space: nowrap; }
+.bar-value small { color: var(--muted); font-size: 15px; font-weight: 550; }
+.legend { display: flex; flex-wrap: wrap; gap: 16px 22px; margin-top: 16px; color: var(--muted); font-size: 17px; }
+.legend-item { display: inline-flex; align-items: center; gap: 9px; }
+.dot { width: 11px; height: 11px; border-radius: 50%; background: var(--primary); }
+.dot.secondary { background: var(--secondary); }
+.dot.deep { background: var(--deep); }
+.dot.go { background: var(--go); }
+.dot.no-go { background: var(--no-go); }
+.hero-metric { display: flex; align-items: baseline; gap: 16px; margin: 4px 0 8px; }
+.hero-metric strong { font-size: 68px; line-height: 1; letter-spacing: -.05em; }
+.hero-metric span { color: var(--muted); font-size: 21px; }
+.split-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 18px; }
+.metric-box { padding: 17px 18px; border: 1px solid var(--line-soft); border-radius: 15px; background: rgba(7, 11, 20, .46); }
+.metric-box .metric-value { font-size: 29px; font-weight: 730; }
+.metric-box .metric-label { margin-top: 6px; color: var(--muted); font-size: 16px; line-height: 1.25; }
+.callout { margin-top: 18px; padding: 16px 18px; border-left: 4px solid var(--primary); border-radius: 4px 12px 12px 4px; background: rgba(140, 163, 212, .07); color: var(--muted); font-size: 19px; line-height: 1.42; }
+.callout.go { border-left-color: var(--go); }
+.callout.no-go { border-left-color: var(--no-go); }
+.callout strong { color: var(--text); }
+.type-row { display: grid; grid-template-columns: 270px minmax(0, 1fr); gap: 18px; align-items: center; min-height: 59px; }
+.type-name { font-size: 20px; line-height: 1.15; }
+.type-name small { margin-top: 3px; }
+.type-bars { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 18px; }
+.type-bar { min-width: 0; }
+.type-bar-top { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 5px; color: var(--muted); font-size: 15px; }
+.type-bar-top strong { color: var(--text); font-size: 16px; }
+.type-bar .track { height: 17px; }
+.footer { display: flex; align-items: flex-start; justify-content: space-between; gap: 30px; padding-top: 15px; border-top: 1px solid var(--line-soft); color: var(--faint); font-size: 16px; line-height: 1.4; }
+.footer .source { max-width: 1340px; }
+.footer .build { flex: 0 0 auto; color: var(--muted); font-weight: 650; white-space: nowrap; }
+a { color: var(--primary); text-decoration: none; }
+.code { font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; }
+@media (max-width: 1100px) {
+  .chart { width: 100%; height: auto; min-height: 0; padding: 28px; }
+  .header, .footer { flex-direction: column; align-items: flex-start; }
+  .kpis, .panels.two, .panels.equal, .split-metrics { grid-template-columns: 1fr; }
+  .bar-row { grid-template-columns: 170px minmax(0, 1fr) 105px; }
+  .type-row { grid-template-columns: 1fr; }
+  h1 { font-size: 36px; }
+  .brand-mark { width: 76px; height: 76px; }
+}
+</style></head>
+<body><main class="chart" role="img" aria-label="LongMemEval — NumPy reference and SplatsDB native">
+<header class="header">
+  <div class="brand">
+    <img class="brand-mark" src="../logo-splatsdb.svg" alt="SplatsDB logo"/>
+    <div>
+      <div class="kicker">SplatsDB / Measured evidence</div>
+      <h1>Two memory pipelines. Two different results.</h1>
+      <p class="subtitle">500 questions · 23,867 sessions · MiniLM 384d · RTX 3090 embeddings</p>
+    </div>
+  </div>
+  <div class="status neutral">RETRIEVAL ONLY · 2026-04-09</div>
+</header><section class="panels equal" style="flex:0 0 460px"><div class="panel"><div class="panel-head"><div><h2 class="panel-title">NumPy brute-force reference</h2><p class="panel-note">Embeddings + normalized cosine; not SplatsDB&#x27;s engine.</p></div><span class="tag">96.6% @10</span></div><div class="bar-row"><div class="bar-label">Top-1<small>answer session in top-k</small></div><div class="track"><div class="fill " style="width:75.80000%"></div></div><div class="bar-value">75.8%</div></div><div class="bar-row"><div class="bar-label">Top-3<small>answer session in top-k</small></div><div class="track"><div class="fill " style="width:88.20000%"></div></div><div class="bar-value">88.2%</div></div><div class="bar-row"><div class="bar-label">Top-5<small>answer session in top-k</small></div><div class="track"><div class="fill " style="width:92.20000%"></div></div><div class="bar-value">92.2%</div></div><div class="bar-row"><div class="bar-label">Top-10<small>answer session in top-k</small></div><div class="track"><div class="fill " style="width:96.60000%"></div></div><div class="bar-value">96.6%</div></div></div><div class="panel"><div class="panel-head"><div><h2 class="panel-title">SplatsDB native pipeline</h2><p class="panel-note">HNSW M=32 · efS=100 · over-fetch 3× + re-rank · L2.</p></div><span class="tag">30.4% @10</span></div><div class="split-metrics"><div class="metric-box"><div class="metric-value">30.4%</div><div class="metric-label">Recall@10 · over-fetch + re-rank</div></div><div class="metric-box"><div class="metric-value">671.63</div><div class="metric-label">QPS · measured native run</div></div><div class="metric-box"><div class="metric-value">1.448 ms</div><div class="metric-label">p50 latency · over-fetch + re-rank</div></div><div class="metric-box"><div class="metric-value">106.96 s</div><div class="metric-label">Index build</div></div></div><div class="callout "><strong>Do not read 96.6% as native-engine recall.</strong> The native gap is real under this methodology; no end-to-end paper comparison is claimed.</div></div></section><section class="panel" style="flex:1;min-height:0"><div class="panel-head"><div><h2 class="panel-title">Recall@10 by question type</h2><p class="panel-note">Same 500 questions; two pipelines shown together.</p></div><span class="tag">NumPy vs native</span></div><div class="type-row"><div class="type-name">single session user<small>· 70 questions</small></div><div class="type-bars"><div class="type-bar"><div class="type-bar-top"><span>NumPy</span><strong>88.6%</strong></div><div class="track"><div class="fill" style="width:88.5700%"></div></div></div><div class="type-bar"><div class="type-bar-top"><span>Native</span><strong>5.7%</strong></div><div class="track"><div class="fill deep" style="width:5.7100%"></div></div></div></div></div><div class="type-row"><div class="type-name">multi session<small>· 133 questions</small></div><div class="type-bars"><div class="type-bar"><div class="type-bar-top"><span>NumPy</span><strong>99.2%</strong></div><div class="track"><div class="fill" style="width:99.2500%"></div></div></div><div class="type-bar"><div class="type-bar-top"><span>Native</span><strong>30.1%</strong></div><div class="track"><div class="fill deep" style="width:30.0800%"></div></div></div></div></div><div class="type-row"><div class="type-name">single session preference<small>· 30 questions</small></div><div class="type-bars"><div class="type-bar"><div class="type-bar-top"><span>NumPy</span><strong>96.7%</strong></div><div class="track"><div class="fill" style="width:96.6700%"></div></div></div><div class="type-bar"><div class="type-bar-top"><span>Native</span><strong>16.7%</strong></div><div class="track"><div class="fill deep" style="width:16.6700%"></div></div></div></div></div><div class="type-row"><div class="type-name">temporal reasoning<small>· 133 questions</small></div><div class="type-bars"><div class="type-bar"><div class="type-bar-top"><span>NumPy</span><strong>95.5%</strong></div><div class="track"><div class="fill" style="width:95.4900%"></div></div></div><div class="type-bar"><div class="type-bar-top"><span>Native</span><strong>28.6%</strong></div><div class="track"><div class="fill deep" style="width:28.5700%"></div></div></div></div></div><div class="type-row"><div class="type-name">knowledge update<small>· 78 questions</small></div><div class="type-bars"><div class="type-bar"><div class="type-bar-top"><span>NumPy</span><strong>100.0%</strong></div><div class="track"><div class="fill" style="width:100.0000%"></div></div></div><div class="type-bar"><div class="type-bar-top"><span>Native</span><strong>20.5%</strong></div><div class="track"><div class="fill deep" style="width:20.5100%"></div></div></div></div></div><div class="type-row"><div class="type-name">single session assistant<small>· 56 questions</small></div><div class="type-bars"><div class="type-bar"><div class="type-bar-top"><span>NumPy</span><strong>98.2%</strong></div><div class="track"><div class="fill" style="width:98.2100%"></div></div></div><div class="type-bar"><div class="type-bar-top"><span>Native</span><strong>87.5%</strong></div><div class="track"><div class="fill deep" style="width:87.5000%"></div></div></div></div></div><div class="legend"><span class="legend-item"><i class="dot"></i>NumPy brute force</span><span class="legend-item"><i class="dot deep"></i>SplatsDB native</span><span>Raw HNSW recall@10: 30.8% · re-ranked: 30.4%</span></div></section><footer class="footer"><div class="source">Sources: <a href="../../bench-data/longmemeval_full_results.json">NumPy JSON</a> · <a href="../../bench-data/longmemeval_splatdb_native.json">native JSON</a> · <a href="../../bench-data/longmemeval_baseline_results.json">question counts</a> · <a href="longmemeval.html">standalone HTML chart</a><br/>NumPy latency p50/p95/p99: 0.056 / 0.080 / 0.105 ms; no NumPy QPS was recorded. Native figures come from the native JSON, not mixed with the reference.</div><div class="build">HTML + CSS · measured values only</div></footer></main></body></html>

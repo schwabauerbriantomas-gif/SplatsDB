@@ -6,6 +6,10 @@
 
 La reducción de contexto y la no-regresión de exactitud superan holgadamente los umbrales numéricos, pero el gate exigía 500 pares completos y ausencia de errores. Hay 498 pares para la comparación de tokens y una pregunta M3 sin respuesta por filtrado del proveedor. No se relajan los criterios ni se imputan valores después de observar los resultados.
 
+<p align="center"><img src="../../assets/splatsdb-m3-context.png" alt="Historical M3 adaptation: NO_GO by coverage despite the observed context and accuracy results" width="900"/></p>
+
+> Gráfico histórico regenerado en HTML/CSS sin cambiar cifras ni veredicto: [fuente](../../assets/charts/m3-historical.html) · [subconjunto medido](../../assets/charts/data/m3-historical.json). El rerun independiente posterior no reinterpreta esta corrida.
+
 ## Diseño
 
 - Fuente de verdad: repositorio privado `m3-glm-protocol` @ `15795ca`.
